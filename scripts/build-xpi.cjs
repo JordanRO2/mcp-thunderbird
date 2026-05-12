@@ -10,6 +10,7 @@ const PROJECT_DIR = path.resolve(__dirname, '..');
 const EXT_DIR = path.join(PROJECT_DIR, 'extension');
 const DIST_DIR = path.join(PROJECT_DIR, 'dist');
 const OUT_FILE = path.join(DIST_DIR, 'thunderbird-mcp.xpi');
+const PACKAGE_FILE = path.join(PROJECT_DIR, 'package.json');
 
 function crc32(buf) {
   let crc = 0xFFFFFFFF;
@@ -104,37 +105,52 @@ function addDir(zip, dir, prefix) {
   }
 }
 
+function readPackageVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(PACKAGE_FILE, 'utf8'));
+    if (typeof pkg.version !== 'string' || !pkg.version) {
+      throw new Error('package.json does not contain a string "version" field');
+    }
+    return pkg.version;
+  } catch (err) {
+    console.error(`Error: could not read package.json version: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // Stamp buildinfo.json with git describe version and timestamp
 const { execSync } = require('child_process');
 const BUILDINFO_FILE = path.join(EXT_DIR, 'buildinfo.json');
+const MANIFEST_FILE = path.join(EXT_DIR, 'manifest.json');
+const packageVersion = readPackageVersion();
 try {
   // Produces e.g. "v1.2.0-3-g1461f1a" (tag + commits past tag + hash)
-  let version;
+  let buildVersion;
   try {
-    version = execSync('git describe --tags --always', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
+    buildVersion = execSync('git describe --tags --always', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
   } catch {
-    // No tags exist — fall back to short hash
-    version = execSync('git rev-parse --short HEAD', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
+    // No tags exist -- fall back to short hash
+    buildVersion = execSync('git rev-parse --short HEAD', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
   }
   // Append +dirty if there are uncommitted changes
   try {
     execSync('git diff --quiet && git diff --cached --quiet', { cwd: PROJECT_DIR });
   } catch {
-    version += '+dirty';
+    buildVersion += '+dirty';
   }
-  const buildInfo = JSON.stringify({ version, builtAt: new Date().toISOString() });
+  const buildInfo = JSON.stringify({ version: buildVersion, builtAt: new Date().toISOString() });
   fs.writeFileSync(BUILDINFO_FILE, buildInfo);
-
-  // Update manifest.json version from git tag (Thunderbird requires numeric version)
-  const MANIFEST_FILE = path.join(EXT_DIR, 'manifest.json');
-  const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
-  const tagMatch = version.match(/^v?(\d+\.\d+(?:\.\d+)?)/);
-  if (tagMatch) {
-    manifest.version = tagMatch[1];
-    fs.writeFileSync(MANIFEST_FILE, JSON.stringify(manifest, null, 2) + '\n');
-  }
 } catch {
   console.warn('Warning: could not stamp buildinfo.json (git not available?)');
+}
+
+try {
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
+  manifest.version = packageVersion;
+  fs.writeFileSync(MANIFEST_FILE, JSON.stringify(manifest, null, 2) + '\n');
+} catch (err) {
+  console.error(`Error: could not update manifest.json version: ${err.message}`);
+  process.exit(1);
 }
 
 fs.mkdirSync(DIST_DIR, { recursive: true });
