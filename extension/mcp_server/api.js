@@ -210,6 +210,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "saveDraft",
+        group: "messages", crud: "create",
+        title: "Save Draft",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Useful when a human will review and send the message later from Thunderbird.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address(es), comma-separated. Optional -- a draft can have no recipient." },
+            subject: { type: "string", description: "Email subject line (optional)" },
+            body: { type: "string", description: "Email body (optional)" },
+            cc: { type: "string", description: "CC recipients (comma-separated)" },
+            bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            attachments: {
+              type: "array",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", description: "Attachment filename" },
+                      contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
+                      base64: { type: "string", description: "Base64-encoded file content" },
+                    },
+                    required: ["name", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+          required: [],
+        },
+      },
+      {
         name: "listCalendars",
         group: "calendar", crud: "read",
         title: "List Calendars",
@@ -1727,11 +1765,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * We try the modern 16-arg call first; if TB throws
              * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
              */
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType) {
+            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType) {
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
               }
 
+              const mode = deliverMode ?? Ci.nsIMsgCompDeliverMode.Now;
+              const bodyMimeType = bodyType || "text/html";
               const SEND_TIMEOUT_MS = 120000; // 2 min safety timeout
 
               return new Promise((resolve) => {
@@ -1786,8 +1826,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                   } catch {}
 
+                  // SaveAsDraft mode routes through _mimeDoFcc() which does not
+                  // call onStopSending. Completion is signaled via the copy
+                  // service's onStopCopy after the message lands in the Drafts
+                  // folder, so the listener also QIs nsIMsgCopyServiceListener.
                   const listener = {
-                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener", "nsIMsgCopyServiceListener"]),
+                    // nsIMsgSendListener -- fires for SMTP send paths
                     onStartSending() {},
                     onProgress() {},
                     onSendProgress() {},
@@ -1809,6 +1854,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       timer.cancel();
                       settle({ error: `Transport security error${location ? ": " + location : ""}` });
                     },
+                    // nsIMsgCopyServiceListener -- fires for SaveAsDraft / Sent-folder copy
+                    onStartCopy() {},
+                    setMessageKey() {},
+                    onStopCopy(status) {
+                      timer.cancel();
+                      if (Components.isSuccessCode(status)) {
+                        settle({ success: true, message: "Saved" });
+                      } else {
+                        settle({ error: `Save failed (status: 0x${status.toString(16)})` });
+                      }
+                    },
                   };
 
                   // Common args shared by both signatures (positions 1-10)
@@ -1819,9 +1875,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     composeFields,                  // fields
                     false,                          // isDigest
                     false,                          // dontDeliver
-                    Ci.nsIMsgCompDeliverMode.Now,   // deliver mode
+                    mode,                           // deliver mode
                     null,                           // msgToReplace
-                    "text/html",                    // body type
+                    bodyMimeType,                   // body type
                     body,                           // body
                   ];
 
@@ -1852,12 +1908,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       throw e;
                     }
                   }
-                  // Handle async Promise from modern TB (128+)
-                  if (sendResult && typeof sendResult.catch === "function") {
-                    sendResult.catch(e => {
-                      timer.cancel();
-                      settle({ error: e.toString() });
-                    });
+                  // Modern TB (128+) returns a Promise from createAndSendMessage.
+                  // Handle both fulfillment and rejection -- belt-and-suspenders
+                  // with the listener (settle is idempotent). For SaveAsDraft on
+                  // older TB without the copy listener, the Promise fulfillment
+                  // can be the only completion signal we get.
+                  if (sendResult && typeof sendResult.then === "function") {
+                    sendResult.then(
+                      () => {
+                        timer.cancel();
+                        settle({ success: true });
+                      },
+                      e => {
+                        timer.cancel();
+                        settle({ error: e.toString() });
+                      }
+                    );
                   }
                 } catch (e) {
                   timer.cancel();
@@ -4009,7 +4075,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
                 if (skipReview) {
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New).then(result => {
+                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
                     if (result.success) {
                       let msg = "Message sent";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
@@ -4028,6 +4094,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let msg = "Compose window opened";
                 if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                 return { success: true, message: msg };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            /**
+             * Saves a composed message to the identity's Drafts folder without
+             * sending or opening a compose window. The destination folder is
+             * resolved by Thunderbird from the identity's draft-folder pref.
+             */
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
+              try {
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                  .createInstance(Ci.nsIMsgComposeParams);
+
+                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                  .createInstance(Ci.nsIMsgCompFields);
+
+                composeFields.to = to || "";
+                composeFields.cc = cc || "";
+                composeFields.bcc = bcc || "";
+                composeFields.subject = subject || "";
+
+                msgComposeParams.type = Ci.nsIMsgCompType.New;
+                msgComposeParams.composeFields = composeFields;
+
+                const identityResult = setComposeIdentity(msgComposeParams, from, null);
+                if (identityResult && identityResult.error) return identityResult;
+
+                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
+                msgComposeParams.format = format;
+                if (useHtml) {
+                  const formatted = formatBodyHtml(body, isHtml);
+                  composeFields.body = isHtml && formatted.includes('<html')
+                    ? formatted
+                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
+                } else {
+                  composeFields.body = body || "";
+                }
+
+                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+
+                return sendMessageDirectly(
+                  composeFields,
+                  msgComposeParams.identity,
+                  fileDescs,
+                  null,
+                  Ci.nsIMsgCompType.New,
+                  Ci.nsIMsgCompDeliverMode.SaveAsDraft,
+                  useHtml ? "text/html" : "text/plain"
+                ).then(result => {
+                  if (result.success) {
+                    let msg = "Draft saved";
+                    if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
+                    result.message = msg;
+                  }
+                  return result;
+                });
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -4147,7 +4271,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
 	                        }
 
-	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
+	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, replyUseHtml ? "text/html" : "text/plain").then(result => {
 	                          if (result.success) {
 	                            let repliedDisposition = null;
 	                            try {
@@ -4319,7 +4443,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                         const allDescs = [...origDescs, ...fileDescs];
 
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType).then(result => {
+                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, fwdUseHtml ? "text/html" : "text/plain").then(result => {
                           if (result.success) {
                             let forwardedDisposition = null;
                             try {
@@ -5584,6 +5708,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
+                case "saveDraft":
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "forwardMessage":

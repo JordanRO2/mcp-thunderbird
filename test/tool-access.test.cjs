@@ -73,6 +73,7 @@ const ALL_TOOLS = [
   { name: "forwardMessage", group: "messages", crud: "create" },
   { name: "updateMessage", group: "messages", crud: "update" },
   { name: "deleteMessages", group: "messages", crud: "delete" },
+  { name: "saveDraft", group: "messages", crud: "create" },
   { name: "createFolder", group: "folders", crud: "create" },
   { name: "renameFolder", group: "folders", crud: "update" },
   { name: "moveFolder", group: "folders", crud: "update" },
