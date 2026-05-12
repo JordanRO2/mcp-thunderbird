@@ -58,6 +58,12 @@ function debugLog(message) {
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
 let lastDiscoveryAttempts = [];
+// Full set of valid connection candidates from the last discovery, in priority
+// order. forwardToThunderbird advances through this list when a candidate's
+// HTTP endpoint refuses or returns 403, so a stale connection file can't
+// permanently mask a live one further down the list.
+let cachedCandidateList = [];
+let cachedCandidateIndex = 0;
 
 function normalizeFsError(err) {
   if (!err) {
@@ -462,6 +468,7 @@ function tryReadConnectionCandidate(candidate, context) {
 function discoverConnectionInfo(options = {}) {
   const groups = buildCandidateGroups(options);
   const attempts = [];
+  const candidates = [];
 
   for (const group of groups) {
     attempts.push(...group.notes);
@@ -470,22 +477,27 @@ function discoverConnectionInfo(options = {}) {
       const result = tryReadConnectionCandidate(candidate, group.context);
       attempts.push(result.attempt);
       if (result.ok) {
-        return { data: result.data, attempts, selectedPath: candidate.path };
-      }
-      if (group.stopOnFailure) {
-        return { data: null, attempts, selectedPath: null };
+        candidates.push({ data: result.data, path: candidate.path });
+        if (group.stopOnFailure) {
+          // Hard pin (e.g. THUNDERBIRD_MCP_CONNECTION_FILE): user explicitly named
+          // this candidate; honor it and don't fall through to autodiscovery.
+          return { candidates, attempts };
+        }
+      } else if (group.stopOnFailure) {
+        // Pinned path failed; do not fall through to autodiscovery candidates.
+        return { candidates, attempts };
       }
     }
   }
 
-  return { data: null, attempts, selectedPath: null };
+  return { candidates, attempts };
 }
 
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if no valid candidate exists.
- * Caches the result for a short TTL to avoid hitting the filesystem on every request.
- * Cache is cleared on connection errors (see clearConnectionCache).
+ * Caches the full candidate list for a short TTL so forwardToThunderbird can
+ * advance past a stale winner on connection failure without re-running discovery.
  */
 function readConnectionInfo(options = {}) {
   if (cachedConnectionInfo && Date.now() < connectionCacheExpiry) {
@@ -494,19 +506,41 @@ function readConnectionInfo(options = {}) {
 
   const result = discoverConnectionInfo(options);
   lastDiscoveryAttempts = result.attempts;
+  cachedCandidateList = result.candidates;
+  cachedCandidateIndex = 0;
 
-  if (!result.data) {
+  if (!cachedCandidateList.length) {
     return null;
   }
 
-  cachedConnectionInfo = result.data;
+  cachedConnectionInfo = cachedCandidateList[0].data;
   connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
-  return result.data;
+  return cachedConnectionInfo;
+}
+
+/**
+ * Advance to the next cached connection candidate after the current one fails
+ * to reach Thunderbird. Returns the new candidate's data, or null when the
+ * cached list is exhausted (caller should rediscover from scratch).
+ */
+function advanceToNextCandidate() {
+  if (!cachedCandidateList.length) {
+    return null;
+  }
+  cachedCandidateIndex += 1;
+  if (cachedCandidateIndex >= cachedCandidateList.length) {
+    return null;
+  }
+  cachedConnectionInfo = cachedCandidateList[cachedCandidateIndex].data;
+  connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
+  return cachedConnectionInfo;
 }
 
 function clearConnectionCache() {
   cachedConnectionInfo = null;
   connectionCacheExpiry = 0;
+  cachedCandidateList = [];
+  cachedCandidateIndex = 0;
 }
 
 function formatDiscoveryAttempts(attempts = lastDiscoveryAttempts) {
@@ -611,8 +645,9 @@ function tryRequest(hostname, postData, port, token) {
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
         if (res.statusCode === 403) {
-          clearConnectionCache();
-          reject(new Error('Authentication failed (403). Token may be stale — retrying with fresh connection info.'));
+          const err = new Error('Authentication failed (403). Token may be stale.');
+          err.statusCode = 403;
+          reject(err);
           return;
         }
         const data = Buffer.concat(chunks).toString('utf8');
@@ -640,13 +675,33 @@ function tryRequest(hostname, postData, port, token) {
   });
 }
 
-async function forwardToThunderbird(message, _retried) {
+function isRetryableConnectionError(err) {
+  return err
+    && (err.statusCode === 403
+      || err.code === 'ECONNREFUSED'
+      || err.code === 'EADDRNOTAVAIL'
+      || err.code === 'EAFNOSUPPORT');
+}
+
+function tryAllHosts(hosts, postData, port, token) {
+  const tryNext = ([hostname, ...rest]) => {
+    return tryRequest(hostname, postData, port, token).catch((err) => {
+      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
+        return tryNext(rest);
+      }
+      throw err;
+    });
+  };
+  return tryNext(hosts);
+}
+
+async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
-  // Fail-closed: if the connection file is missing, retry a few times
-  // (Thunderbird may still be starting), then fail with an error.
-  // Never forward requests without authentication.
+  // Fail-closed: if no connection file exists, retry a few times (Thunderbird may
+  // still be starting), then fail with an error. Never forward requests without
+  // authentication.
   let connInfo = readConnectionInfo();
   if (!connInfo) {
     for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
@@ -661,44 +716,45 @@ async function forwardToThunderbird(message, _retried) {
     }
   }
 
-  if (!connInfo.port || !connInfo.token) {
-    throw new Error('Invalid connection file: missing port or token');
-  }
-  if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
-    throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
-  }
+  // Walk through the cached candidate list on retryable failures so a stale
+  // connection.json can't permanently mask a live one further down the list.
+  // After the cached list is exhausted, rediscover once before giving up.
+  let rediscoveryAttempted = false;
 
-  const { port, token } = connInfo;
+  while (connInfo) {
+    if (!connInfo.port || !connInfo.token) {
+      throw new Error('Invalid connection file: missing port or token');
+    }
+    if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
+      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
+    }
 
-  // Try each host in order - handles platforms where 'localhost' resolves to
-  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
-  const tryNext = (hosts) => {
-    const [hostname, ...rest] = hosts;
-    return tryRequest(hostname, postData, port, token).catch((err) => {
-      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
-        return tryNext(rest);
+    try {
+      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
+    } catch (err) {
+      if (!isRetryableConnectionError(err)) {
+        throw err;
       }
-      // On 403 or connection refused, clear cache and retry once with fresh
-      // connection info (Thunderbird may have restarted on a new port/token).
-      if (!_retried) {
-        if (err.message && err.message.includes('403')) {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
+
+      const next = advanceToNextCandidate();
+      if (next) {
+        connInfo = next;
+        continue;
+      }
+
+      if (!rediscoveryAttempted) {
+        rediscoveryAttempted = true;
+        clearConnectionCache();
+        connInfo = readConnectionInfo();
+        if (!connInfo) {
+          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
         }
-        if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
-        }
+        continue;
       }
-      // Already retried or non-recoverable error
-      if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
-        throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
-      }
-      throw err;
-    });
-  };
 
-  return tryNext(THUNDERBIRD_HOSTS);
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+    }
+  }
 }
 
 function startBridge() {
@@ -799,6 +855,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  advanceToNextCandidate,
   buildCandidateGroups,
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,

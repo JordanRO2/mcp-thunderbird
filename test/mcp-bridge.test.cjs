@@ -5,8 +5,10 @@ const os = require('os');
 const path = require('path');
 
 const {
+  advanceToNextCandidate,
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
+  discoverConnectionInfo,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -272,5 +274,81 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+  });
+
+  it('discoverConnectionInfo collects every valid candidate, not just the winner', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+    });
+
+    // Native /tmp file (first group, winner)
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20100,
+      token: 'native',
+    });
+
+    // Flatpak runtime file (later group, also valid)
+    writeConnectionFile(
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      { port: 20101, token: 'flatpak' }
+    );
+
+    const result = discoverConnectionInfo(options);
+    assert.ok(result.candidates.length >= 2, `expected >=2 candidates, got ${result.candidates.length}`);
+    assert.equal(result.candidates[0].data.token, 'native');
+    assert.ok(result.candidates.some(c => c.data.token === 'flatpak'));
+  });
+
+  it('advanceToNextCandidate walks the cached list, then returns null when exhausted', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+    });
+
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20200,
+      token: 'first',
+    });
+    writeConnectionFile(
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      { port: 20201, token: 'second' }
+    );
+
+    const first = readConnectionInfo(options);
+    assert.equal(first.token, 'first');
+
+    const second = advanceToNextCandidate();
+    assert.ok(second, 'should advance to a second candidate');
+    assert.equal(second.token, 'second');
+
+    const third = advanceToNextCandidate();
+    assert.equal(third, null, 'should return null after the last candidate');
+  });
+
+  it('advanceToNextCandidate returns null when no cache exists', () => {
+    clearConnectionCache();
+    assert.equal(advanceToNextCandidate(), null);
+  });
+
+  it('hard-pinned env override does not collect autodiscovery candidates as fallbacks', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+      env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'pinned', 'connection.json') },
+    });
+
+    writeConnectionFile(options.env.THUNDERBIRD_MCP_CONNECTION_FILE, {
+      port: 20300,
+      token: 'pinned',
+    });
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20301,
+      token: 'should-not-appear',
+    });
+
+    const result = discoverConnectionInfo(options);
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].data.token, 'pinned');
   });
 });
