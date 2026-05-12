@@ -28,6 +28,7 @@ const CONNECTION_FILE_BASENAME = 'connection.json';
 // relay -- behavior never changes by version -- so it accepts every published
 // version, but it does NOT echo unknown future versions back as if it knew them.
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-10-07',
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
@@ -556,7 +557,17 @@ async function handleMessage(line) {
   switch (message.method) {
     case 'initialize': {
       const requested = message.params?.protocolVersion;
-      const negotiated = (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+      if (typeof requested !== 'string') {
+        return {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: -32602,
+            message: 'Invalid params: protocolVersion must be a string',
+          },
+        };
+      }
+      const negotiated = SUPPORTED_PROTOCOL_VERSIONS.has(requested)
         ? requested
         : LATEST_PROTOCOL_VERSION;
       return {

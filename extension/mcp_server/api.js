@@ -26,6 +26,7 @@ const MCP_MAX_PORT_ATTEMPTS = 10;
 // for clients), but for the rare case a client talks directly to the HTTP server
 // we still need a spec-compliant negotiated value. Keep in sync with mcp-bridge.cjs.
 const MCP_SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  "2024-10-07",
   "2024-11-05",
   "2025-03-26",
   "2025-06-18",
@@ -1397,7 +1398,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (desc.size != null) att.size = desc.size;
                   if (desc.contentType) att.contentType = desc.contentType;
                   result.push(att);
-                } catch {}
+                } catch (e) {
+                  console.warn("thunderbird-mcp: failed to convert attachment descriptor:", desc?.name || desc?.url || desc, e);
+                }
               }
               return result;
             }
@@ -5499,7 +5502,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // Behavior never depends on the version inside Thunderbird,
                       // so we accept any well-known protocol version.
                       const requested = params?.protocolVersion;
-                      const negotiated = (typeof requested === "string" && MCP_SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+                      if (typeof requested !== "string") {
+                        res.setStatusLine("1.1", 200, "OK");
+                        res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                        res.write(JSON.stringify({
+                          jsonrpc: "2.0",
+                          id: id ?? null,
+                          error: { code: -32602, message: "Invalid params: protocolVersion must be a string" }
+                        }));
+                        res.finish();
+                        return;
+                      }
+                      const negotiated = MCP_SUPPORTED_PROTOCOL_VERSIONS.has(requested)
                         ? requested
                         : MCP_LATEST_PROTOCOL_VERSION;
                       result = {
