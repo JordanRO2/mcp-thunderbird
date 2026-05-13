@@ -1258,19 +1258,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
-                try {
-                  const mode = tmpDir.permissions;
-                  if (mode && (mode & 0o077) !== 0) {
-                    try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                    if ((tmpDir.permissions & 0o077) !== 0) {
-                      throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                //
+                // Windows uses ACLs, not POSIX modes. The bits reported by
+                // nsIFile.permissions on Windows do not correspond to the
+                // group/world semantics this check assumes -- a normal Temp
+                // subfolder reads as 0o666 or similar and trips a false
+                // positive. Skip the chmod entirely on Windows; the POSIX
+                // attack model (shared /tmp other-user race) does not apply
+                // there anyway since %LOCALAPPDATA%\Temp is per-user.
+                const isWindows = (() => {
+                  try { return Services.appinfo.OS === "WINNT"; } catch { return false; }
+                })();
+                if (!isWindows) {
+                  try {
+                    const mode = tmpDir.permissions;
+                    if (mode && (mode & 0o077) !== 0) {
+                      try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
+                      if ((tmpDir.permissions & 0o077) !== 0) {
+                        throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                      }
                     }
+                  } catch (e) {
+                    if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
+                    // ignore: permissions accessor unsupported on this platform
                   }
-                } catch (e) {
-                  if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
-                  // ignore: permissions accessor unsupported on this platform
                 }
               }
               const connFile = tmpDir.clone();
@@ -7754,9 +7765,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
+            // Clear any prior start error now that we're fully up.
+            globalThis.__tbMcpStartError = null;
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
+            // Persist the error so getServerInfo can surface it in the
+            // options page; otherwise the user just sees "Running" forever
+            // while the actual error sits in the Error Console.
+            const errStr = e && e.toString ? e.toString() : String(e);
+            const stack = e && e.stack ? e.stack : "";
+            globalThis.__tbMcpStartError = errStr;
+            // Also write to <TmpD>/thunderbird-mcp/start-error.log so the
+            // error survives a TB restart and can be inspected from the
+            // host shell even when the Error Console isn't open. Best-
+            // effort; failures here must not mask the original problem.
+            try {
+              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmpDir.append("thunderbird-mcp");
+              if (!tmpDir.exists()) tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              const f = tmpDir.clone();
+              f.append("start-error.log");
+              const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+              out.init(f, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const conv = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(Ci.nsIConverterOutputStream);
+              conv.init(out, "UTF-8");
+              conv.writeString(new Date().toISOString() + " " + errStr + "\n" + stack + "\n");
+              conv.close();
+            } catch { /* best-effort */ }
             // Stop server if it was started but something else failed
             if (globalThis.__tbMcpServer) {
               try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
@@ -7815,12 +7851,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
           }
 
+          // `running` is true only when the HTTP server has been instantiated
+          // and the start promise resolved cleanly. Checking
+          // `!!globalThis.__tbMcpStartPromise` alone was misleading because a
+          // rejected promise is still truthy -- the page would say "Running"
+          // while the server had silently failed to bind. Surface the actual
+          // start error so the options page can show it.
+          const startError = globalThis.__tbMcpStartError || null;
+          const running = !!globalThis.__tbMcpServer && !startError;
           return {
-            running: !!globalThis.__tbMcpStartPromise,
+            running,
             port,
             connectionFile,
             buildVersion,
             buildDate,
+            startError,
           };
         },
 

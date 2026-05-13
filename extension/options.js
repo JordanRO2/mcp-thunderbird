@@ -38,6 +38,12 @@ async function loadServerInfo() {
       statusText.textContent = "Running";
       serverPort.textContent = info.port || "--";
       connFile.textContent = info.connectionFile || "--";
+    } else if (info.startError) {
+      // Show the real error instead of a misleading "Running" label.
+      statusDot.className = "status-dot stopped";
+      statusText.textContent = "Failed: " + info.startError;
+      serverPort.textContent = "--";
+      connFile.textContent = info.connectionFile || "--";
     } else {
       statusDot.className = "status-dot stopped";
       statusText.textContent = "Not running";
