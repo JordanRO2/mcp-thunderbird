@@ -379,6 +379,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the message directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional client-supplied key (max 256 chars). If sendMail was previously called with this same key within the last 24 hours AND succeeded, the prior result is returned instead of sending again. Use this to make retries safe across crashes / network errors -- especially for outreach where re-sending to a real target is costly." },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -659,6 +660,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the reply directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional dedup key (max 256 chars). See sendMail for semantics." },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -699,6 +701,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the forward directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional dedup key (max 256 chars). See sendMail for semantics." },
             attachments: {
               type: "array",
               description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -1422,6 +1425,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return out;
             }
 
+            // Idempotency window: how far back to scan for a matching key
+            // before considering the new call a fresh send.
+            const IDEMPOTENCY_WINDOW_HOURS = 24;
+
+            /**
+             * Find a recent successful audit entry whose idempotencyKey
+             * matches `key`. Returns the entry's stored `result` object, or
+             * null if no match. Used by sendMail / replyToMessage /
+             * forwardMessage to skip duplicate sends after a crash or retry.
+             *
+             * Only entries with .success === true are considered hits --
+             * a previous error MUST allow the caller to retry.
+             */
+            function findIdempotentEntry(tool, key) {
+              if (typeof key !== "string" || !key) return null;
+              if (key.length > 256) return null; // schema caps caller input
+              const since = new Date(Date.now() - IDEMPOTENCY_WINDOW_HOURS * 3600 * 1000).toISOString();
+              const log = readAuditLog(1000, { tool, since });
+              for (const e of log.entries) {
+                if (e && e.idempotencyKey === key && e.success === true && e.result) {
+                  return e.result;
+                }
+              }
+              return null;
+            }
+
             /**
              * Truncate both audit.log and audit.log.1. Returns the number of
              * bytes deleted. Best-effort; missing files are silent successes.
@@ -1447,25 +1476,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { success: true, bytesRemoved };
             }
 
+            // Pref-read cache. Services.prefs is hit on every tool dispatch
+            // (rate-limit, access-control, safeguards) and the cost adds up
+            // under search bursts. We cache the parsed value behind each
+            // pref name and register one observer per pref that flips the
+            // cached entry to undefined on change, forcing a re-read next
+            // call. Cheap: a few microseconds saved per call, but matters
+            // for batch tools like batchGetMessageHeaders.
+            const __prefCache = Object.create(null);
+            const __prefObservers = Object.create(null);
+
+            function __invalidatePrefCache(prefName) {
+              return {
+                observe(subject, topic, data) {
+                  if (topic === "nsPref:changed" && data === prefName) {
+                    delete __prefCache[prefName];
+                  }
+                },
+              };
+            }
+            function __ensurePrefObserver(prefName) {
+              if (__prefObservers[prefName]) return;
+              const obs = __invalidatePrefCache(prefName);
+              try {
+                Services.prefs.addObserver(prefName, obs, false);
+                __prefObservers[prefName] = obs;
+              } catch (e) {
+                console.warn("thunderbird-mcp: pref observer registration failed for", prefName, e);
+              }
+            }
+            function __cachedRead(prefName, reader) {
+              __ensurePrefObserver(prefName);
+              if (__prefCache[prefName] !== undefined) return __prefCache[prefName];
+              const value = reader();
+              __prefCache[prefName] = value;
+              return value;
+            }
+
             /**
              * Get the list of allowed account IDs from preferences.
              * Returns an empty array if no restriction is set (all accounts allowed).
              */
             function getAllowedAccountIds() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed)) {
-                  console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+              return __cachedRead(PREF_ALLOWED_ACCOUNTS, () => {
+                try {
+                  const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+                  if (!pref) return [];
+                  const parsed = JSON.parse(pref);
+                  if (!Array.isArray(parsed)) {
+                    console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+                    return ["__invalid__"];
+                  }
+                  return parsed;
+                } catch (e) {
+                  // Fail closed: corrupt pref means block all accounts, not allow all
+                  console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
                   return ["__invalid__"];
                 }
-                return parsed;
-              } catch (e) {
-                // Fail closed: corrupt pref means block all accounts, not allow all
-                console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
-                return ["__invalid__"];
-              }
+              });
             }
 
             /**
@@ -1489,13 +1557,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * into silent sends from the options page.
              */
             function isSkipReviewBlocked() {
-              try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true);
-              } catch {
-                // Fail closed: if we can't read the pref, assume blocked so the
-                // user retains ability to review before send.
-                return true;
-              }
+              return __cachedRead(PREF_BLOCK_SKIPREVIEW, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true); }
+                catch { return true; }
+              });
             }
 
             /**
@@ -1506,11 +1571,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Default true.
              */
             function isFilterForwardReplyBlocked() {
-              try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
-              } catch {
-                return true;
-              }
+              return __cachedRead(PREF_BLOCK_FILTER_FORWARD_REPLY, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true); }
+                catch { return true; }
+              });
             }
 
             /**
@@ -1522,11 +1586,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Default true.
              */
             function isContactWritesBlocked() {
-              try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
-              } catch {
-                return true;
-              }
+              return __cachedRead(PREF_BLOCK_CONTACT_WRITES, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true); }
+                catch { return true; }
+              });
             }
 
             /**
@@ -1535,19 +1598,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Fails closed: corrupt pref disables all tools.
              */
             function getDisabledTools() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
-                  console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
+              return __cachedRead(PREF_DISABLED_TOOLS, () => {
+                try {
+                  const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+                  if (!pref) return [];
+                  const parsed = JSON.parse(pref);
+                  if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
+                    console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
+                    return ["__all__"];
+                  }
+                  return parsed;
+                } catch (e) {
+                  console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
                   return ["__all__"];
                 }
-                return parsed;
-              } catch (e) {
-                console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
-                return ["__all__"];
-              }
+              });
             }
 
             /**
@@ -2900,6 +2965,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return fallback;
             }
 
+	            // Hard cap on the linear-enumeration fallback when
+	            // getMsgHdrForMessageID misses. A 200k-message archive walked
+	            // header-by-header takes tens of seconds; we'd rather fail
+	            // fast and tell the caller to pass a smaller folderPath than
+	            // burn an agent's clock on a single lookup.
+	            const FIND_MESSAGE_SCAN_CAP = 50000;
+
 	            function findMessage(messageId, folderPath) {
 	              const opened = openFolder(folderPath);
 	              if (opened.error) return opened;
@@ -2917,11 +2989,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              }
 
 	              if (!msgHdr) {
+	                let scanned = 0;
+	                let capped = false;
 	                for (const hdr of db.enumerateMessages()) {
+	                  scanned++;
+	                  if (scanned > FIND_MESSAGE_SCAN_CAP) { capped = true; break; }
 	                  if (hdr.messageId === messageId) {
 	                    msgHdr = hdr;
 	                    break;
 	                  }
+	                }
+	                if (!msgHdr && capped) {
+	                  return {
+	                    error: `Message not found after scanning ${FIND_MESSAGE_SCAN_CAP} headers in this folder. Pass a more specific folderPath or use searchMessages first to locate the exact folder.`,
+	                  };
 	                }
 	              }
 
@@ -5165,10 +5246,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * 2. Encode non-ASCII as HTML entities - compose window has charset issues
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
+            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, idempotencyKey) {
               try {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
+                }
+                // Idempotency: if a prior successful sendMail with this key
+                // ran in the last 24h, return its result instead of sending
+                // again. The audit-log entry is the source of truth.
+                if (typeof idempotencyKey === "string" && idempotencyKey) {
+                  const prior = findIdempotentEntry("sendMail", idempotencyKey);
+                  if (prior) {
+                    return { ...prior, idempotent: true, idempotencyKey };
+                  }
                 }
                 appendComposeAudit({
                   tool: "sendMail",
@@ -5180,6 +5270,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   bcc: countRecipients(bcc),
                   subject: typeof subject === "string" ? subject.slice(0, 200) : null,
                   attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                  idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
                 });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
@@ -5221,6 +5312,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       let msg = "Message sent";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       result.message = msg;
+                      // Idempotency: record the successful outcome so a retry
+                      // with the same key returns this result instead of
+                      // sending again. The pre-send audit entry only records
+                      // intent; findIdempotentEntry filters to success:true.
+                      if (typeof idempotencyKey === "string" && idempotencyKey) {
+                        appendComposeAudit({
+                          tool: "sendMail",
+                          success: true,
+                          idempotencyKey: idempotencyKey.slice(0, 256),
+                          result,
+                        });
+                      }
                     }
                     return result;
                   });
@@ -5318,12 +5421,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * skipReview still uses direct send, so it keeps a manual quoted body
              * and manually marks the original as replied after a successful send.
              */
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
+	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, idempotencyKey) {
 	              return new Promise((resolve) => {
 	                try {
 	                  if (skipReview && isSkipReviewBlocked()) {
 	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
 	                    return;
+	                  }
+	                  if (typeof idempotencyKey === "string" && idempotencyKey) {
+	                    const prior = findIdempotentEntry("replyToMessage", idempotencyKey);
+	                    if (prior) {
+	                      resolve({ ...prior, idempotent: true, idempotencyKey });
+	                      return;
+	                    }
 	                  }
 	                  appendComposeAudit({
 	                    tool: "replyToMessage",
@@ -5336,6 +5446,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    cc: countRecipients(cc),
 	                    bcc: countRecipients(bcc),
 	                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+	                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
 	                  });
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
@@ -5445,6 +5556,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            let msg = "Reply sent";
 	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
 	                            result.message = msg;
+	                            if (typeof idempotencyKey === "string" && idempotencyKey) {
+	                              appendComposeAudit({
+	                                tool: "replyToMessage",
+	                                success: true,
+	                                idempotencyKey: idempotencyKey.slice(0, 256),
+	                                result,
+	                              });
+	                            }
 	                          }
 	                          resolve(result);
 	                        });
@@ -5496,12 +5615,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * block + auto-attaches originals from MsgHdrToMimeMessage + manually
              * marks the original as forwarded after a successful send.
              */
-            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview, idempotencyKey) {
               return new Promise((resolve) => {
                 try {
                   if (skipReview && isSkipReviewBlocked()) {
                     resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
                     return;
+                  }
+                  if (typeof idempotencyKey === "string" && idempotencyKey) {
+                    const prior = findIdempotentEntry("forwardMessage", idempotencyKey);
+                    if (prior) {
+                      resolve({ ...prior, idempotent: true, idempotencyKey });
+                      return;
+                    }
                   }
                   appendComposeAudit({
                     tool: "forwardMessage",
@@ -5513,6 +5639,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     cc: countRecipients(cc),
                     bcc: countRecipients(bcc),
                     attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
                   });
                   const found = findMessage(messageId, folderPath);
                   if (found.error) {
@@ -5628,6 +5755,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
+                            if (typeof idempotencyKey === "string" && idempotencyKey) {
+                              appendComposeAudit({
+                                tool: "forwardMessage",
+                                success: true,
+                                idempotencyKey: idempotencyKey.slice(0, 256),
+                                result,
+                              });
+                            }
                           }
                           resolve(result);
                         });
@@ -6917,13 +7052,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "updateTask":
                   return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
                 case "sendMail":
-                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
+                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "saveDraft":
                   return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "displayMessage":
