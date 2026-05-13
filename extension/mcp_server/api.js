@@ -100,6 +100,10 @@ const PREF_BLOCK_FILTER_FORWARD_REPLY = "extensions.thunderbird-mcp.blockFilterF
 // misrouted. Default is to refuse contact writes; users who want LLM-driven
 // contact management opt in via the options page.
 const PREF_BLOCK_CONTACT_WRITES = "extensions.thunderbird-mcp.blockContactWrites";
+// Gate exportMailbox. Bulk-exports walk thousands of messages, may run for
+// many seconds, and write the user's mail content to a JSON file on disk.
+// Default off-by-pref so an LLM cannot mass-extract mailbox content silently.
+const PREF_BLOCK_MAILBOX_EXPORT = "extensions.thunderbird-mcp.blockMailboxExport";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -238,6 +242,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
           },
           required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "exportMailbox",
+        group: "messages", crud: "read",
+        title: "Export Mailbox",
+        description: "Stream a folder's messages to a JSON-lines file under <ProfD>/thunderbird-mcp/exports/. Default mode is headers-only; pass includeBody:true to also embed each message's plain-text body and attachment metadata (slower). The destination file is named with a UTC timestamp and a sanitized folder name; the path is returned so the caller knows where to find it. Disabled by default via extensions.thunderbird-mcp.blockMailboxExport -- enable it in the options page when you actually need a bulk export.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI to export (required). Subfolders are NOT recursed -- call once per folder." },
+            maxMessages: { type: "integer", description: "Cap on exported messages (default 1000, hard cap 50000). Use sortOrder:'desc' (default) to take the newest N." },
+            includeBody: { type: "boolean", description: "If true, extract each message's plain-text body and embed it on the JSON line. Default false. Adds a MIME parse per message so a 5000-message export takes substantially longer." },
+            includeAttachmentMeta: { type: "boolean", description: "If true and includeBody is true, embed attachment {name, contentType, size} metadata too. Attachment CONTENT is never written -- only metadata. Default false." },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated before stopping (default 50000). Prevents the LLM from walking a 200k-message archive forever." },
+            sortOrder: { type: "string", enum: ["asc", "desc"], description: "Date sort order before applying maxMessages. 'desc' (default) = newest first." },
+          },
+          required: ["folderPath"],
         },
       },
       {
@@ -1477,6 +1499,194 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return null;
             }
 
+            // ─── Bulk mailbox export ──────────────────────────────────────
+            //
+            // Streams headers (and optionally bodies) from a folder to a
+            // JSON-lines file under <ProfD>/thunderbird-mcp/exports/. Each
+            // line is written and flushed before the next message is parsed,
+            // so RAM usage stays flat regardless of folder size.
+
+            const EXPORTS_SUBDIR = "exports";
+            const EXPORT_DEFAULT_MAX = 1000;
+            const EXPORT_HARD_CAP = 50000;
+            const EXPORT_DEFAULT_SCAN_CAP = 50000;
+
+            function exportsDir() {
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const d = profDir.clone();
+              d.append(AUDIT_LOG_SUBDIR);
+              d.append(EXPORTS_SUBDIR);
+              return d;
+            }
+
+            /**
+             * Build a safe destination filename for an export: ISO timestamp
+             * with `:` replaced (Windows-hostile) and a sanitized folder
+             * component derived from the folder URI's tail.
+             */
+            function buildExportFilename(folder) {
+              const ts = new Date().toISOString().replace(/[:]/g, "-");
+              const tail = folder.URI ? folder.URI.split("/").pop() : "folder";
+              const safeTail = String(tail || "folder").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+              return `${ts}-${safeTail || "folder"}.jsonl`;
+            }
+
+            /**
+             * Async streaming export. Resolves once every message has been
+             * serialized and flushed to disk.
+             */
+            function exportMailbox(folderPath, maxMessages, includeBody, includeAttachmentMeta, scanCap, sortOrder) {
+              return new Promise((resolve) => {
+                try {
+                  if (isMailboxExportBlocked()) {
+                    resolve({ error: "User preference blocks mailbox export via MCP. Enable 'Allow mailbox export' in the extension options page if you trust this MCP client to bulk-export your mail." });
+                    return;
+                  }
+                  if (!folderPath) { resolve({ error: "folderPath is required" }); return; }
+                  const opened = openFolder(folderPath);
+                  if (opened.error) { resolve({ error: opened.error }); return; }
+                  const { folder, db } = opened;
+
+                  const cap = Number.isFinite(maxMessages) && maxMessages > 0
+                    ? Math.min(Math.floor(maxMessages), EXPORT_HARD_CAP)
+                    : EXPORT_DEFAULT_MAX;
+                  const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+                    ? Math.min(Math.floor(scanCap), EXPORT_HARD_CAP)
+                    : EXPORT_DEFAULT_SCAN_CAP;
+                  const order = sortOrder === "asc" ? "asc" : "desc";
+
+                  // Walk + collect candidate headers with their timestamps.
+                  // We sort BEFORE applying `cap` so "newest N" semantics are
+                  // honored across the whole folder, not just the first N
+                  // enumerated. enumerateMessages doesn't guarantee an order.
+                  const candidates = [];
+                  let totalScanned = 0;
+                  for (const hdr of db.enumerateMessages()) {
+                    totalScanned++;
+                    if (totalScanned > scanLimit) break;
+                    candidates.push({ hdr, ts: hdr.date ? hdr.date / 1000 : 0 });
+                  }
+                  candidates.sort((a, b) => order === "asc" ? a.ts - b.ts : b.ts - a.ts);
+                  const slice = candidates.slice(0, cap);
+
+                  // Open the output file.
+                  const dir = exportsDir();
+                  if (!dir.exists()) {
+                    dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                  }
+                  const outFile = dir.clone();
+                  outFile.append(buildExportFilename(folder));
+                  const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                    .createInstance(Ci.nsIFileOutputStream);
+                  // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x20 = O_TRUNC. We always
+                  // start fresh -- the filename has an ISO timestamp so
+                  // collisions are essentially impossible.
+                  ostream.init(outFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+                  const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                    .createInstance(Ci.nsIConverterOutputStream);
+                  converter.init(ostream, "UTF-8");
+
+                  let bytesWritten = 0;
+                  function writeLine(obj) {
+                    const line = JSON.stringify(obj) + "\n";
+                    converter.writeString(line);
+                    bytesWritten += line.length;
+                  }
+
+                  // Synchronous header-only path is straightforward.
+                  if (!includeBody) {
+                    for (const { hdr } of slice) {
+                      const obj = msgHdrToHeaderObject(hdr);
+                      obj.folderPath = folder.URI;
+                      writeLine(obj);
+                    }
+                    converter.close();
+                    appendComposeAudit({
+                      tool: "exportMailbox",
+                      folderPath: folder.URI,
+                      includeBody: false,
+                      exported: slice.length,
+                      scanned: totalScanned,
+                      filePath: outFile.path,
+                      bytesWritten,
+                    });
+                    resolve({
+                      filePath: outFile.path,
+                      folderPath: folder.URI,
+                      exported: slice.length,
+                      scanned: totalScanned,
+                      truncated: totalScanned > scanLimit || candidates.length > cap,
+                      bytesWritten,
+                      includeBody: false,
+                    });
+                    return;
+                  }
+
+                  // With-body path: MIME-parse one at a time, write line, then
+                  // schedule the next. Sequential to keep memory flat -- a
+                  // parallel fan-out would buffer N MimeMessage trees.
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  let index = 0;
+                  function next() {
+                    if (index >= slice.length) {
+                      converter.close();
+                      appendComposeAudit({
+                        tool: "exportMailbox",
+                        folderPath: folder.URI,
+                        includeBody: true,
+                        exported: index,
+                        scanned: totalScanned,
+                        filePath: outFile.path,
+                        bytesWritten,
+                      });
+                      resolve({
+                        filePath: outFile.path,
+                        folderPath: folder.URI,
+                        exported: index,
+                        scanned: totalScanned,
+                        truncated: totalScanned > scanLimit || candidates.length > cap,
+                        bytesWritten,
+                        includeBody: true,
+                      });
+                      return;
+                    }
+                    const { hdr } = slice[index++];
+                    const obj = msgHdrToHeaderObject(hdr);
+                    obj.folderPath = folder.URI;
+                    MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
+                      try {
+                        if (aMimeMsg) {
+                          obj.body = extractPlainTextBody(aMimeMsg);
+                          if (includeAttachmentMeta && aMimeMsg.allUserAttachments) {
+                            obj.attachments = aMimeMsg.allUserAttachments.map(a => ({
+                              name: a && a.name ? String(a.name) : "",
+                              contentType: a && a.contentType ? String(a.contentType) : "",
+                              size: typeof a?.size === "number" ? a.size : null,
+                            }));
+                          }
+                        }
+                      } catch (e) {
+                        obj.bodyError = String(e);
+                      }
+                      try { writeLine(obj); }
+                      catch (e) {
+                        converter.close();
+                        resolve({ error: `Write failed at message ${index}: ${e}`, filePath: outFile.path, exported: index - 1, bytesWritten });
+                        return;
+                      }
+                      next();
+                    });
+                  }
+                  next();
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             // ─── Compose templates ────────────────────────────────────────
             //
             // Templates live in <ProfD>/thunderbird-mcp/templates/*.md so they
@@ -1769,6 +1979,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function isContactWritesBlocked() {
               return __cachedRead(PREF_BLOCK_CONTACT_WRITES, () => {
                 try { return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true); }
+                catch { return true; }
+              });
+            }
+
+            /**
+             * Check if bulk mailbox export is blocked. Default true:
+             * exportMailbox writes the user's mail content to disk in a
+             * machine-readable format, which is an attractive primitive for
+             * an LLM that has been prompt-injected into "back up everything
+             * I have". Off-by-pref keeps it from being a one-call data
+             * exfil channel.
+             */
+            function isMailboxExportBlocked() {
+              return __cachedRead(PREF_BLOCK_MAILBOX_EXPORT, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_MAILBOX_EXPORT, true); }
                 catch { return true; }
               });
             }
@@ -7698,6 +7923,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await searchAttachments(args.nameContains, args.contentType, args.folderPath, args.maxResults, args.scanCap);
                 case "getSenderHistory":
                   return getSenderHistory(args.email, args.maxResults, args.scanCap, args.sinceDays);
+                case "exportMailbox":
+                  return await exportMailbox(args.folderPath, args.maxMessages, args.includeBody, args.includeAttachmentMeta, args.scanCap, args.sortOrder);
                 case "dryRunCompose":
                   return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "getServerCapabilities":
@@ -8281,6 +8508,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
           Services.prefs.setBoolPref(PREF_BLOCK_CONTACT_WRITES, blockContactWrites);
           return { success: true, blockContactWrites };
+        },
+
+        getBlockMailboxExport: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_MAILBOX_EXPORT, true);
+          } catch { /* ignore */ }
+          return { blockMailboxExport: blocked };
+        },
+
+        setBlockMailboxExport: async function(blockMailboxExport) {
+          if (typeof blockMailboxExport !== "boolean") {
+            return { error: "blockMailboxExport must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_MAILBOX_EXPORT, blockMailboxExport);
+          return { success: true, blockMailboxExport };
         },
 
         readAuditLog: async function(maxEntries, filter) {

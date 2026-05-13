@@ -400,19 +400,22 @@ saveToolsBtn.addEventListener("click", async () => {
 const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
 const blockFilterForwardReplyCheckbox = document.getElementById("blockFilterForwardReply");
 const blockContactWritesCheckbox = document.getElementById("blockContactWrites");
+const blockMailboxExportCheckbox = document.getElementById("blockMailboxExport");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
 
 async function loadSafeguardPrefs() {
   try {
-    const [skip, filter, contacts] = await Promise.all([
+    const [skip, filter, contacts, exportPref] = await Promise.all([
       browser.mcpServer.getBlockSkipReview(),
       browser.mcpServer.getBlockFilterForwardReply(),
       browser.mcpServer.getBlockContactWrites(),
+      browser.mcpServer.getBlockMailboxExport(),
     ]);
     blockSkipReviewCheckbox.checked = !!skip.blockSkipReview;
     blockFilterForwardReplyCheckbox.checked = !!filter.blockFilterForwardReply;
     blockContactWritesCheckbox.checked = !!contacts.blockContactWrites;
+    blockMailboxExportCheckbox.checked = !!exportPref.blockMailboxExport;
     saveSkipReviewBtn.disabled = false;
     saveSkipReviewStatus.textContent = "";
   } catch (e) {
@@ -426,13 +429,14 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewStatus.textContent = "Saving...";
   saveSkipReviewStatus.className = "save-status";
   try {
-    // Persist all three in parallel so one click writes a consistent state.
+    // Persist all four in parallel so one click writes a consistent state.
     // If any individual setter returns an error, surface it but continue
     // saving the others -- partial application is better than total revert.
     const results = await Promise.all([
       browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked),
       browser.mcpServer.setBlockFilterForwardReply(blockFilterForwardReplyCheckbox.checked),
       browser.mcpServer.setBlockContactWrites(blockContactWritesCheckbox.checked),
+      browser.mcpServer.setBlockMailboxExport(blockMailboxExportCheckbox.checked),
     ]);
     const errors = results.filter(r => r && r.error).map(r => r.error);
     if (errors.length > 0) {
