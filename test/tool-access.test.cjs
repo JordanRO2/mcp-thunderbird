@@ -75,6 +75,7 @@ const ALL_TOOLS = [
   { name: "searchByThread", group: "messages", crud: "read" },
   { name: "searchAttachments", group: "messages", crud: "read" },
   { name: "getSenderHistory", group: "messages", crud: "read" },
+  { name: "exportMailbox", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "dryRunCompose", group: "messages", crud: "read" },

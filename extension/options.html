@@ -278,6 +278,18 @@
         </span>
       </label>
     </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockMailboxExport">
+        <span>
+          Block bulk mailbox export via MCP. When on,
+          <code>exportMailbox</code> is refused. Bulk-exports stream
+          message content to a JSON-lines file on disk; an LLM that
+          gets prompt-injected into "back up everything" would
+          otherwise be a one-call data exfil channel.
+        </span>
+      </label>
+    </li>
   </ul>
   <div class="save-row">
     <button id="saveSkipReviewBtn" disabled>Save</button>

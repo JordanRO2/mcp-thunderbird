@@ -127,6 +127,26 @@
         ]
       },
       {
+        "name": "getBlockMailboxExport",
+        "type": "function",
+        "async": true,
+        "description": "Get whether bulk mailbox export is blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockMailboxExport",
+        "type": "function",
+        "async": true,
+        "description": "Set whether bulk mailbox export is blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockMailboxExport",
+            "type": "boolean",
+            "description": "When true, exportMailbox refuses to run."
+          }
+        ]
+      },
+      {
         "name": "readAuditLog",
         "type": "function",
         "async": true,
