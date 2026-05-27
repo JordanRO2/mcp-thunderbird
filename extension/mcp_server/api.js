@@ -3813,6 +3813,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return Math.abs(actualSize - declaredSize) > Math.max(8, declaredSize * 0.05);
             }
 
+            // Reads a message stream fully, looping on stream.available() to handle
+            // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
+            // underreport (observed at ~56% of true size for locally-injected mbox
+            // entries). Returns the raw Latin-1 bytestring or throws. Caller must
+            // close the stream.
+            function readMessageStreamFully(stream, maxBytes) {
+              let raw = "";
+              for (let safety = 0; safety < 1024; safety++) {
+                const available = stream.available();
+                if (available <= 0) break;
+                if (typeof maxBytes === "number" && raw.length + available > maxBytes) {
+                  throw new Error(`message too large (> ${maxBytes} bytes)`);
+                }
+                const chunk = NetUtil.readInputStreamToString(stream, available);
+                if (!chunk || chunk.length === 0) break;
+                raw += chunk;
+              }
+              return raw;
+            }
+
             function parseAttachmentPartsFromRawMime(rawBytes) {
               function toByteString(input) {
                 if (typeof input === "string") return input;
@@ -4120,23 +4140,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    try {
 	                      const folder = msgHdr.folder;
 	                      stream = folder.getMsgInputStream(msgHdr, {});
-	                      let messageSize = folder.hasMsgOffline(msgHdr.messageKey)
-	                        ? msgHdr.offlineMessageSize
-	                        : msgHdr.messageSize;
-	                      // For local folders (mbox), messageSize can be 0 or
-	                      // inaccurate for imported messages. Fall back to reading
-	                      // whatever is available in the stream.
-	                      if (!messageSize || messageSize <= 0) {
-	                        messageSize = stream.available();
-	                      }
-	                      if (!messageSize || messageSize <= 0) {
+	                      // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
+	                      const raw = readMessageStreamFully(stream);
+	                      if (!raw || raw.length === 0) {
 	                        resolve({ error: "Message has zero size - cannot read raw source" });
 	                        return;
 	                      }
-	                      // No charset specified -- defaults to Latin-1 which
-	                      // preserves raw bytes. UTF-8 would corrupt messages
-	                      // with 8-bit content.
-	                      const raw = NetUtil.readInputStreamToString(stream, messageSize);
 	                      resolve({
 	                        id: msgHdr.messageId,
 	                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -4173,16 +4182,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       try {
                         const rawFolder = msgHdr.folder;
                         rawStream = rawFolder.getMsgInputStream(msgHdr, {});
-                        let rawSize = rawFolder.hasMsgOffline(msgHdr.messageKey)
-                          ? msgHdr.offlineMessageSize
-                          : msgHdr.messageSize;
-                        if (!rawSize || rawSize <= 0) rawSize = rawStream.available();
-                        if (!rawSize || rawSize <= 0) {
+                        // Latin-1 default preserves raw bytes for later transfer decoding.
+                        const rawContent = readMessageStreamFully(rawStream);
+                        if (!rawContent || rawContent.length === 0) {
                           console.error(`${fallbackContext}: message stream has zero size`);
                         } else {
-                          // No charset specified -- defaults to Latin-1 which
-                          // preserves raw bytes for later transfer decoding.
-                          const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
                           // Find header/body boundary. Prefer CRLFCRLF (RFC 5322),
                           // then LFLF (LF-normalized mbox), then CRCR (legacy
                           // classic Mac exports). Pick the earliest match so a
@@ -4452,15 +4456,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                           try {
                                             const rawFolder = msgHdr.folder;
                                             rawStream = rawFolder.getMsgInputStream(msgHdr, {});
-                                            let rawSize = rawFolder.hasMsgOffline(msgHdr.messageKey)
-                                              ? msgHdr.offlineMessageSize
-                                              : msgHdr.messageSize;
-                                            if (!rawSize || rawSize <= 0) rawSize = rawStream.available();
-                                            if (!rawSize || rawSize <= 0) throw new Error("message stream has zero size");
-                                            if (rawSize > MAX_ATTACHMENT_BYTES) {
-                                              throw new Error(`raw MIME message too large (${rawSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`);
+                                            const rawContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
+                                            if (!rawContent || rawContent.length === 0) {
+                                              throw new Error("message stream has zero size");
                                             }
-                                            const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
                                             rawMimeAttachmentParts = parseAttachmentPartsFromRawMime(rawContent);
                                             return { parts: rawMimeAttachmentParts };
                                           } catch (e) {
