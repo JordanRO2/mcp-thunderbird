@@ -545,9 +545,16 @@ module.exports = function register(ctx) {
               }
             }
 
+            function shouldUseDirectComposeOpen(compType) {
+              return compType === Ci.nsIMsgCompType.ForwardInline;
+            }
+
             function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs) {
               return new Promise((resolve) => {
-                const OPEN_TIMEOUT_MS = 15000;
+                // ForwardInline needs OpenComposeWindow (libmime inline-forward body +
+                // attachment population), which streams the original before the window
+                // opens -- slow on IMAP / large attachments, so it gets a longer timeout.
+                const OPEN_TIMEOUT_MS = shouldUseDirectComposeOpen(compType) ? 60000 : 15000;
                 let settled = false;
                 let matchedWindow = null;
                 let pendingStateListener = null;
@@ -652,9 +659,23 @@ module.exports = function register(ctx) {
 
                 try {
                   Services.ww.registerNotification(windowObserver);
-                  const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                  const msgComposeService = MailServices.compose || Cc["@mozilla.org/messengercompose;1"]
                     .getService(Ci.nsIMsgComposeService);
-                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                  if (shouldUseDirectComposeOpen(compType)) {
+                    // Native inline-forward body/attachment population only runs through OpenComposeWindow.
+                    msgComposeService.OpenComposeWindow(
+                      null,
+                      msgComposeParams.origMsgHdr,
+                      originalMsgURI,
+                      compType,
+                      msgComposeParams.format,
+                      identity,
+                      identity?.email || "",
+                      null
+                    );
+                  } else {
+                    msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                  }
                 } catch (e) {
                   finish({ error: e.toString() });
                 }
