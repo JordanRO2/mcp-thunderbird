@@ -254,7 +254,11 @@ describe('Bridge discovery', () => {
   });
 
   it('macOS scan finds current uid files and ignores other owners', () => {
-    const currentUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+    // Pin a synthetic uid rather than process.getuid(). On Windows the real
+    // fs.statSync reports uid=0 for every file regardless of the caller, so we
+    // can't rely on stat.uid matching process.getuid() — both files are stat-
+    // overridden below so the uid-filter logic is exercised on any platform.
+    const currentUid = 1000;
     const darwinRoot = path.join(root, 'var', 'folders');
     const options = makeTestOptions(root, {
       platform: 'darwin',
@@ -275,6 +279,10 @@ describe('Bridge discovery', () => {
     });
 
     const statOverrides = new Map();
+    // Force both stat results: the owned file to the caller's uid and the
+    // foreign one to a different uid, so the filter is tested independent of
+    // what the host's real fs.statSync returns.
+    statOverrides.set(ownedConnFile, { uid: currentUid });
     statOverrides.set(foreignConnFile, { uid: currentUid + 1 });
 
     const connInfo = readConnectionInfo({
