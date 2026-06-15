@@ -18,9 +18,9 @@ jobs:
       matrix:
         node-version: ['18.x', '22.x', '24.x']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
       # The test suite has zero runtime dependencies, so no install step.
@@ -30,8 +30,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '22.x'
       # No package-lock.json is committed, so install (not ci) for the devDeps.
@@ -43,8 +43,8 @@ jobs:
   version-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '22.x'
       - name: Assert package.json and manifest versions match
