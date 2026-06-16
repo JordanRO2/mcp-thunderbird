@@ -498,6 +498,124 @@ function discoverConnectionInfo(options = {}) {
   return { candidates, attempts };
 }
 
+// Max raw bytes for an attachment read from a path before base64 encoding.
+// Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
+// extension's 25 MB MAX_BASE64_SIZE limit.
+const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+
+// Tools whose `attachments` array may contain string file paths that this
+// bridge resolves on the host filesystem before forwarding. Needed because the
+// Thunderbird snap (and other sandboxed installs) cannot see arbitrary host
+// paths like /data/... or the host's /tmp; passing those paths through to the
+// extension results in silent "failed to attach" warnings since file.exists()
+// returns false inside the sandbox. Reading on the bridge side and shipping
+// inline base64 sidesteps the sandbox entirely.
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'replyToMessage', 'forwardMessage']);
+
+// Minimal MIME map covering common attachment types (documents, images,
+// archives, A/V). Falls back to application/octet-stream which Thunderbird
+// handles fine.
+const MIME_BY_EXT = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  heic: 'image/heic',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  html: 'text/html',
+  htm: 'text/html',
+  md: 'text/markdown',
+  json: 'application/json',
+  xml: 'application/xml',
+  yml: 'application/yaml',
+  yaml: 'application/yaml',
+  zip: 'application/zip',
+  tar: 'application/x-tar',
+  gz: 'application/gzip',
+  '7z': 'application/x-7z-compressed',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  odp: 'application/vnd.oasis.opendocument.presentation',
+  ics: 'text/calendar',
+  eml: 'message/rfc822',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime'
+};
+
+function guessContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase().replace(/^\./, '');
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+// Read a file path off the host filesystem and convert it to the inline
+// { name, contentType, base64 } shape the extension already supports. Throws
+// a clear error on missing/unreadable/oversized files so the caller can
+// surface them as MCP errors instead of the extension's silent
+// "failed to attach" warning.
+async function readAttachmentFromPath(filePath) {
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+  } catch (e) {
+    if (e.code === 'ENOENT') throw new Error(`Attachment not found: ${filePath}`, { cause: e });
+    if (e.code === 'EACCES') throw new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: e });
+    throw new Error(`Attachment stat failed (${e.code || 'unknown'}): ${filePath}`, { cause: e });
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (stat.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `Attachment too large: ${filePath} is ${stat.size} bytes ` +
+      `(limit ${MAX_ATTACHMENT_BYTES} bytes / ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB raw before base64)`
+    );
+  }
+  let buf;
+  try {
+    buf = await fs.promises.readFile(filePath);
+  } catch (e) {
+    throw new Error(`Attachment read failed (${e.code || 'unknown'}): ${filePath}`, { cause: e });
+  }
+  return {
+    name: path.basename(filePath),
+    contentType: guessContentType(filePath),
+    base64: buf.toString('base64')
+  };
+}
+
+// Replace every string entry in `args.attachments` (= file path) with an
+// inline { name, contentType, base64 } object read off the host filesystem.
+// Inline objects pass through unchanged. Reads run in parallel; the first
+// failing path rejects the whole call so the bridge fails loud instead of
+// silently dropping an attachment.
+async function inlineAttachmentPaths(args) {
+  if (!args || !Array.isArray(args.attachments)) return;
+  const resolved = await Promise.all(
+    args.attachments.map(entry =>
+      typeof entry === 'string' ? readAttachmentFromPath(entry) : entry
+    )
+  );
+  args.attachments = resolved;
+}
+
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if no valid candidate exists.
@@ -568,7 +686,10 @@ function buildConnectionDiscoveryErrorMessage() {
 }
 
 function sanitizeJson(data) {
-  // Remove control chars except \n, \r, \t
+  // Remove control chars except \n, \r, \t. The character class is
+  // intentional -- some clients emit stray control bytes and we
+  // sanitize them out before JSON.parse() chokes on them.
+  // eslint-disable-next-line no-control-regex
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Escape raw newlines/carriage returns/tabs that aren't already escaped.
   // Match an even number of backslashes (including zero) before the control
@@ -625,6 +746,25 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { resources: [] } };
     case 'prompts/list':
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
+  }
+
+  // For mail-sending tools, inline any attachments passed as file paths.
+  // The Thunderbird extension may run inside a sandboxed snap that cannot
+  // see /data/..., the host /tmp, or any path outside its confined view —
+  // letting paths through results in silent "failed to attach" warnings.
+  // Reading on the bridge side and shipping base64 sidesteps the sandbox.
+  if (message.method === 'tools/call'
+      && message.params
+      && ATTACHMENT_TOOLS.has(message.params.name)) {
+    try {
+      await inlineAttachmentPaths(message.params.arguments);
+    } catch (e) {
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: e.message }
+      };
+    }
   }
 
   return forwardToThunderbird(message);
@@ -700,6 +840,36 @@ function tryAllHosts(hosts, postData, port, token) {
   return tryNext(hosts);
 }
 
+function compactToolResultJsonText(response) {
+  const content = response?.result?.content;
+  if (!Array.isArray(content)) {
+    return response;
+  }
+
+  let changed = false;
+  const compactedContent = content.map((item) => {
+    if (item?.type !== 'text' || typeof item.text !== 'string') {
+      return item;
+    }
+    try {
+      const compactedText = JSON.stringify(JSON.parse(item.text));
+      if (compactedText === item.text) {
+        return item;
+      }
+      changed = true;
+      return { ...item, text: compactedText };
+    } catch {
+      // Non-JSON text content is already the compact representation.
+      return item;
+    }
+  });
+
+  if (!changed) {
+    return response;
+  }
+  return { ...response, result: { ...response.result, content: compactedContent } };
+}
+
 async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
@@ -755,12 +925,12 @@ async function forwardToThunderbird(message) {
         clearConnectionCache();
         connInfo = readConnectionInfo();
         if (!connInfo) {
-          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
         }
         continue;
       }
 
-      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
     }
   }
 }
@@ -809,7 +979,7 @@ function startBridge() {
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
-          await writeOutput(JSON.stringify(response) + '\n');
+          await writeOutput(JSON.stringify(compactToolResultJsonText(response)) + '\n');
           debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
@@ -873,6 +1043,7 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  compactToolResultJsonText,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
