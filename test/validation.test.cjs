@@ -511,8 +511,9 @@ const richValidator = createValidator([
                   name: { type: 'string' },
                   contentType: { type: 'string' },
                   base64: { type: 'string' },
+                  content: { type: 'string' },
                 },
-                required: ['name', 'base64'],
+                required: ['name'],
                 additionalProperties: false,
               },
             ],
@@ -631,6 +632,36 @@ describe('Validator: oneOf items (attachments)', () => {
     });
     assert.ok(errors.some(e => /attachments\[1\]/.test(e)),
       `expected attachments[1] path, got: ${JSON.stringify(errors)}`);
+  });
+
+  // Regression: the runtime accepts `content` as an alias for `base64`
+  // (entry.base64 || entry.content). Validation must not reject {name, content}.
+  it('accepts inline attachment using `content` as a base64 alias', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c', subject: 's', body: 'b',
+      attachments: [{ name: 'a.txt', content: 'aGk=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // base64 + content together is accepted (runtime lets base64 win).
+  it('accepts inline attachment with both base64 and content set', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c', subject: 's', body: 'b',
+      attachments: [{ name: 'a.txt', base64: 'aGk=', content: 'Ynll' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Regression: validateAgainstSchema returns early on null, so a null array
+  // item used to skip the item schema entirely. Must be rejected explicitly.
+  it('rejects a null attachment item', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c', subject: 's', body: 'b',
+      attachments: [null],
+    });
+    assert.ok(errors.some(e => /must not be null/.test(e)),
+      `expected null-item rejection, got: ${JSON.stringify(errors)}`);
   });
 });
 

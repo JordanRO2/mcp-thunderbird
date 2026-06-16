@@ -181,6 +181,13 @@ function validateAgainstSchema(value, schema, path, errors) {
     }
     if (schema.items) {
       for (let i = 0; i < value.length; i++) {
+        // Array items are never nullable: validateAgainstSchema returns early
+        // on null/undefined, so a null item would otherwise skip the item
+        // schema entirely. Reject explicitly.
+        if (value[i] === null || value[i] === undefined) {
+          errors.push(`Parameter '${path}[${i}]' must not be null`);
+          continue;
+        }
         validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
       }
     }

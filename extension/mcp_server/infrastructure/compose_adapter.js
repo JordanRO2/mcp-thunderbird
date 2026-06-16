@@ -220,6 +220,16 @@ module.exports = function register(ctx) {
                       failed.push(entry);
                       continue;
                     }
+                    // SECURITY: re-check the *resolved* path. The raw string can
+                    // look benign while pointing at a credential store through a
+                    // symlink (e.g. /tmp/report.pdf -> ~/.ssh/id_rsa). Canonicalize
+                    // (resolves symlinks + . / .. components) and re-run the
+                    // deny-list before reading the file.
+                    try { file.normalize(); } catch (_) { /* keep raw path if normalize fails */ }
+                    if (isSensitiveFilePath(file.path)) {
+                      failed.push(`${entry} (sensitive path blocked)`);
+                      continue;
+                    }
                     // Size cap mirrors the saved-attachment ceiling and avoids
                     // ballooning outgoing messages when a caller points at a huge file.
                     let fileSize = 0;
