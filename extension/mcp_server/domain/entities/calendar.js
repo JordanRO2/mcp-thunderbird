@@ -66,6 +66,8 @@ function formatEvent(item, calendar) {
     // when the event has no explicit status (iCal spec treats this
     // as implicit -- Thunderbird renders it like confirmed).
     status: (item.getProperty("STATUS") || "").toLowerCase(),
+    categories: item.getCategories(),
+    onlineMeetingURL: item.getProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL") || null,
     allDay,
     isRecurring: !!item.recurrenceInfo,
   };

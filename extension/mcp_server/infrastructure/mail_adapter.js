@@ -19,7 +19,7 @@
  *   Ci, Services, MailServices, GlodaMsgSearcher,
  *   AUDIT_LOG_SUBDIR, MAX_SEARCH_RESULTS_CAP, DEFAULT_MAX_RESULTS,
  *   paginate, getUserTags, getAccessibleFolder, isFolderAccessible,
- *   wrapUntrustedPreview
+ *   wrapUntrustedPreview, messageEntity
  * Registers onto ctx:
  *   mailAdapter = { EXPORTS_SUBDIR, exportsDir, msgHdrToHeaderObject,
  *                   findTrashFolder, findSpecialFolder,
@@ -39,7 +39,13 @@ module.exports = function register(ctx) {
     getAccessibleFolder,
     isFolderAccessible,
     wrapUntrustedPreview,
+    messageEntity,
   } = ctx;
+
+  // Pure dedupe helper (lives on the message entity) used by the gloda body
+  // search path so cross-folder duplicates collapse exactly like the header
+  // search path in mail_service.js.
+  const { dedupeSearchMessageResults } = messageEntity;
 
   // Export destination subdir under <ProfD>/thunderbird-mcp/. Lives with its
   // only consumers (exportsDir + the export tool) rather than in api.js.
@@ -162,7 +168,7 @@ module.exports = function register(ctx) {
              * searchMessages. IMAP accounts need offline sync for body
              * indexing; without it only headers are searched.
              */
-            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly) {
+            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId) {
               const requestedLimit = Number(maxResults);
               const effectiveLimit = Math.min(
                 Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
@@ -247,12 +253,14 @@ module.exports = function register(ctx) {
                           results.push(result);
                         }
 
+                        const finalResults = dedupByMessageId !== false ? dedupeSearchMessageResults(results) : results;
+
                         if (countOnly) {
-                          resolve({ count: results.length });
+                          resolve({ count: finalResults.length });
                           return;
                         }
-                        results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
-                        resolve(paginate(results, offset, effectiveLimit));
+                        finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+                        resolve(paginate(finalResults, offset, effectiveLimit));
                       } catch (e) {
                         resolve({ error: e.toString() });
                       }

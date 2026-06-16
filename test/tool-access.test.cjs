@@ -70,6 +70,7 @@ const ALL_TOOLS = [
   { name: "renderTemplate", group: "system", crud: "read" },
   { name: "searchMessages", group: "messages", crud: "read" },
   { name: "getMessage", group: "messages", crud: "read" },
+  { name: "getMessages", group: "messages", crud: "read" },
   { name: "getMessageHeaders", group: "messages", crud: "read" },
   { name: "batchGetMessageHeaders", group: "messages", crud: "read" },
   { name: "searchByThread", group: "messages", crud: "read" },

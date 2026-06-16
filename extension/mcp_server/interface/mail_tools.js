@@ -20,7 +20,7 @@
  *
  * Consumes from ctx: mailService, registerToolHandler
  * Registers onto ctx:
- *   searchMessages, getMessage, getMessageHeaders, getRecentMessages,
+ *   searchMessages, getMessage, getMessages, getMessageHeaders, getRecentMessages,
  *   batchGetMessageHeaders, searchByThread, searchAttachments, getSenderHistory,
  *   displayMessage, updateMessage, deleteMessages, createFolder, renameFolder,
  *   deleteFolder, moveFolder, emptyTrash, emptyJunk, refreshFolder,
@@ -31,6 +31,7 @@
 const MAIL_TOOL_DEFS = [
   { name: "searchMessages", group: "messages", crud: "read", title: "Search Mail" },
   { name: "getMessage", group: "messages", crud: "read", title: "Get Message" },
+  { name: "getMessages", group: "messages", crud: "read", title: "Get Messages" },
   { name: "getMessageHeaders", group: "messages", crud: "read", title: "Get Message Headers" },
   { name: "exportMailbox", group: "messages", crud: "read", title: "Export Mailbox" },
   { name: "getSenderHistory", group: "messages", crud: "read", title: "Get Sender History" },
@@ -54,11 +55,14 @@ module.exports = function register(ctx) {
   const { mailService, registerToolHandler } = ctx;
 
   // Thin pass-through functions preserving the original positional signatures.
-  function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
-    return mailService.searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody);
+  function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
+    return mailService.searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId);
   }
   function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
     return mailService.getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource);
+  }
+  function getMessages(messages, saveAttachments, bodyFormat, rawSource) {
+    return mailService.getMessages(messages, saveAttachments, bodyFormat, rawSource);
   }
   function getMessageHeaders(messageId, folderPath) {
     return mailService.getMessageHeaders(messageId, folderPath);
@@ -115,8 +119,9 @@ module.exports = function register(ctx) {
   // Wire into the dispatch registry. Each closure unpacks the raw args object
   // into the original positional signature so behavior matches the old switch
   // case exactly (including the `args.query || ""` default).
-  registerToolHandler("searchMessages", (args) => searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody));
+  registerToolHandler("searchMessages", (args) => searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId));
   registerToolHandler("getMessage", (args) => getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource));
+  registerToolHandler("getMessages", (args) => getMessages(args.messages, args.saveAttachments, args.bodyFormat, args.rawSource));
   registerToolHandler("getMessageHeaders", (args) => getMessageHeaders(args.messageId, args.folderPath));
   registerToolHandler("batchGetMessageHeaders", (args) => batchGetMessageHeaders(args.messageIds, args.folderPath));
   registerToolHandler("searchByThread", (args) => searchByThread(args.messageId, args.folderPath, args.maxResults));
@@ -137,7 +142,7 @@ module.exports = function register(ctx) {
 
   // Back-compat: also expose the bare functions on ctx (harmless if unused).
   Object.assign(ctx, {
-    searchMessages, getMessage, getMessageHeaders, getRecentMessages,
+    searchMessages, getMessage, getMessages, getMessageHeaders, getRecentMessages,
     batchGetMessageHeaders, searchByThread, searchAttachments, getSenderHistory,
     displayMessage, updateMessage, deleteMessages, createFolder, renameFolder,
     deleteFolder, moveFolder, emptyTrash, emptyJunk, refreshFolder, exportMailbox,

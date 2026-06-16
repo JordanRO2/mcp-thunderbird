@@ -71,6 +71,17 @@ function createValidator(tools) {
       }
       if (value === undefined || value === null) continue;
 
+      // Mirror dispatch.js: array length bounds (minItems/maxItems) are enforced
+      // in validateToolArgs, NOT in the shared validateAgainstSchema walker.
+      if (Array.isArray(value)) {
+        if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+          errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+        }
+        if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+          errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+        }
+      }
+
       validateAgainstSchema(value, propSchema, key, errors);
     }
 
@@ -91,8 +102,35 @@ const sampleTools = [
         offset: { type: "number" },
         unreadOnly: { type: "boolean" },
         tag: { type: "string" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "getMessages",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messages: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              messageId: { type: "string" },
+              folderPath: { type: "string" },
+            },
+            required: ["messageId", "folderPath"],
+            additionalProperties: false,
+          },
+        },
+        saveAttachments: { type: "boolean" },
+        bodyFormat: { type: "string", enum: ["markdown", "text", "html"] },
+        rawSource: { type: "boolean" },
+      },
+      required: ["messages"],
     },
   },
   {
@@ -290,6 +328,90 @@ describe('Validation: pagination parameters', () => {
       maxResults: 50,
     });
     assert.equal(errors.length, 0);
+  });
+});
+
+describe('Validation: searchMessages dedupByMessageId', () => {
+  it('accepts dedupByMessageId as a boolean', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      dedupByMessageId: false,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects dedupByMessageId as a non-boolean', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      dedupByMessageId: 'yes',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be boolean/);
+  });
+});
+
+describe('Validation: getMessages batch (array bounds)', () => {
+  const validItem = { messageId: 'm-1', folderPath: 'imap://user@server/INBOX' };
+
+  it('accepts a valid batch of message references', () => {
+    const errors = validate('getMessages', {
+      messages: [
+        { messageId: 'm-1', folderPath: 'imap://x/INBOX' },
+        { messageId: 'm-2', folderPath: 'imap://x/Archive' },
+      ],
+      bodyFormat: 'markdown',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects an empty array (minItems: 1)', () => {
+    const errors = validate('getMessages', { messages: [] });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 item/);
+  });
+
+  it('rejects an over-limit array (maxItems: 20)', () => {
+    const messages = Array.from({ length: 21 }, (_, i) => ({
+      messageId: `m-${i}`,
+      folderPath: 'imap://x/INBOX',
+    }));
+    const errors = validate('getMessages', { messages });
+    assert.ok(errors.some(e => /at most 20 item/.test(e)),
+      `expected maxItems rejection, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects a null item ("must not be null")', () => {
+    const errors = validate('getMessages', { messages: [validItem, null] });
+    assert.ok(errors.some(e => /must not be null/.test(e)),
+      `expected null-item rejection, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects an item missing a required field', () => {
+    const errors = validate('getMessages', {
+      messages: [{ messageId: 'm-1' }],
+    });
+    assert.ok(errors.some(e => /Missing required parameter/.test(e)),
+      `expected missing-required rejection, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects an unknown property on an item (additionalProperties: false)', () => {
+    const errors = validate('getMessages', {
+      messages: [{ ...validItem, evil: '../../etc/passwd' }],
+    });
+    assert.ok(errors.some(e => /Unknown parameter/.test(e)),
+      `expected unknown-property rejection, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects an unknown top-level parameter', () => {
+    const errors = validate('getMessages', { messages: [validItem], bogus: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+
+  it('requires the messages array', () => {
+    const errors = validate('getMessages', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /messages/);
   });
 });
 

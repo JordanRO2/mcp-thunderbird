@@ -22,7 +22,8 @@
  *   isSafeImageSrc, isSafeMarkdownHref, escapeMarkdownLinkText,
  *   renderMarkdownLink, wrapUntrustedBody
  * Registers onto ctx:
- *   messageEntity = { htmlToMarkdown, extractFormattedBody, buildExportFilename }
+ *   messageEntity = { htmlToMarkdown, extractFormattedBody, buildExportFilename,
+ *                     normalizeMessageIdForDedup, dedupeSearchMessageResults }
  *
  * `buildExportFilename` is a pure string builder: it only reads folder.URI (a
  * plain string already in hand) and formats a timestamped filename — no service
@@ -35,6 +36,76 @@
  * component derived from the folder URI's tail. Pure: only consumes
  * folder.URI as a string.
  */
+function normalizeMessageIdForDedup(value) {
+  // Compare RFC Message-IDs without surrounding angle brackets / whitespace.
+  // Case is preserved on purpose: the local part of a Message-ID is
+  // case-sensitive per RFC 5322, so lowercasing could collapse two
+  // genuinely-distinct messages and hide one. Showing a duplicate is the
+  // safe failure direction; hiding a message is not.
+  if (value === undefined || value === null) return "";
+  let normalized = String(value).trim();
+  if (!normalized) return "";
+  if (normalized.startsWith("<") && normalized.endsWith(">")) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  return normalized;
+}
+
+/**
+ * Collapse search results that share the same RFC Message-ID into a single
+ * row, listing the other folder URIs the message was found in under
+ * `dupLocations`. Pure: operates on the already-built result objects (each
+ * carrying `id` and `folderPath`). Rows without a usable Message-ID are kept
+ * as-is (the safe direction: never hide a message).
+ */
+function dedupeSearchMessageResults(results) {
+  const seen = new Map();
+  const deduped = [];
+
+  function addDupLocation(survivor, folderPath) {
+    if (!folderPath || folderPath === survivor.folderPath) return;
+    if (!Array.isArray(survivor.dupLocations)) survivor.dupLocations = [];
+    if (!survivor.dupLocations.includes(folderPath)) {
+      survivor.dupLocations.push(folderPath);
+    }
+  }
+
+  function mergeDupLocations(survivor, row) {
+    addDupLocation(survivor, row.folderPath);
+    if (Array.isArray(row.dupLocations)) {
+      for (const folderPath of row.dupLocations) {
+        addDupLocation(survivor, folderPath);
+      }
+    }
+  }
+
+  for (const row of results) {
+    const normalizedId = normalizeMessageIdForDedup(row?.id);
+    if (!normalizedId) {
+      deduped.push(row);
+      continue;
+    }
+
+    const survivor = seen.get(normalizedId);
+    if (survivor) {
+      mergeDupLocations(survivor, row);
+      continue;
+    }
+
+    if (Array.isArray(row.dupLocations)) {
+      const existingDupLocations = row.dupLocations;
+      delete row.dupLocations;
+      for (const folderPath of existingDupLocations) {
+        addDupLocation(row, folderPath);
+      }
+    }
+    seen.set(normalizedId, row);
+    deduped.push(row);
+  }
+
+  return deduped;
+}
+
 function buildExportFilename(folder) {
   const ts = new Date().toISOString().replace(/[:]/g, "-");
   const tail = folder.URI ? folder.URI.split("/").pop() : "folder";
@@ -198,7 +269,10 @@ function buildMessageEntity(deps) {
               return { body: wrapUntrustedBody(htmlToMarkdown(text)), bodyIsHtml: false };
             }
 
-  return { htmlToMarkdown, extractFormattedBody, buildExportFilename };
+  return {
+    htmlToMarkdown, extractFormattedBody, buildExportFilename,
+    normalizeMessageIdForDedup, dedupeSearchMessageResults,
+  };
 }
 
 module.exports = function register(ctx) {

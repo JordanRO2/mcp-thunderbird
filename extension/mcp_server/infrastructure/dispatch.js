@@ -66,6 +66,19 @@ module.exports = function register(ctx) {
       }
       if (value === undefined || value === null) continue;
 
+      // Array length bounds (minItems/maxItems) sit OUTSIDE validateAgainstSchema
+      // (the shared schema walker in security_helpers.js intentionally does not
+      // check them), so enforce them here. This keeps the batch caps (e.g.
+      // getMessages maxItems) honored before the handler runs.
+      if (Array.isArray(value)) {
+        if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+          errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+        }
+        if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+          errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+        }
+      }
+
       validateAgainstSchema(value, propSchema, key, errors);
     }
 

@@ -45,7 +45,7 @@ module.exports = function register(ctx) {
     }
   }
 
-  async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
+  async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
     if (!calendarAdapter.eventsAvailable()) {
       return { error: "Calendar module not available" };
     }
@@ -122,13 +122,21 @@ module.exports = function register(ctx) {
 
       if (location) calendarAdapter.setProp(event, "LOCATION", location);
       if (description) calendarAdapter.setProp(event, "DESCRIPTION", description);
-      if (status !== undefined && status !== null && status !== "") {
-        const normalized = normalizeEventStatus(status);
-        if (!normalized) {
-          return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
-        }
-        calendarAdapter.setProp(event, "STATUS", normalized);
+      if (showAs !== undefined && showAs !== null && showAs !== "busy" && showAs !== "free") {
+        return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
       }
+      // STATUS: explicit param wins; otherwise derive from showAs so Thunderbird renders busy=solid, free=hatched
+      const effectiveStatus = (status !== undefined && status !== null && status !== "")
+        ? status
+        : (showAs === "free" ? "tentative" : "confirmed");
+      const normalizedStatus = normalizeEventStatus(effectiveStatus);
+      if (!normalizedStatus) {
+        return { error: `Invalid status: "${effectiveStatus}". Expected tentative, confirmed, or cancelled.` };
+      }
+      calendarAdapter.setProp(event, "STATUS", normalizedStatus);
+      calendarAdapter.setProp(event, "TRANSP", showAs === "free" ? "TRANSPARENT" : "OPAQUE");
+      if (categories && categories.length > 0) event.setCategories(categories);
+      if (onlineMeeting) calendarAdapter.setProp(event, "X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
 
       // Find target calendar
       let targetCalendar = null;
@@ -255,7 +263,7 @@ module.exports = function register(ctx) {
     }
   }
 
-  async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope) {
+  async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurringScope) {
     if (!calendarAdapter.available()) return { error: "Calendar not available" };
     try {
       if (!eventId) return { error: "eventId is required" };
@@ -323,6 +331,36 @@ module.exports = function register(ctx) {
           calendarAdapter.setProp(newItem, "STATUS", normalized);
         }
         changes.push("status");
+      }
+      if (showAs !== undefined) {
+        if (showAs === null || showAs === "") {
+          calendarAdapter.deleteProp(newItem, "TRANSP");
+        } else if (showAs === "free") {
+          calendarAdapter.setProp(newItem, "TRANSP", "TRANSPARENT");
+          // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
+          if (status === undefined) { calendarAdapter.setProp(newItem, "STATUS", "TENTATIVE"); changes.push("status"); }
+        } else if (showAs === "busy") {
+          calendarAdapter.setProp(newItem, "TRANSP", "OPAQUE");
+          // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
+          if (status === undefined) { calendarAdapter.setProp(newItem, "STATUS", "CONFIRMED"); changes.push("status"); }
+        } else {
+          return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
+        }
+        changes.push("showAs");
+      }
+      // null/undefined preserves existing categories; empty array clears them.
+      if (Array.isArray(categories)) {
+        newItem.setCategories(categories);
+        changes.push("categories");
+      }
+      if (onlineMeeting !== undefined) {
+        if (onlineMeeting) {
+          calendarAdapter.setProp(newItem, "X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
+        } else {
+          calendarAdapter.deleteProp(newItem, "X-ONLINE-MEETING-PROVIDER");
+          calendarAdapter.deleteProp(newItem, "X-MICROSOFT-SKYPETEAMSMEETINGURL");
+        }
+        changes.push("onlineMeeting");
       }
 
       if (changes.length === 0) return { error: "No changes specified" };

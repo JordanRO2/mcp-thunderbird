@@ -12,9 +12,9 @@
  * Tool names/args/behavior are preserved exactly (matching the old legacy
  * switch arg order):
  *   listCalendars()
- *   createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status)
+ *   createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting)
  *   listEvents(calendarId, startDate, endDate, maxResults)
- *   updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope)
+ *   updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurringScope)
  *   deleteEvent(eventId, calendarId, recurringScope)
  *   listCategories()
  *   createTask(title, dueDate, calendarId, description, priority, categories, skipReview)
@@ -60,6 +60,9 @@ const CALENDAR_TOOL_DEFS = [
         calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
         allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
         status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
+        showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
+        categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
+        onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
         skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
       },
       required: ["title", "startDate"],
@@ -97,6 +100,9 @@ const CALENDAR_TOOL_DEFS = [
         location: { type: "string", description: "New event location (optional)" },
         description: { type: "string", description: "New event description (optional)" },
         status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
+        showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
+        categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
+        onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
         recurringScope: { type: "string", enum: ["series"], description: "Required for recurring events. 'series' rewrites every occurrence past and future. Per-occurrence editing is not supported through this API; use Thunderbird's UI." },
       },
       required: ["eventId", "calendarId"],
@@ -187,14 +193,14 @@ module.exports = function register(ctx) {
   function listCalendars() {
     return calendarService.listCalendars();
   }
-  function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
-    return calendarService.createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status);
+  function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
+    return calendarService.createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting);
   }
   function listEvents(calendarId, startDate, endDate, maxResults) {
     return calendarService.listEvents(calendarId, startDate, endDate, maxResults);
   }
-  function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope) {
-    return calendarService.updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope);
+  function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurringScope) {
+    return calendarService.updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurringScope);
   }
   function deleteEvent(eventId, calendarId, recurringScope) {
     return calendarService.deleteEvent(eventId, calendarId, recurringScope);
@@ -216,9 +222,9 @@ module.exports = function register(ctx) {
   // we unpack it into the original positional signature so behavior matches the
   // old switch case exactly.
   registerToolHandler("listCalendars", () => listCalendars());
-  registerToolHandler("createEvent", (args) => createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status));
+  registerToolHandler("createEvent", (args) => createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting));
   registerToolHandler("listEvents", (args) => listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults));
-  registerToolHandler("updateEvent", (args) => updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurringScope));
+  registerToolHandler("updateEvent", (args) => updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurringScope));
   registerToolHandler("deleteEvent", (args) => deleteEvent(args.eventId, args.calendarId, args.recurringScope));
   registerToolHandler("listCategories", () => listCategories());
   registerToolHandler("createTask", (args) => createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview));

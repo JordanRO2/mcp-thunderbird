@@ -302,7 +302,7 @@ module.exports = function register(ctx) {
 
     if (accountId) {
       if (!isAccountAllowed(accountId)) {
-        return { error: `Account not accessible: ${accountId}` };
+        return { error: `Account not accessible: "${accountId}". Call listAccounts to see which account IDs are available.` };
       }
       let target = null;
       for (const account of MailServices.accounts.accounts) {
@@ -312,7 +312,7 @@ module.exports = function register(ctx) {
         }
       }
       if (!target) {
-        return { error: `Account not found: ${accountId}` };
+        return { error: `Account not found: "${accountId}". Account IDs come from listAccounts (internal keys like "account1"), not email addresses. Omit accountId to list folders across all accounts.` };
       }
       try {
         const root = target.incomingServer.rootFolder;

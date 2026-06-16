@@ -26,7 +26,7 @@
  *   mailAdapter, messageEntity
  * Registers onto ctx:
  *   mailService = {
- *     searchMessages, getMessage, getMessageHeaders, getRecentMessages,
+ *     searchMessages, getMessage, getMessages, getMessageHeaders, getRecentMessages,
  *     batchGetMessageHeaders, searchByThread, searchAttachments,
  *     getSenderHistory, displayMessage, updateMessage, deleteMessages,
  *     createFolder, renameFolder, deleteFolder, moveFolder, emptyTrash,
@@ -72,7 +72,10 @@ module.exports = function register(ctx) {
     deleteAllMessagesRecursive,
     glodaBodySearch,
   } = mailAdapter;
-  const { htmlToMarkdown, extractFormattedBody, buildExportFilename } = messageEntity;
+  const {
+    htmlToMarkdown, extractFormattedBody, buildExportFilename,
+    dedupeSearchMessageResults,
+  } = messageEntity;
 
   // ── Export/search limit constants (used only by the mailbox-export and
   // search tools, so they live with their consumers rather than in api.js). ──
@@ -80,6 +83,10 @@ module.exports = function register(ctx) {
   const EXPORT_HARD_CAP = 50000;
   const EXPORT_DEFAULT_SCAN_CAP = 50000;
   const SEARCH_COLLECTION_CAP = 10000;
+  // Max messages a single getMessages batch call may read. Mirrors the upstream
+  // cap; the array bound in the tool schema (maxItems) is kept in lock-step with
+  // this so validation rejects over-limit batches before the handler runs.
+  const GET_MESSAGES_LIMIT = 20;
 
             /**
              * Async streaming export. Resolves once every message has been
@@ -237,7 +244,7 @@ module.exports = function register(ctx) {
               });
             }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
 	              // Gloda full-body search path (async).
 	              //
 	              // SECURITY: GlodaMsgSearcher passes the query through to a
@@ -258,7 +265,7 @@ module.exports = function register(ctx) {
 	                    error: "searchBody query must be plain keywords. Gloda operators (AND, OR, NOT, *, \", parentheses) are rejected by this MCP API.",
 	                  };
 	                }
-	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly);
+	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
 	              }
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
@@ -400,13 +407,17 @@ module.exports = function register(ctx) {
                 }
               }
 
+              // Collapse cross-folder duplicates by RFC Message-ID (default on);
+              // pass dedupByMessageId:false to keep every folder/label location.
+              const finalResults = dedupByMessageId !== false ? dedupeSearchMessageResults(results) : results;
+
               if (countOnly) {
-                return { count: results.length };
+                return { count: finalResults.length };
               }
 
-              results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+              finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return paginate(results, offset, effectiveLimit);
+              return paginate(finalResults, offset, effectiveLimit);
             }
 
 	            /**
@@ -1356,6 +1367,75 @@ module.exports = function register(ctx) {
 	              });
 	            }
 
+            /**
+             * Batch variant of getMessage: read full content for up to
+             * GET_MESSAGES_LIMIT messages in one call. Each item is
+             * { messageId, folderPath }. Reuses the single-message getMessage
+             * path verbatim (no duplicated MIME/body/attachment logic) and
+             * tags each result with its array index so the caller can correlate
+             * partial failures. Per-item errors are returned inline rather than
+             * aborting the whole batch.
+             */
+            async function getMessages(messages, saveAttachments, bodyFormat, rawSource) {
+              if (typeof messages === "string") {
+                try { messages = JSON.parse(messages); } catch { /* leave as-is */ }
+              }
+              if (!Array.isArray(messages) || messages.length === 0) {
+                return { error: "messages must be a non-empty array of { messageId, folderPath } objects" };
+              }
+              if (messages.length > GET_MESSAGES_LIMIT) {
+                return { error: `getMessages accepts at most ${GET_MESSAGES_LIMIT} messages per call` };
+              }
+
+              const results = [];
+              for (let i = 0; i < messages.length; i++) {
+                const ref = messages[i];
+                if (!ref || typeof ref !== "object" || Array.isArray(ref)) {
+                  results.push({
+                    index: i,
+                    error: "Message reference must be an object with messageId and folderPath",
+                  });
+                  continue;
+                }
+
+                const { messageId, folderPath } = ref;
+                if (typeof messageId !== "string" || !messageId) {
+                  results.push({
+                    index: i,
+                    folderPath,
+                    error: "messageId must be a non-empty string",
+                  });
+                  continue;
+                }
+                if (typeof folderPath !== "string" || !folderPath) {
+                  results.push({
+                    index: i,
+                    messageId,
+                    error: "folderPath must be a non-empty string",
+                  });
+                  continue;
+                }
+
+                const result = await getMessage(
+                  messageId,
+                  folderPath,
+                  saveAttachments,
+                  bodyFormat,
+                  rawSource
+                );
+                results.push({ index: i, messageId, folderPath, ...result });
+              }
+
+              const failed = results.filter(result => result.error).length;
+              return {
+                messages: results,
+                requested: messages.length,
+                succeeded: results.length - failed,
+                failed,
+                max: GET_MESSAGES_LIMIT,
+              };
+            }
+
             function displayMessage(messageId, folderPath, displayMode) {
               const found = findMessage(messageId, folderPath);
               if (found.error) return found;
@@ -2019,6 +2099,7 @@ module.exports = function register(ctx) {
     mailService: {
       searchMessages,
       getMessage,
+      getMessages,
       getMessageHeaders,
       getRecentMessages,
       batchGetMessageHeaders,
