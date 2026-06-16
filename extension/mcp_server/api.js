@@ -1478,7 +1478,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const server = new HttpServer();
 
-            server.registerPathHandler("/", (req, res) => {
+            const mcpHandler = (req, res) => {
               res.processAsync();
 
               // Verify auth token on ALL requests (including non-POST) to
@@ -1673,7 +1673,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 console.error("thunderbird-mcp: unhandled dispatch error:", e);
                 try { res.finish(); } catch {}
               });
-            });
+            };
+            // Serve the MCP JSON-RPC handler at /mcp (canonical, matches the
+            // other MCP servers) and at / (backwards compatibility).
+            server.registerPathHandler("/mcp", mcpHandler);
+            server.registerPathHandler("/", mcpHandler);
 
             // Try the default port first, then fall back to nearby ports
             let boundPort = null;
