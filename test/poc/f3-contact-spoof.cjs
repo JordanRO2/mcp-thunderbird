@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const { callTool, banner, log } = require('./_client.cjs');
+const { callTool, banner, log, loadConnection } = require('./_client.cjs');
 
 const TEST_DISPLAY_NAME = 'POC-F3-Boss-DELETE-ME';
 const TEST_REAL_EMAIL = 'boss@dummy.invalid';
@@ -107,7 +107,20 @@ async function safeDelete(contactId) {
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`PoC failed: ${e.message}\n`);
-  process.exit(99);
-});
+if (process.env.NODE_TEST_CONTEXT) {
+  // Discovered by `node --test`. This is a MANUAL security PoC: it talks to a
+  // live Thunderbird profile and signals patched/vulnerable through semantic
+  // process.exit() codes, so it is not a unit test. Register a skipped test
+  // (with a reason) instead of letting the connection error surface as a suite
+  // failure. Run it standalone — `node test/poc/f3-contact-spoof.cjs` — to
+  // actually exercise the F3 chain.
+  const { test } = require('node:test');
+  let reason = 'manual PoC — run standalone against a live Thunderbird test profile';
+  try { loadConnection(); } catch { reason = 'no live Thunderbird MCP connection'; }
+  test('F3 PoC: contact-spoof (manual)', { skip: reason }, () => {});
+} else {
+  main().catch((e) => {
+    process.stderr.write(`PoC failed: ${e.message}\n`);
+    process.exit(99);
+  });
+}

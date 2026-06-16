@@ -17,7 +17,7 @@
  */
 'use strict';
 
-const { callTool, banner, log } = require('./_client.cjs');
+const { callTool, banner, log, loadConnection } = require('./_client.cjs');
 
 const ATTACKER = 'attacker@dummy.invalid';
 const TEST_FILTER_NAME = 'POC-F1-FILTER-FORWARD-DELETE-ME';
@@ -101,7 +101,20 @@ async function main() {
   process.exit(1); // exit non-zero so CI / wrappers can tell "unpatched"
 }
 
-main().catch((e) => {
-  process.stderr.write(`PoC failed: ${e.message}\n`);
-  process.exit(99);
-});
+if (process.env.NODE_TEST_CONTEXT) {
+  // Discovered by `node --test`. This is a MANUAL security PoC: it talks to a
+  // live Thunderbird profile and signals patched/vulnerable through semantic
+  // process.exit() codes, so it is not a unit test. Register a skipped test
+  // (with a reason) instead of letting the connection error surface as a suite
+  // failure. Run it standalone — `node test/poc/f1-filter-forward.cjs` — to
+  // actually exercise the F1 chain.
+  const { test } = require('node:test');
+  let reason = 'manual PoC — run standalone against a live Thunderbird test profile';
+  try { loadConnection(); } catch { reason = 'no live Thunderbird MCP connection'; }
+  test('F1 PoC: silent-forward filter (manual)', { skip: reason }, () => {});
+} else {
+  main().catch((e) => {
+    process.stderr.write(`PoC failed: ${e.message}\n`);
+    process.exit(99);
+  });
+}
