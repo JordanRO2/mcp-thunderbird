@@ -1,4 +1,3 @@
-/* global ChromeUtils */
 "use strict";
 
 /**

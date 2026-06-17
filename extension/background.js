@@ -1,5 +1,3 @@
-/* global browser */
-
 async function init() {
   try {
     const result = await browser.mcpServer.start();

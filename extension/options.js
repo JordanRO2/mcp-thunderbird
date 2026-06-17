@@ -1,4 +1,3 @@
-/* global browser */
 "use strict";
 
 const statusDot = document.getElementById("statusDot");

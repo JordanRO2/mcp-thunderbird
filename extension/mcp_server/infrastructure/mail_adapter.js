@@ -83,7 +83,7 @@ module.exports = function register(ctx) {
 
             function findTrashFolder(folder) {
               const TRASH_FLAG = 0x00000100;
-              let account = null;
+              let account;
               try {
                 account = MailServices.accounts.findAccountForServer(folder.server);
               } catch {

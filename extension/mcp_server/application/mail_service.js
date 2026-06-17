@@ -971,7 +971,7 @@ module.exports = function register(ctx) {
                         const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
                         for (const { part, name, ct } of inlineImages) {
                           // Resolve to a fetchable URL via the message service
-                          let partUrl = "";
+                          let partUrl;
                           try {
                             const svc = MailServices.messageServiceFromURI(msgUri);
                             const baseUri = svc.getUrlForUri(msgUri);
@@ -1187,7 +1187,7 @@ module.exports = function register(ctx) {
                                           } catch (e) {
                                             return { error: `attachment raw MIME recovery write failed: ${e}` };
                                           }
-                                          let recoveredSize = null;
+                                          let recoveredSize;
                                           try {
                                             recoveredSize = file.fileSize;
                                             if (recoveredSize > MAX_ATTACHMENT_BYTES) {

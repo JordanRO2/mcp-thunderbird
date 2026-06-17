@@ -1,4 +1,3 @@
-/* global ExtensionCommon, ChromeUtils, Services, Cc, Ci */
 "use strict";
 
 /**
@@ -1726,7 +1725,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 break;
               } catch (portErr) {
                 if (attempt === MCP_MAX_PORT_ATTEMPTS - 1) {
-                  throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${tryPort}: ${portErr}`);
+                  throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${tryPort}: ${portErr}`, { cause: portErr });
                 }
                 console.warn(`Port ${tryPort} in use, trying ${tryPort + 1}...`);
               }

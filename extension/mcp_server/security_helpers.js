@@ -623,7 +623,7 @@ function parseAttachmentPartsFromRawMime(rawBytes) {
     const hasNonTextFilename = !!filename && !ct.startsWith("text/");
     if (!hasAttachmentDisposition && !hasInlineFilename && !hasNonTextFilename) return;
 
-    let bytes = null;
+    let bytes;
     try {
       bytes = decodeTransferBody(split.body, getHeader(headers, "content-transfer-encoding"));
     } catch {
