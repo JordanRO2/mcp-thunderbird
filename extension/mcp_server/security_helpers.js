@@ -139,7 +139,7 @@ function isSafeImageSrc(url) {
 }
 
 function escapeMarkdownLinkText(s) {
-  return String(s).replace(/[\[\]]/g, m => (m === '[' ? '\\[' : '\\]'));
+  return String(s).replace(/[[\]]/g, m => (m === '[' ? '\\[' : '\\]'));
 }
 
 function renderMarkdownLink(text, url) {
