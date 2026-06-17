@@ -464,6 +464,20 @@ const sampleTools = [
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+  {
+    name: "searchAttachments",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nameContains: { type: "string" },
+        contentType: { type: "string" },
+        folderPath: { type: "string" },
+        maxResults: { type: "integer" },
+        scanCap: { type: "integer" },
+      },
+      required: [],
+    },
+  },
 ];
 
 const validate = createValidator(sampleTools);
@@ -2094,5 +2108,80 @@ describe('Validation: batchGetMessageHeaders', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /at least 1 character/);
+  });
+});
+
+describe('Validation: searchAttachments', () => {
+  it('accepts only nameContains (no required params)', () => {
+    const errors = validate('searchAttachments', { nameContains: 'invoice' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts only contentType', () => {
+    const errors = validate('searchAttachments', { contentType: 'application/pdf' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts both filters plus folderPath, maxResults, scanCap', () => {
+    const errors = validate('searchAttachments', {
+      nameContains: 'invoice',
+      contentType: 'application/pdf',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 100,
+      scanCap: 10000,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // required: [] -- no params are mandatory at the validation layer. The
+  // "provide at least one filter" rule is enforced by the handler, not the
+  // schema, so an empty args object passes validation.
+  it('accepts an empty args object (the filter rule lives in the handler)', () => {
+    const errors = validate('searchAttachments', {});
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects nameContains of the wrong type', () => {
+    const errors = validate('searchAttachments', { nameContains: 42 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects contentType of the wrong type', () => {
+    const errors = validate('searchAttachments', { contentType: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts integer maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: 50 });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects non-integer (float) maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: 12.5 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: '50' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects non-integer (float) scanCap', () => {
+    const errors = validate('searchAttachments', { contentType: 'image/', scanCap: 99.9 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('searchAttachments', {
+      nameContains: 'invoice',
+      regex: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: regex/);
   });
 });
