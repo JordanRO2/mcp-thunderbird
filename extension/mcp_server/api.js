@@ -2636,16 +2636,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             searchFolderPaths: { type: "array", items: { type: "string" }, description: "Folder URIs to search across (from listFolders)" },
             conditions: {
               type: "array",
-              description: "Search conditions. Same attrib/op vocabulary as createFilter.",
+              minItems: 1,
+              description: "Search conditions. Same attrib/op/value vocabulary as createFilter.",
               items: {
                 type: "object",
                 properties: {
-                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
-                  op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
-                  value: { type: "string", description: "Value to match against" },
+                  attrib: { type: "string", description: FILTER_ATTRIB_DESCRIPTION },
+                  op: { type: "string", description: FILTER_OP_DESCRIPTION },
+                  value: { type: "string", description: FILTER_VALUE_DESCRIPTION },
                   booleanAnd: { type: "boolean", description: "true=AND with the other terms, false=OR (default: true). Thunderbird applies one boolean to the whole saved search." },
-                  header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
+                  header: { type: "string", description: FILTER_HEADER_DESCRIPTION },
                 },
+                required: ["attrib", "op"],
+                additionalProperties: false,
               },
             },
             searchOnline: { type: "boolean", description: "Search on the server rather than locally (IMAP only, slower). Default false." },
@@ -10549,73 +10552,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               ).VirtualFolderHelper;
             }
 
-            /**
-             * Build nsIMsgSearchTerm objects outside of a filter. Filters mint
-             * terms via filter.createTerm(); a saved search has no filter, so we
-             * borrow a throwaway search session as the term factory. Same strict
-             * ATTRIB_MAP/OP_MAP allow-lists as buildTerms -- raw enum values must
-             * not be reachable from MCP input.
-             */
+            // Build nsIMsgSearchTerm objects outside of a filter. A saved search has
+            // no nsIMsgFilter to mint terms from, so a throwaway search session
+            // stands in: it exposes the same createTerm/appendTerm pair, which lets
+            // buildTerms apply its allow-lists, header handling and typed search
+            // values unchanged.
             function buildSearchTerms(conditions) {
               const session = Cc["@mozilla.org/messenger/searchSession;1"]
                 .createInstance(Ci.nsIMsgSearchSession);
-              const terms = [];
-              for (const cond of conditions) {
-                if (!Object.prototype.hasOwnProperty.call(ATTRIB_MAP, cond.attrib)) {
-                  throw new Error(`Unknown attribute: ${cond.attrib}`);
-                }
-                if (!Object.prototype.hasOwnProperty.call(OP_MAP, cond.op)) {
-                  throw new Error(`Unknown operator: ${cond.op}`);
-                }
-                const term = session.createTerm();
-                term.attrib = ATTRIB_MAP[cond.attrib];
-                term.op = OP_MAP[cond.op];
-
-                // nsIMsgSearchValue is a tagged union: only the member matching
-                // the attribute's type may be written. Assigning .str to a
-                // numeric/status attribute throws NS_ERROR_ILLEGAL_VALUE, so
-                // dispatch on the attribute rather than assuming everything is
-                // a string.
-                const value = term.value;
-                value.attrib = term.attrib;
-                const raw = cond.value == null ? "" : String(cond.value);
-                const num = parseInt(raw, 10);
-                switch (term.attrib) {
-                  case 13: // hasAttachment -- matched via the message flag
-                    value.status = Ci.nsMsgMessageFlags.Attachment;
-                    break;
-                  case 5:  // status
-                  case 14: // junkStatus
-                    value.status = Number.isNaN(num) ? 0 : num;
-                    break;
-                  case 4: // priority
-                    value.priority = Number.isNaN(num) ? 0 : num;
-                    break;
-                  case 10: // ageInDays
-                    value.age = Number.isNaN(num) ? 0 : num;
-                    break;
-                  case 11: // size
-                    value.size = Number.isNaN(num) ? 0 : num;
-                    break;
-                  case 15: // junkPercent
-                    value.junkPercent = Number.isNaN(num) ? 0 : num;
-                    break;
-                  case 3: { // date -- nsIMsgSearchValue.date is PRTime (microseconds)
-                    const parsed = Date.parse(raw);
-                    if (Number.isNaN(parsed)) throw new Error(`Invalid date value: ${raw}`);
-                    value.date = parsed * 1000;
-                    break;
-                  }
-                  default:
-                    value.str = raw;
-                }
-                term.value = value;
-
-                term.booleanAnd = cond.booleanAnd !== false;
-                if (cond.header) term.arbitraryHeader = cond.header;
-                terms.push(term);
-              }
-              return terms;
+              buildTerms(session, conditions);
+              return session.searchTerms;
             }
 
             function createVirtualFolder(name, parentFolderPath, searchFolderPaths, conditions, searchOnline) {
@@ -10692,12 +10638,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const w = helper.wrapVirtualFolder(folder);
                     searchFolders = (w.searchFolders || []).map((f) => f.URI);
                     onlineSearch = !!w.onlineSearch;
-                    terms = (w.searchTerms || []).map((t) => ({
-                      attrib: ATTRIB_NAMES[t.attrib] ?? t.attrib,
-                      op: OP_NAMES[t.op] ?? t.op,
-                      value: t.value ? t.value.str : "",
-                      booleanAnd: t.booleanAnd,
-                    }));
+                    terms = (w.searchTerms || []).map(serializeSearchTerm);
                   } catch { /* unreadable wrapper -- still report the folder */ }
 
                   out.push({
