@@ -6456,7 +6456,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               });
               calendarRefreshInFlight.set(id, completion);
-              completion.then(() => calendarRefreshInFlight.delete(id));
+              // completion never rejects (every path settles via resolve).
+              completion.then(() => calendarRefreshInFlight.delete(id)).catch(() => {});
               return completion;
             }
 
@@ -11845,7 +11846,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               });
               refreshInFlight.set(uri, completion);
-              completion.then(() => refreshInFlight.delete(uri));
+              // completion never rejects (every path settles via resolve).
+              completion.then(() => refreshInFlight.delete(uri)).catch(() => {});
               return completion;
             }
 
