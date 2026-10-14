@@ -187,6 +187,8 @@ The separate "Filter Send Actions" section controls **Allow automatic Forward/Re
 
 The "Contact Writes" section controls **Allow contact writes**, which defaults to off and gates `createContact`, `updateContact`, and `deleteContact`. Only the user can change it.
 
+A message can declare an "external" attachment, a link to a `file:`, `http:`, or `https:` URL instead of embedded content. These links are never fetched: `getMessage` with `saveAttachments: true` reports "External attachment link refused" on that attachment, `includeInlineImages` reports the same refusal when no stored part of the message can be read instead, and a direct forward (`forwardMessage` with `skipReview: true`) is refused if the original has one, so a crafted message cannot make the server read a local file or request a URL. Attachments stored in the message, including those from Exchange accounts, are unaffected. As a second check, attachment and inline-image fetches also refuse URLs using schemes that are never a mail store (`file`, `http`, `https`, `ftp`, `data`, `blob`, `jar`, `resource`, `chrome`, `moz-extension`, `about`, `view-source`). A forward opened for review (`skipReview: false`) is built by Thunderbird itself and shows its attachments in the compose window.
+
 ---
 
 ## Setup

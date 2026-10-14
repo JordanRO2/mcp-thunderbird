@@ -7943,6 +7943,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               walkPart(top, false);
               return results;
             }
+            // BEGIN SYSTEM PRINCIPAL FETCH GUARD
+            // Attachment and inline-image bytes are fetched with the system principal.
+            // Message-part URLs come from Thunderbird's message services and use
+            // whatever scheme the account type registers (mailbox, imap, news,
+            // x-moz-ews, x-moz-graph, add-on stores), so they cannot be allow-listed.
+            // The one URL a message can control is an external attachment: libmime
+            // honours X-Mozilla-External-Attachment-URL for http, https and file, and
+            // the parsed attachment reports isExternal. Those are refused at the
+            // source (see isExternalAttachment) and never reach a channel. The
+            // deny-list below is defense in depth for schemes that are never a mail store.
+            const EXTERNAL_ATTACHMENT_ERROR = "External attachment link refused: its content is not stored in the message";
+            const SYSTEM_PRINCIPAL_DENIED_SCHEMES = new Set([
+              "file", "http", "https", "ftp", "data", "blob", "jar",
+              "resource", "chrome", "moz-extension", "about", "view-source",
+            ]);
+
+            // Fails closed: an attachment whose flag cannot be read counts as external.
+            function isExternalAttachment(att) {
+              try {
+                return !!att?.isExternal;
+              } catch {
+                return true;
+              }
+            }
+
+            // Mirrors URL parsing, which ignores tabs/newlines and strips leading
+            // C0 controls and spaces before reading the scheme.
+            function getFetchUrlScheme(url) {
+              if (typeof url !== "string") return null;
+              const normalized = url.replace(/[\t\n\r]/g, "").replace(/^[\x00-\x20]+/, "");
+              const match = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+              return match ? match[1].toLowerCase() : null;
+            }
+
+            function isSystemPrincipalFetchDenied(url) {
+              if (typeof url !== "string") return true;
+              return SYSTEM_PRINCIPAL_DENIED_SCHEMES.has(getFetchUrlScheme(url));
+            }
+
+            function getSystemPrincipalFetchRefusal(url) {
+              if (!isSystemPrincipalFetchDenied(url)) return null;
+              const scheme = getFetchUrlScheme(url);
+              return scheme
+                ? `Refusing to fetch a ${scheme}: URL; it is not a mail-store URL`
+                : "Refusing to fetch an invalid URL";
+            }
+            // END SYSTEM PRINCIPAL FETCH GUARD
             // END RAW MIME ATTACHMENT HELPERS
 
             // BEGIN ENCRYPTED MESSAGE GUARD
@@ -8728,10 +8775,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           size: typeof att?.size === "number" ? att.size : null,
                           isInline: false,
                         };
+                        // An external attachment's URL is controlled by the message
+                        // (http, https or file), so drop it here; saving and inline
+                        // reads report EXTERNAL_ATTACHMENT_ERROR instead.
+                        const external = isExternalAttachment(att);
                         const source = {
                           info,
-                          url: att?.url || "",
-                          size: typeof att?.size === "number" ? att.size : null
+                          url: external ? "" : (att?.url || ""),
+                          size: typeof att?.size === "number" ? att.size : null,
+                          external
                         };
                         attachments.push(info);
                         attachmentSources.push(source);
@@ -8834,6 +8886,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             : null;
                           let info;
                           let fallbackUrl = "";
+                          let fallbackExternal = false;
                           if (includeInlineImages && correlation.matchedKnownAttachment) {
                             const knownRecord = correlation.metadataRecord;
                             info = knownRecord.info;
@@ -8846,6 +8899,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             info.isInline = true;
                             info.contentId = contentId || knownRecord.contentId || null;
                             fallbackUrl = knownRecord.source?.url || "";
+                            fallbackExternal = knownRecord.source?.external === true;
                           } else {
                             info = {
                               name,
@@ -8860,11 +8914,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                               attachmentSources.push({ info, url: partUrl, size: info.size });
                             }
                           }
+                          // partUrl comes from the message service, not from message
+                          // content, so it needs no guard; only the fallback taken from
+                          // an attachment record can carry a message-controlled URL.
                           inlineImageSources.push({
                             info,
                             url: partUrl || fallbackUrl,
                             size: info.size,
                             partName: part.partName,
+                            external: !partUrl && fallbackExternal,
                           });
                         }
                       }
@@ -8929,8 +8987,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             : { data: encodeByteStringToBase64(rawMimeToByteString(source.bytes)) });
                           return;
                         }
+                        if (source.external) {
+                          resolve({ error: EXTERNAL_ATTACHMENT_ERROR });
+                          return;
+                        }
                         if (!source.url) {
                           resolve({ error: "Inline image has no fetchable message-part URL" });
+                          return;
+                        }
+                        const fetchRefusal = getSystemPrincipalFetchRefusal(source.url);
+                        if (fetchRefusal) {
+                          resolve({ error: fetchRefusal });
                           return;
                         }
                         try {
@@ -9229,11 +9296,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return { size: recoveredSize };
                     }
 
-                                        const saveOne = ({ info, url, size, bytes }, index) =>
+                                        const saveOne = ({ info, url, size, bytes, external }, index) =>
                                           new Promise((done) => {
                         try {
+                          if (external) {
+                            info.error = EXTERNAL_ATTACHMENT_ERROR;
+                            done();
+                            return;
+                          }
                           if (!url && !bytes) {
                             info.error = "Missing attachment URL";
+                            done();
+                            return;
+                          }
+
+                          // Defense in depth: refuse schemes that are never a mail store
+                          // before any file is created.
+                          const fetchRefusal = bytes ? null : getSystemPrincipalFetchRefusal(url);
+                          if (fetchRefusal) {
+                            info.error = fetchRefusal;
                             done();
                             return;
                           }
@@ -10005,6 +10086,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             `From: ${fwdAuthor}\n` +
                             `To: ${fwdRecipients}\n\n`;
                           composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                        }
+
+                        // An external attachment's URL (file:, http:, https:) is chosen by
+                        // the message; sending it would attach and mail a local file.
+                        // Refuse before anything is built or sent.
+                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                          for (const att of aMimeMsg.allUserAttachments) {
+                            if (isExternalAttachment(att)) {
+                              resolve({ error: "Direct forward cannot include an external attachment link, because its content is not stored in the message. Use skipReview: false to review in Thunderbird." });
+                              return;
+                            }
+                          }
                         }
 
                         const origDescs = [];

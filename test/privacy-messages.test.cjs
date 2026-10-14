@@ -2144,3 +2144,161 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     for (const value of values) assert.equal(value, "allowEncrypted");
   });
 });
+
+describe("Attachment and forward handling of external attachment links", () => {
+  function fileStub(filePath, created) {
+    return {
+      path: filePath,
+      append(name) { this.path += `/${name}`; },
+      clone() { return fileStub(this.path, created); },
+      create() {},
+      createUnique() { created.push(this.path); },
+      remove() {},
+      exists: () => true, isDirectory: () => true,
+    };
+  }
+
+  function loadSaver(attachments, extraMime = {}) {
+    const mime = { contentType: "text/plain", body: "visible", allUserAttachments: attachments, ...extraMime };
+    const { api, calls } = loadMessageTools({ mime });
+    const created = [];
+    const channels = [];
+    api.Services.dirsvc = { get: () => fileStub("/tmp", created) };
+    api.Ci.nsIFile = { DIRECTORY_TYPE: 1, NORMAL_FILE_TYPE: 0 };
+    api.NetUtil = {
+      newChannel: options => { channels.push(options); return {}; },
+      asyncFetch() { assert.fail("a refused URL must not be fetched"); },
+    };
+    return { api, calls, created, channels };
+  }
+
+  const attachment = (url, extra = {}) => ({ name: "report.pdf", contentType: "application/pdf", size: 10, url, ...extra });
+  const EXTERNAL = /^External attachment link refused/;
+
+  for (const url of [
+    "file:///etc/passwd", "file:///C:/Users/alice/.ssh/id_rsa", "http://127.0.0.1:8080/admin", "https://example.test/report.pdf",
+  ]) {
+    it(`refuses the external attachment ${url} on save without a file or channel`, async () => {
+      const { api, created, channels } = loadSaver([attachment(url, { isExternal: true })]);
+      const result = await api.getMessage("message-1", "folder", true, "text");
+      assert.match(result.attachments[0].error, EXTERNAL);
+      assert.equal(result.attachments[0].filePath, undefined);
+      assert.equal(JSON.stringify(result).includes("alice"), false);
+      assert.equal(JSON.stringify(result).includes(url), false);
+      assert.deepEqual(created, []);
+      assert.deepEqual(channels, []);
+    });
+  }
+
+  it("refuses only the external attachment and still saves the mail-store one", async () => {
+    const { api, created, channels } = loadSaver([
+      attachment("file:///etc/passwd", { name: "evil.txt", isExternal: true }),
+      attachment("x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2", { name: "good.pdf" }),
+    ]);
+    api.NetUtil.asyncFetch = () => {};
+    const pending = api.getMessage("message-1", "folder", true, "text");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(channels.map(options => options.uri), ["x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2"]);
+    assert.equal(created.length, 1);
+    assert.match(created[0], /good\.pdf$/);
+    void pending;
+  });
+
+  for (const url of [
+    "x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2",
+    "x-moz-graph://user@graph.example.test/inbox/AAMk?part=1.2",
+    "imap://user@mail.example.test/fetch%3EUID%3E/INBOX%3E42?part=1.2",
+    "mailbox-message://nobody@Local%20Folders/Inbox?number=1&part=1.2",
+  ]) {
+    it(`opens a system-principal channel for the non-external attachment ${url}`, async () => {
+      const { api, created, channels } = loadSaver([attachment(url)]);
+      api.NetUtil.asyncFetch = () => {};
+      const pending = api.getMessage("message-1", "folder", true, "text");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(channels.length, 1);
+      assert.equal(channels[0].uri, url);
+      assert.equal(channels[0].loadUsingSystemPrincipal, true);
+      assert.equal(created.length, 1);
+      void pending;
+    });
+  }
+
+  for (const url of [
+    "file:///etc/passwd", "http://127.0.0.1:8080/admin", "https://example.test/report.pdf",
+    "chrome://browser/content/browser.xhtml", "resource://gre/modules/Services.sys.mjs", "FILE:///etc/passwd",
+    "data:text/plain,secret", "  file:///etc/passwd",
+  ]) {
+    it(`still refuses ${JSON.stringify(url)} by scheme when the attachment is not flagged external`, async () => {
+      const { api, created, channels } = loadSaver([attachment(url)]);
+      const result = await api.getMessage("message-1", "folder", true, "text");
+      assert.match(result.attachments[0].error, /^Refusing to fetch a [a-z]+: URL/);
+      assert.deepEqual(created, []);
+      assert.deepEqual(channels, []);
+    });
+  }
+
+  it("lists an external attachment when saving is not requested and fetches nothing", async () => {
+    const { api, channels } = loadSaver([attachment("file:///etc/passwd", { isExternal: true })]);
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.attachments[0].name, "report.pdf");
+    assert.equal(result.attachments[0].error, undefined);
+    assert.deepEqual(channels, []);
+  });
+
+  describe("inline image fallback", () => {
+    const inlineMime = (url, extra) => ({
+      contentType: "multipart/mixed", partName: "",
+      parts: [{
+        contentType: "multipart/related", partName: "1",
+        parts: [
+          { contentType: "text/plain", partName: "1.1", body: "visible" },
+          { contentType: "image/png", partName: "1.2", size: 8, name: "pic.png", headers: { "content-id": ["<img1>"] } },
+        ],
+      }],
+      allUserAttachments: [attachment(url, { name: "pic.png", contentType: "image/png", size: 8, partName: "1.2", ...extra })],
+    });
+
+    for (const [label, extra, expected] of [
+      ["an external attachment", { isExternal: true }, EXTERNAL],
+      ["a denied scheme that is not flagged external", {}, /^Refusing to fetch a file: URL/],
+    ]) {
+      it(`does not fetch the fallback URL of ${label}`, async () => {
+        const { api, channels } = loadSaver([], inlineMime("file:///etc/passwd", extra));
+        const result = await api.getMessage("message-1", "folder", false, "text", false, true);
+        const image = result.attachments.find(info => info.isInline);
+        assert.ok(image, "the inline image is listed");
+        assert.equal(image.mcpImage.status, "skipped");
+        assert.match(image.mcpImage.reason, expected);
+        assert.equal(JSON.stringify(result).includes("passwd"), false);
+        assert.deepEqual(channels, []);
+      });
+    }
+  });
+
+  describe("direct forward", () => {
+    const forward = api => api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true);
+
+    it("refuses the whole send when any original attachment is external", async () => {
+      const { api, calls } = loadSaver([
+        attachment("x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2", { name: "good.pdf" }),
+        attachment("file:///home/alice/.ssh/id_rsa", { name: "id_rsa", isExternal: true }),
+      ]);
+      const result = await forward(api);
+      assert.match(result.error, /external attachment link/);
+      assert.match(result.error, /skipReview: false/);
+      assert.equal(JSON.stringify(result).includes("alice"), false);
+      assert.deepEqual(calls.sends, []);
+    });
+
+    it("sends ordinary attachments, including Exchange URLs, unchanged", async () => {
+      const urls = [
+        "x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2",
+        "imap://user@mail.example.test/fetch%3EUID%3E/INBOX%3E42?part=1.2",
+      ];
+      const { api, calls } = loadSaver(urls.map((url, i) => attachment(url, { name: `file${i}.pdf` })));
+      const result = await forward(api);
+      assert.equal(result.success, true);
+      assert.deepEqual(Array.from(calls.sends[0].attachments, desc => desc.url), urls);
+    });
+  });
+});

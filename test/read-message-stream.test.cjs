@@ -8,6 +8,7 @@ const vm = require("node:vm");
 
 const NS_BASE_STREAM_CLOSED = "NS_BASE_STREAM_CLOSED";
 const FIXED_CHUNK_SIZE = 64 * 1024;
+const MAIL_PART_URL = "mailbox-message://nobody@Local%20Folders/Inbox?number=1&part=1.2";
 
 function loadReadMessageStreamFully() {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
@@ -45,6 +46,7 @@ function loadInlineImageFetcher({
   log,
   newChannelError,
   asyncFetchError,
+  channelLog = [],
 }) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
@@ -80,7 +82,8 @@ function loadInlineImageFetcher({
     Cr: { NS_BASE_STREAM_CLOSED },
     console: { error: (...args) => log.push(args) },
     NetUtil: {
-      newChannel() {
+      newChannel(options) {
+        channelLog.push(options);
         if (newChannelError) throw newChannelError;
         return {};
       },
@@ -275,7 +278,7 @@ describe("inline image stream errors", () => {
       log,
     });
 
-    const result = await fetchInlineImageBase64({ url: "mailbox-message-part" });
+    const result = await fetchInlineImageBase64({ url: MAIL_PART_URL });
 
     assert.equal(result.error, undefined);
     assert.equal(result.data, btoa("small image bytes"));
@@ -298,7 +301,7 @@ describe("inline image stream errors", () => {
       log,
     });
 
-    const result = await fetchInlineImageBase64({ url: "mailbox-message-part" });
+    const result = await fetchInlineImageBase64({ url: MAIL_PART_URL });
 
     assert.equal(result.error, "Inline image read failed");
     assert.equal(log.length, 1);
@@ -315,7 +318,7 @@ describe("inline image stream errors", () => {
       newChannelError: failure,
     });
 
-    const result = await fetchInlineImageBase64({ url: "mailbox-message-part" });
+    const result = await fetchInlineImageBase64({ url: MAIL_PART_URL });
 
     assert.equal(result.error, "Inline image fetch failed");
     assert.equal(JSON.stringify(result).includes(internalPath), false);
@@ -332,7 +335,7 @@ describe("inline image stream errors", () => {
       asyncFetchError: failure,
     });
 
-    const result = await fetchInlineImageBase64({ url: "mailbox-message-part" });
+    const result = await fetchInlineImageBase64({ url: MAIL_PART_URL });
 
     assert.equal(result.error, "Inline image fetch failed");
     assert.equal(JSON.stringify(result).includes(internalUri), false);
@@ -350,7 +353,7 @@ describe("inline image stream errors", () => {
       log,
     });
 
-    const result = await fetchInlineImageBase64({ url: "mailbox-message-part" });
+    const result = await fetchInlineImageBase64({ url: MAIL_PART_URL });
 
     assert.equal(
       result.error,
@@ -408,5 +411,139 @@ describe("getMessage error sanitization", () => {
     assert.equal(JSON.stringify(result).includes(internalUri), false);
     assert.equal(log.length, 1);
     assert.equal(log[0].at(-1), failure);
+  });
+});
+
+describe("system-principal fetch deny-list", () => {
+  // Message-part URLs use whatever scheme the account type registers.
+  const mailStore = [
+    "mailbox-message://nobody@Local%20Folders/Inbox?number=1&part=1.2",
+    "mailbox:///profile/Mail/Local%20Folders/Inbox?number=1",
+    "imap://user@mail.example.test:993/fetch%3EUID%3E/INBOX%3E42?part=1.2",
+    "imap-message://user@mail.example.test/INBOX#42",
+    "news://news.example.test/group.name?article=3",
+    "news-message://news.example.test/group.name#3",
+    "nntp://news.example.test/group.name",
+    "x-moz-ews://user@exchange.example.test/inbox/AAMk?part=1.2",
+    "x-moz-graph://user@graph.example.test/inbox/AAMk?part=1.2",
+    "X-MOZ-EWS://user@exchange.example.test/inbox/AAMk",
+    "owl-message://account/INBOX/42",
+    "some-addon-store://account/1",
+    "mailbox-message-part",
+    "no scheme at all",
+    "",
+  ];
+  const denied = [
+    "file:///etc/passwd", "file:///C:/Users/alice/secret.txt", "FILE:///etc/passwd", "FiLe:///etc/passwd",
+    "http://127.0.0.1:8080/admin", "HTTP://example.test/", "https://example.test/image.png",
+    "ftp://example.test/file", "data:text/plain,secret", "blob:https://example.test/id",
+    "jar:file:///profile/extensions/x.xpi!/manifest.json", "resource://gre/modules/Services.sys.mjs",
+    "chrome://browser/content/browser.xhtml", "moz-extension://id/page.html", "about:config",
+    "view-source:https://example.test/",
+    // Leading whitespace and control characters are ignored by URL parsing.
+    " file:///etc/passwd", "  https://example.test/", "\tfile:///etc/passwd", "\r\n http://example.test/",
+    "\x01file:///etc/passwd", "\x00\x1f data:text/plain,x",
+    // Tabs and newlines inside the scheme are removed by URL parsing.
+    "fi\nle:///etc/passwd", "ht\ttp://example.test/", "ch\r\nrome://x/",
+    // Not a string, so it cannot name a mail store.
+    undefined, null, 0, {}, [], ["file:///etc/passwd"],
+  ];
+
+  function loadGuard() {
+    const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
+    const source = fs.readFileSync(apiPath, "utf8");
+    const start = source.indexOf("// BEGIN SYSTEM PRINCIPAL FETCH GUARD");
+    const end = source.indexOf("// END SYSTEM PRINCIPAL FETCH GUARD");
+    assert.ok(start >= 0 && end > start, "system principal fetch guard markers missing");
+    const sandbox = {};
+    vm.createContext(sandbox);
+    vm.runInContext(
+      `${source.slice(start, end)}
+this.isSystemPrincipalFetchDenied = isSystemPrincipalFetchDenied;
+this.getSystemPrincipalFetchRefusal = getSystemPrincipalFetchRefusal;
+this.isExternalAttachment = isExternalAttachment;
+this.EXTERNAL_ATTACHMENT_ERROR = EXTERNAL_ATTACHMENT_ERROR;`,
+      sandbox
+    );
+    return sandbox;
+  }
+
+  const guard = loadGuard();
+
+  it("keeps every mail-store scheme working, including Exchange and add-on stores", () => {
+    for (const url of mailStore) {
+      assert.equal(guard.isSystemPrincipalFetchDenied(url), false, url);
+      assert.equal(guard.getSystemPrincipalFetchRefusal(url), null, url);
+    }
+  });
+
+  it("refuses schemes that are never a mail store, however they are spelled", () => {
+    for (const url of denied) {
+      assert.equal(guard.isSystemPrincipalFetchDenied(url), true, JSON.stringify(url));
+      assert.match(guard.getSystemPrincipalFetchRefusal(url), /^Refusing to fetch/, JSON.stringify(url));
+    }
+  });
+
+  it("only matches the scheme at the start of the URL", () => {
+    for (const url of [
+      "mailbox-message://x/?next=https://example.test/", "imap://host/file:///etc/passwd",
+      "x-moz-ews://host/path#http://example.test",
+    ]) {
+      assert.equal(guard.isSystemPrincipalFetchDenied(url), false, url);
+    }
+  });
+
+  it("names the refused scheme without echoing the URL", () => {
+    const message = guard.getSystemPrincipalFetchRefusal("file:///C:/Users/alice/secret.txt");
+    assert.equal(message, "Refusing to fetch a file: URL; it is not a mail-store URL");
+    assert.equal(message.includes("alice"), false);
+    assert.equal(guard.getSystemPrincipalFetchRefusal(undefined), "Refusing to fetch an invalid URL");
+  });
+
+  it("treats an attachment as external only when Thunderbird says so, and fails closed on a bad read", () => {
+    assert.equal(guard.isExternalAttachment({ isExternal: true }), true);
+    assert.equal(guard.isExternalAttachment({ isExternal: 1 }), true);
+    for (const att of [{ isExternal: false }, {}, { url: "file:///x" }, null, undefined]) {
+      assert.equal(guard.isExternalAttachment(att), false);
+    }
+    assert.equal(guard.isExternalAttachment({ get isExternal() { throw new Error("unreadable"); } }), true);
+    assert.equal(guard.EXTERNAL_ATTACHMENT_ERROR.includes("file"), false);
+  });
+
+  it("never opens a system-principal channel for a denied inline-image URL", async () => {
+    for (const url of denied.filter(value => typeof value === "string" && value.trim())) {
+      const channelLog = [];
+      const fetchInlineImageBase64 = loadInlineImageFetcher({
+        stream: makePipeStream("secret"), contentLength: -1, log: [], channelLog,
+      });
+      const result = await fetchInlineImageBase64({ url });
+      assert.match(result.error, /^Refusing to fetch/, JSON.stringify(url));
+      assert.equal(result.data, undefined);
+      assert.equal(channelLog.length, 0, JSON.stringify(url));
+    }
+  });
+
+  it("refuses an external inline-image source even when it carries no URL", async () => {
+    const channelLog = [];
+    const fetchInlineImageBase64 = loadInlineImageFetcher({
+      stream: makePipeStream("secret"), contentLength: -1, log: [], channelLog,
+    });
+    const result = await fetchInlineImageBase64({ url: "", external: true });
+    assert.equal(result.error, guard.EXTERNAL_ATTACHMENT_ERROR);
+    assert.equal(channelLog.length, 0);
+  });
+
+  it("still fetches an inline image from every mail-store URL with the system principal", async () => {
+    const channelLog = [];
+    const urls = mailStore.filter(url => /^[a-z][a-z0-9+.-]*:/i.test(url));
+    for (const uri of urls) {
+      const fetchInlineImageBase64 = loadInlineImageFetcher({
+        stream: makePipeStream("image bytes"), contentLength: -1, log: [], channelLog,
+      });
+      const result = await fetchInlineImageBase64({ url: uri });
+      assert.equal(result.data, btoa("image bytes"), uri);
+    }
+    assert.deepEqual(channelLog.map(options => options.uri), urls);
+    assert.ok(channelLog.every(options => options.loadUsingSystemPrincipal === true));
   });
 });
