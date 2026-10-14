@@ -142,6 +142,8 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | `updateContact` | Update contact fields; omitted fields stay unchanged, while empty phone/address arrays clear those collections |
 | `deleteContact` | Delete a contact by UID |
 
+`createContact`, `updateContact`, and `deleteContact` are refused until you enable **Allow contact writes** in the extension settings (off by default). Contact changes are saved without a review step, so a changed email address could silently redirect future messages. Reading contacts is not affected.
+
 ### Calendar
 
 | Tool | Description |
@@ -182,6 +184,8 @@ Account and tool access are configured via the extension settings page (Tools > 
 The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`. It also blocks adding attendees and makes meetings with attendees other than the calendar user read-only through MCP: `updateEvent` and `deleteEvent` reject every write, including time/description/recurrence edits, attendee removal, and occurrence deletion, even when `attendees` is omitted. Occurrence writes check both the series and selected occurrence; series writes also check stored exceptions. Events without attendees and events whose only attendee is the identified calendar user remain editable. If the calendar identity cannot be established, existing attendees cannot be treated as self-only. Disabling the setting permits these writes, which may email updates or cancellations without review. Event/task creation review dialogs remain available without attendees.
 
 The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
+
+The "Contact Writes" section controls **Allow contact writes**, which defaults to off and gates `createContact`, `updateContact`, and `deleteContact`. Only the user can change it.
 
 ---
 

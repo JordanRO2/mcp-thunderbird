@@ -106,6 +106,7 @@ function loadOptions(overrides = {}) {
     toolList: "ul", saveToolsBtn: "button", saveToolsStatus: "span",
     allowEncryptedMessages: "input", allowAllCalendars: "input", allowAllAddressBooks: "input",
     savePrivacyBtn: "button", savePrivacyStatus: "span",
+    allowContactWrites: "input", saveContactWritesBtn: "button", saveContactWritesStatus: "span",
   })) {
     elements[id] = document.createElement(tagName);
     elements[id].id = id;
@@ -116,12 +117,14 @@ function loadOptions(overrides = {}) {
     accountConfig: structuredClone(restrictedAccounts),
     toolConfig: structuredClone(restrictedTools),
     privacySettings: { allowEncryptedMessages: false, allowAllCalendars: false, allowAllAddressBooks: false },
+    contactWrites: { allowContactWrites: false },
+    contactWritesResult: { success: true },
     accountResult: { success: true },
     toolResult: { success: true },
     privacyResult: { success: true },
     ...overrides,
   };
-  const calls = { accounts: [], tools: [], privacy: [] };
+  const calls = { accounts: [], tools: [], privacy: [], contactWrites: [] };
   const api = {
     async getAccountAccessConfig() {
       if (state.accountConfig instanceof Error) throw state.accountConfig;
@@ -134,6 +137,15 @@ function loadOptions(overrides = {}) {
     async getPrivacySettings() {
       if (state.privacySettings instanceof Error) throw state.privacySettings;
       return structuredClone(state.privacySettings);
+    },
+    async getAllowContactWrites() {
+      if (state.contactWrites instanceof Error) throw state.contactWrites;
+      return structuredClone(state.contactWrites);
+    },
+    async setAllowContactWrites(value) {
+      calls.contactWrites.push(value);
+      if (state.contactWritesResult instanceof Error) throw state.contactWritesResult;
+      return structuredClone(state.contactWritesResult);
     },
     async setAccountAccess(ids) {
       calls.accounts.push(Array.from(ids));
@@ -159,6 +171,7 @@ function loadOptions(overrides = {}) {
     markedOptionsSnippet("OPTIONS ACCESS STATE"),
     markedOptionsSnippet("OPTIONS ACCOUNT ACCESS"),
     markedOptionsSnippet("OPTIONS TOOL ACCESS"),
+    markedOptionsSnippet("OPTIONS CONTACT WRITES"),
     markedOptionsSnippet("OPTIONS PRIVACY SETTINGS"),
   ].join("\n"), sandbox);
   return {
@@ -166,6 +179,7 @@ function loadOptions(overrides = {}) {
     loadAccountAccess: sandbox.loadAccountAccess,
     loadToolAccess: sandbox.loadToolAccess,
     loadPrivacySettings: sandbox.loadPrivacySettings,
+    loadContactWritesPref: sandbox.loadContactWritesPref,
   };
 }
 
@@ -379,6 +393,69 @@ describe("Options privacy preferences", () => {
       await ui.savePrivacyBtn.fire("click");
       assert.equal(ui.calls.privacy.length, 2);
       assert.equal(ui.savePrivacyStatus.textContent, "Saved.");
+    });
+  }
+});
+
+describe("Options contact writes", () => {
+  it("starts unchecked and locked until the stored value has been read", async () => {
+    const ui = loadOptions();
+    ui.allowContactWrites.checked = true;
+    ui.allowContactWrites.disabled = false;
+    const loading = ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, true);
+    assert.equal(ui.saveContactWritesBtn.disabled, true);
+    await loading;
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, false);
+    assert.equal(ui.saveContactWritesBtn.disabled, false);
+  });
+
+  it("loads an enabled value and saves the user's choice", async () => {
+    const ui = loadOptions({ contactWrites: { allowContactWrites: true } });
+    await ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, true);
+    ui.allowContactWrites.checked = false;
+    await ui.saveContactWritesBtn.fire("click");
+    assert.deepEqual(ui.calls.contactWrites, [false]);
+    assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal(ui.saveContactWritesBtn.disabled, false);
+  });
+
+  it("treats anything but true as off", async () => {
+    for (const value of ["true", 1, null, undefined]) {
+      const ui = loadOptions({ contactWrites: { allowContactWrites: value } });
+      await ui.loadContactWritesPref();
+      assert.equal(ui.allowContactWrites.checked, false);
+    }
+  });
+
+  it("keeps the setting locked when loading fails", async () => {
+    const ui = loadOptions({ contactWrites: new Error("unavailable") });
+    await ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, true);
+    assert.equal(ui.saveContactWritesBtn.disabled, true);
+    assert.match(ui.saveContactWritesStatus.textContent, /Error loading setting/);
+    assert.equal(ui.saveContactWritesStatus.className, "save-status error");
+    assert.deepEqual(ui.calls.contactWrites, []);
+  });
+
+  for (const errorKind of ["thrown", "returned"]) {
+    it(`shows ${errorKind} save errors and permits retry`, async () => {
+      const contactWritesResult = errorKind === "thrown" ? new Error("cannot save") : { error: "cannot save" };
+      const ui = loadOptions({ contactWritesResult });
+      await ui.loadContactWritesPref();
+      ui.allowContactWrites.checked = true;
+      await ui.saveContactWritesBtn.fire("click");
+      assert.deepEqual(ui.calls.contactWrites, [true]);
+      assert.match(ui.saveContactWritesStatus.textContent, /cannot save/);
+      assert.equal(ui.saveContactWritesStatus.className, "save-status error");
+      assert.equal(ui.saveContactWritesBtn.disabled, false);
+      ui.state.contactWritesResult = { success: true };
+      await ui.saveContactWritesBtn.fire("click");
+      assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
     });
   }
 });

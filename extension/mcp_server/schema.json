@@ -112,6 +112,26 @@
         ]
       },
       {
+        "name": "getAllowContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Get whether MCP may create, update, or delete address book contacts. Defaults to false; this setting is independent of the address book access setting.",
+        "parameters": []
+      },
+      {
+        "name": "setAllowContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Set the user-only permission for contact writes (createContact, updateContact, deleteContact).",
+        "parameters": [
+          {
+            "name": "allowContactWrites",
+            "type": "boolean",
+            "description": "Set true explicitly to allow MCP to create, update, and delete contacts in any address book it can access. Defaults to false."
+          }
+        ]
+      },
+      {
         "name": "getPrivacySettings",
         "type": "function",
         "async": true,
