@@ -35,15 +35,29 @@ function productionTools() {
 
 const ENCRYPTED_RAW = 'From: sender@example.test\r\nSubject: =?utf-8?q?Encrypted_Message?=\r\nContent-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"\r\n\r\n--b--\r\n';
 const DECRYPTION_OKAY = 0x00020000;
+const INBOX_FLAG = 0x1000;
+const NO_THREAD = 0xffffffff;
+
+// Minimal stand-in for MailServices.headerParser.parseEncodedHeader.
+function parseEncodedHeader(raw) {
+  return (raw.match(/(?:[^,"]|"[^"]*")+/g) || []).map(part => {
+    const angle = part.match(/<([^>]+)>/);
+    const email = (angle ? angle[1] : part).trim();
+    return { email, name: angle ? part.replace(angle[0], "").trim().replace(/^"|"$/g, "") : "" };
+  });
+}
 
 /**
- * folders: [{ uri, rows, inbox }]. Each row: { id, thread, author, date (ms), hdr,
- * properties, enigmail, throwOn }. Every folder is its own account.
+ * folders: [{ uri, rows, noInbox, threadApi, direct }]. Every folder is its own
+ * account whose server root (isServer, no database) holds the folder as its
+ * Inbox unless noInbox. Row fields: id, key (message key, default index + 1),
+ * thread, author, date (ms; 0 = undated), hdr, properties, enigmail, throwOn.
+ * Message keys follow insertion order, like arrival order, not date order.
  */
 function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
-  const stats = { yields: 0, listAllKeys: 0, headerReads: 0 };
+  const stats = { yields: 0, listAllKeys: 0, headerReads: 0, hydrated: 0 };
   let generation = 0;
-  let now = 1000 * 86400 * 1000 * 365;
+  let now = 1700000000000;
   const revoked = new Set();
   let onYield = null;
   const byUri = new Map();
@@ -55,6 +69,7 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
     const folder = {
       URI: spec.uri,
       prettyName: "INBOX",
+      isServer: false,
       hasSubFolders: false,
       server: null,
       updateFolder() {},
@@ -67,28 +82,37 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
           close() {},
         };
       },
-      getFolderWithFlags() { return null; },
       get msgDatabase() {
         const openedGeneration = generation;
         const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
-        return {
+        const db = {
           listAllKeys() { assertLive(); stats.listAllKeys++; return Array.from(headers.keys()); },
           enumerateMessages() { assert.fail("A folder query must not open a native message enumerator"); },
           containsKey(key) { assertLive(); return headers.has(key); },
           getMsgHdrForKey(key) { assertLive(); stats.headerReads++; return headers.get(key); },
-          getMsgHdrForMessageID(id) { assertLive(); return byMessageId.get(id) || null; },
         };
+        if (spec.direct !== false) {
+          db.getMsgHdrForMessageID = id => { assertLive(); return byMessageId.get(id) || null; };
+        }
+        if (spec.threadApi !== false) {
+          db.getThreadContainingMsgHdr = hdr => {
+            assertLive();
+            const keys = [...headers.values()].filter(h => h.threadId === hdr.threadId).map(h => h.messageKey);
+            return { numChildren: keys.length, getChildKeyAt: i => keys[i] };
+          };
+        }
+        return db;
       },
     };
     spec.rows.forEach((row, index) => {
       const properties = { keywords: "custom", ...row.properties };
       const header = {
-        messageKey: index + 1,
+        messageKey: row.key === undefined ? index + 1 : row.key,
         messageId: row.id || `f${folderIndex}-m${index}@example.com`,
         threadId: row.thread === undefined ? 100 + index : row.thread,
         date: row.date === undefined ? (index + 1) * 1000000 : row.date * 1000,
         subject: "Raw subject",
-        author: row.author || "Raw author",
+        author: row.author || "Alice Smith <alice@example.com>",
         recipients: "Bob Jones",
         mime2DecodedSubject: "Decoded subject",
         mime2DecodedAuthor: row.author || "Alice Smith <alice@example.com>",
@@ -99,7 +123,10 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
         isFlagged: false,
         messageSize: 321,
         folder,
-        getStringProperty: name => properties[name] || "",
+        getStringProperty: name => {
+          if (name === "references") stats.hydrated++;
+          return properties[name] || "";
+        },
         getUint32Property: name => (name === "enigmail" ? (row.enigmail || 0) : 0),
         ...row.hdr,
       };
@@ -109,8 +136,15 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
       headers.set(header.messageKey, header);
       byMessageId.set(header.messageId, header);
     });
-    const server = { type: "imap", rootFolder: folder };
+    const root = {
+      URI: `imap://account${folderIndex}`,
+      isServer: true,
+      getFolderWithFlags: flag => (flag === INBOX_FLAG && !spec.noInbox ? folder : null),
+      get msgDatabase() { throw new Error("a server root has no database"); },
+    };
+    const server = { type: "imap", rootFolder: root };
     folder.server = server;
+    root.server = server;
     const account = { key: `account${folderIndex}`, incomingServer: server };
     accounts.push(account);
     byUri.set(spec.uri, { folder, account, headers });
@@ -135,12 +169,13 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
         },
       },
     },
-    Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsMsgFolderFlags: { Inbox: INBOX_FLAG }, nsITimer: { TYPE_ONE_SHOT: 0 } },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       mimeConverter: {
         decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")),
       },
+      headerParser: { parseEncodedHeader },
       folderLookup: { getFolderForURL: uri => (byUri.has(uri) ? byUri.get(uri).folder : null) },
       accounts: {
         accounts,
@@ -159,7 +194,7 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
     ...[
       "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "MAX_HEADER_BATCH_IDS", "PREF_ALLOW_ENCRYPTED_MESSAGES",
       "DEFAULT_THREAD_RESULTS", "MAX_THREAD_RESULTS", "DEFAULT_SENDER_RESULTS", "MAX_SENDER_RESULTS",
-      "DEFAULT_SENDER_SCAN_CAP", "MAX_SENDER_SCAN_CAP", "FOLDER_FLAG_INBOX",
+      "DEFAULT_SENDER_SCAN_CAP", "MAX_SENDER_SCAN_CAP", "NSMSGKEY_NONE",
     ].map(constant),
     snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
     snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
@@ -180,8 +215,6 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
     runtime,
     stats,
     now: () => now,
-    rows: uri => byUri.get(uri).headers,
-    accountKey: uri => byUri.get(uri).account.key,
     revoke(uri) { revoked.add(byUri.get(uri).account.key); },
     setOnYield(callback) { onYield = callback; },
     async call(name, args) {
@@ -193,7 +226,8 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
 
 const INBOX = "imap://account0/INBOX";
 const rowsOf = (count, make = () => ({})) => Array.from({ length: count }, (_, i) => make(i));
-const oneFolder = rows => makeHarness({ folders: [{ uri: INBOX, rows }] });
+const oneFolder = (rows, extra = {}) => makeHarness({ folders: [{ uri: INBOX, rows, ...extra }] });
+const idsOf = list => list.map(m => m.id);
 
 describe("query tool schemas", () => {
   const tools = Object.fromEntries(productionTools().map(t => [t.name, t.inputSchema]));
@@ -227,18 +261,19 @@ describe("query tool schemas", () => {
 });
 
 describe("searchByThread", () => {
-  it("returns the shared header shape, newest-first, anchor included", async () => {
+  it("returns the shared header shape newest-first from the thread object, without scanning the folder", async () => {
+    // Message keys are arrival order and deliberately not in date order.
     const h = oneFolder([
       { id: "a@x", thread: 7, date: 1000 },
       { id: "b@x", thread: 7, date: 3000 },
       { id: "other@x", thread: 8, date: 5000 },
       { id: "c@x", thread: 7, date: 2000 },
-    ]);
+    ].concat(rowsOf(2000, i => ({ thread: 1000 + i }))));
     const result = await h.call("searchByThread", { messageId: "a@x", folderPath: INBOX });
     assert.equal(result.threadId, 7);
     assert.equal(typeof result.threadId, "number");
     assert.equal(result.anchorId, "a@x");
-    assert.deepEqual(result.thread.map(m => m.id), ["b@x", "c@x", "a@x"]);
+    assert.deepEqual(idsOf(result.thread), ["b@x", "c@x", "a@x"]);
     assert.equal(result.total, 3);
     assert.equal(result.truncated, false);
     assert.equal(result.notScanned, undefined);
@@ -246,30 +281,69 @@ describe("searchByThread", () => {
       "author", "ccList", "date", "flagged", "id", "inReplyTo", "read", "recipients",
       "references", "size", "subject", "tags", "threadId",
     ]);
-    assert.equal(result.thread[0].read, true);
-    assert.equal(result.thread[0].threadId, 7);
+    assert.equal(h.stats.listAllKeys, 0, "no folder enumeration");
+    assert.equal(h.stats.yields, 0);
+    assert.ok(h.stats.headerReads <= 10, `bounded by the thread size, read ${h.stats.headerReads}`);
   });
 
-  it("scans cooperatively past 50,000 rows without a native enumerator", async () => {
-    const rows = rowsOf(60000, i => ({ thread: 1000 + i }));
-    rows[59990].thread = 5;
-    rows[10].thread = 5;
-    const h = oneFolder(rows);
-    const result = await h.call("searchByThread", { messageId: "f0-m10@example.com", folderPath: INBOX });
+  it("accepts a bracketed anchor id", async () => {
+    const h = oneFolder([{ id: "a@x", thread: 7 }]);
+    const result = await h.call("searchByThread", { messageId: "<a@x>", folderPath: INBOX });
+    assert.equal(result.anchorId, "a@x");
+  });
+
+  it("treats thread id 0 and message key 0 as real, and nsMsgKey_None as no thread", async () => {
+    const zero = oneFolder([
+      { id: "a@x", key: 0, thread: 0, date: 1000 },
+      { id: "b@x", key: 5, thread: 0, date: 2000 },
+      { id: "c@x", key: 6, thread: 9, date: 3000 },
+    ]);
+    const result = await zero.call("searchByThread", { messageId: "a@x", folderPath: INBOX });
+    assert.equal(result.threadId, 0);
+    assert.equal(result.anchored, undefined);
+    assert.deepEqual(idsOf(result.thread), ["b@x", "a@x"]);
+
+    const none = oneFolder([{ id: "a@x", thread: NO_THREAD }, { id: "b@x", thread: NO_THREAD }]);
+    const alone = await none.call("searchByThread", { messageId: "a@x", folderPath: INBOX });
+    assert.equal(alone.threadId, null);
+    assert.equal(alone.anchored, true);
+    assert.deepEqual(idsOf(alone.thread), ["a@x"]);
+    assert.equal(alone.truncated, false);
+  });
+
+  it("finds an anchor that misses the direct lookup and shares one budget with the thread read", async () => {
+    const rows = rowsOf(3000, i => ({ thread: i % 700 === 0 ? 4 : 1000 + i }));
+    const h = oneFolder(rows, { direct: false });
+    const result = await h.call("searchByThread", { messageId: "f0-m2801@example.com", folderPath: INBOX });
+    assert.equal(result.threadId, 1000 + 2801);
+    assert.equal(result.total, 1);
+
+    const shared = makeHarness({ folders: [{ uri: INBOX, rows: rowsOf(3000, () => ({ thread: 4 })), direct: false }], msPerYield: 4000 });
+    const budget = await shared.call("searchByThread", { messageId: "f0-m600@example.com", folderPath: INBOX });
+    assert.equal(budget.notScanned, true, "the anchor scan consumed the budget the thread read needed");
+    assert.equal(budget.anchorId, "f0-m600@example.com");
+    assert.ok(idsOf(budget.thread).includes("f0-m600@example.com"));
+    assert.match(budget.message, /20-second time budget/);
+  });
+
+  it("falls back to a cooperative folder scan when no thread object is available", async () => {
+    const rows = rowsOf(1000, i => ({ thread: i === 3 || i === 900 ? 4 : 1000 + i }));
+    const h = oneFolder(rows, { threadApi: false });
+    const result = await h.call("searchByThread", { messageId: "f0-m3@example.com", folderPath: INBOX });
     assert.equal(result.total, 2);
     assert.equal(result.truncated, false);
-    assert.ok(h.stats.yields >= Math.floor(60000 / 250) - 1, `expected a yield every 250 rows, saw ${h.stats.yields}`);
+    assert.ok(h.stats.yields >= 3);
   });
 
-  it("reports the result cap as truncated with the full match total", async () => {
+  it("reports the result cap as truncated, keeps the newest rows and always the anchor", async () => {
     const h = oneFolder(rowsOf(30, i => ({ thread: 1, date: i + 1 })));
     const result = await h.call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX, maxResults: 5 });
     assert.equal(result.thread.length, 5);
     assert.equal(result.total, 30);
     assert.equal(result.truncated, true);
     assert.equal(result.notScanned, undefined);
-    // Newest rows win even though the scan met them last.
     assert.equal(result.thread[0].id, "f0-m29@example.com");
+    assert.ok(idsOf(result.thread).includes("f0-m0@example.com"), "the oldest anchor is kept");
   });
 
   it("clamps an over-cap maxResults to 500", async () => {
@@ -280,18 +354,17 @@ describe("searchByThread", () => {
     assert.equal(result.truncated, true);
   });
 
-  it("flags an unfinished scan as notScanned instead of returning a silent partial thread", async () => {
-    const rows = rowsOf(5000, i => ({ thread: i === 4000 ? 1 : (i === 0 ? 1 : 100 + i) }));
-    const h = makeHarness({ folders: [{ uri: INBOX, rows }], msPerYield: 6000 });
+  it("flags an unfinished thread read as notScanned with the anchor still present", async () => {
+    const h = makeHarness({ folders: [{ uri: INBOX, rows: rowsOf(5000, () => ({ thread: 1 })) }], msPerYield: 6000 });
     const result = await h.call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX });
     assert.equal(result.truncated, true);
     assert.equal(result.notScanned, true);
     assert.match(result.message, /20-second time budget/);
-    assert.deepEqual(result.thread.map(m => m.id), ["f0-m0@example.com"]);
+    assert.ok(idsOf(result.thread).includes("f0-m0@example.com"));
     assert.ok(h.stats.headerReads < 5000, "bounded by the time budget");
   });
 
-  it("treats unreadable rows as an incomplete scan", async () => {
+  it("treats unreadable members as an incomplete read", async () => {
     const rows = rowsOf(20, () => ({ thread: 1 }));
     rows[5].throwOn = ["flags"];
     const result = await oneFolder(rows).call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX });
@@ -299,21 +372,11 @@ describe("searchByThread", () => {
     assert.doesNotMatch(result.message, /time budget/);
   });
 
-  it("returns the anchor alone when it has no thread id", async () => {
-    const result = await oneFolder([{ id: "a@x", thread: 0 }, { id: "b@x", thread: 0 }])
-      .call("searchByThread", { messageId: "a@x", folderPath: INBOX });
-    assert.equal(result.threadId, null);
-    assert.equal(result.anchored, true);
-    assert.deepEqual(result.thread.map(m => m.id), ["a@x"]);
-    assert.equal(result.truncated, false);
-  });
-
   it("distinguishes an absent anchor from an unscanned one", async () => {
     const absent = await oneFolder(rowsOf(10)).call("searchByThread", { messageId: "nope@x", folderPath: INBOX });
     assert.deepEqual(absent, { error: "Message not found: nope@x" });
 
     const slow = makeHarness({ folders: [{ uri: INBOX, rows: rowsOf(2000) }], msPerYield: 25000 });
-    slow.runtime.MailServices.folderLookup.getFolderForURL(INBOX).msgDatabase;
     const unknown = await slow.call("searchByThread", { messageId: "nope@x", folderPath: INBOX });
     assert.equal(unknown.notScanned, true);
     assert.match(unknown.error, /time budget/);
@@ -329,7 +392,7 @@ describe("searchByThread", () => {
     assert.equal(open.thread[0].subject, "Cached decrypted subject");
   });
 
-  it("returns an error and no rows when access is revoked during the scan", async () => {
+  it("returns an error and no rows when access is revoked mid-read", async () => {
     const h = oneFolder(rowsOf(2000, () => ({ thread: 1 })));
     h.setOnYield(() => h.revoke(INBOX));
     const result = await h.call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX });
@@ -349,20 +412,74 @@ describe("searchByThread", () => {
 describe("getSenderHistory", () => {
   const DAY = 86400 * 1000;
 
-  it("matches the sender case-insensitively, newest-first, in the shared shape plus folderPath", async () => {
+  it("matches the parsed address exactly and case-insensitively, never a substring or a display name", async () => {
     const h = oneFolder([
-      { id: "1@x", author: "Alice <ALICE@example.com>", date: 1000 },
-      { id: "2@x", author: "Bob <bob@example.com>", date: 9000 },
-      { id: "3@x", author: "alice@example.com", date: 3000 },
+      { id: "hit1@x", author: "Ann <ANN@example.com>", date: 1000 },
+      { id: "hit2@x", author: "ann@example.com", date: 3000 },
+      { id: "joann@x", author: "Jo <joann@example.com>", date: 4000 },
+      { id: "suffix@x", author: "ann@example.com.evil.test", date: 5000 },
+      { id: "spoof@x", author: '"ann@example.com" <attacker@evil.test>', date: 6000 },
+      { id: "comma@x", author: '"Doe, Ann" <ann@example.com>', date: 2000 },
+      { id: "other@x", author: "Bob <bob@example.com>", date: 9000 },
     ]);
-    const result = await h.call("getSenderHistory", { email: "Alice@Example.com" });
-    assert.deepEqual(result.messages.map(m => m.id), ["3@x", "1@x"]);
+    for (const query of ["Ann@Example.com", "mailto:ann@example.com", "Ann <ann@example.com>"]) {
+      const result = await h.call("getSenderHistory", { email: query });
+      assert.deepEqual(idsOf(result.messages), ["hit2@x", "comma@x", "hit1@x"], query);
+      assert.equal(result.truncated, false);
+    }
+  });
+
+  it("rejects a query that is not a single address", async () => {
+    const h = oneFolder(rowsOf(2));
+    for (const query of ["alice", "a@x.test, b@x.test", "   "]) {
+      assert.match((await h.call("getSenderHistory", { email: query })).error, /single email address|non-empty/, query);
+    }
+  });
+
+  it("returns the shared shape plus folderPath, newest by date despite key order", async () => {
+    const h = oneFolder([
+      { id: "old@x", date: 1000, key: 9 },
+      { id: "new@x", date: 9000, key: 2 },
+      { id: "mid@x", date: 5000, key: 4 },
+    ]);
+    const result = await h.call("getSenderHistory", { email: "alice@example.com" });
+    assert.deepEqual(idsOf(result.messages), ["new@x", "mid@x", "old@x"]);
     assert.equal(result.messages[0].folderPath, INBOX);
     assert.equal(result.messages[0].read, true);
-    assert.equal(result.messages[0].threadId, 102);
+    assert.equal(typeof result.messages[0].threadId, "number");
     assert.equal(result.totalScanned, 3);
     assert.equal(result.truncated, false);
     assert.equal(result.notScanned, undefined);
+    assert.equal(result.notScannedFolders, undefined);
+  });
+
+  it("reads each Inbox newest-first so scanCap examines the newest keys, not the oldest", async () => {
+    const h = oneFolder(rowsOf(50, i => ({ id: `m${i}@x`, date: i + 1 })));
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", scanCap: 10, maxResults: 200 });
+    assert.equal(result.messages.length, 10);
+    assert.deepEqual(idsOf(result.messages), Array.from({ length: 10 }, (_, i) => `m${49 - i}@x`));
+    assert.equal(result.truncated, true);
+    assert.equal(result.notScanned, true);
+    assert.deepEqual(result.notScannedFolders, [INBOX]);
+    assert.match(result.message, /scanCap of 10/);
+    assert.match(result.message, /newest-first[^.]*older/);
+
+    const exact = await oneFolder(rowsOf(10)).call("getSenderHistory", { email: "alice@example.com", scanCap: 10 });
+    assert.equal(exact.truncated, false, "a folder exactly at the cap was fully examined");
+  });
+
+  it("does not let messages outside sinceDays consume scanCap, and keeps undated ones", async () => {
+    const now = oneFolder([]).now();
+    const rows = [
+      { id: "recent-low@x", date: now - 2 * DAY },
+      { id: "recent-mid@x", date: now - 3 * DAY },
+      { id: "undated@x", date: 0 },
+      ...rowsOf(40, i => ({ id: `stale${i}@x`, date: now - (100 + i) * DAY })),
+    ];
+    const h = makeHarness({ folders: [{ uri: INBOX, rows }] });
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", sinceDays: 30, scanCap: 3 });
+    assert.deepEqual(new Set(idsOf(result.messages)), new Set(["recent-low@x", "recent-mid@x", "undated@x"]));
+    assert.equal(result.truncated, false, "stale rows were skipped without using the cap");
   });
 
   it("scans every account so newest-first holds across them", async () => {
@@ -372,9 +489,22 @@ describe("getSenderHistory", () => {
         { uri: "imap://account1/INBOX", rows: rowsOf(3, i => ({ id: `new${i}@x`, date: 50000 + i })) },
       ],
     });
-    const result = await h.call("getSenderHistory", { email: "alice", maxResults: 4 });
-    assert.deepEqual(result.messages.map(m => m.id), ["new2@x", "new1@x", "new0@x", "old4@x"]);
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", maxResults: 4 });
+    assert.deepEqual(idsOf(result.messages), ["new2@x", "new1@x", "new0@x", "old4@x"]);
     assert.equal(result.truncated, true, "matches exceeded maxResults");
+    assert.equal(result.notScanned, undefined);
+  });
+
+  it("skips accounts without an Inbox and server roots without reporting truncation", async () => {
+    const h = makeHarness({
+      folders: [
+        { uri: "imap://account0/INBOX", rows: [{ id: "ok@x" }] },
+        { uri: "imap://account1/Other", rows: [{ id: "elsewhere@x" }], noInbox: true },
+      ],
+    });
+    const result = await h.call("getSenderHistory", { email: "alice@example.com" });
+    assert.deepEqual(idsOf(result.messages), ["ok@x"]);
+    assert.equal(result.truncated, false);
     assert.equal(result.notScanned, undefined);
   });
 
@@ -386,45 +516,20 @@ describe("getSenderHistory", () => {
       ],
     });
     h.revoke("imap://account1/INBOX");
-    const result = await h.call("getSenderHistory", { email: "alice" });
-    assert.deepEqual(result.messages.map(m => m.id), ["ok@x"]);
+    const result = await h.call("getSenderHistory", { email: "alice@example.com" });
+    assert.deepEqual(idsOf(result.messages), ["ok@x"]);
   });
 
-  it("applies sinceDays", async () => {
-    const h = oneFolder([]);
-    const nowMs = h.now();
-    const fresh = makeHarness({
-      folders: [{ uri: INBOX, rows: [
-        { id: "recent@x", date: nowMs - 2 * DAY },
-        { id: "stale@x", date: nowMs - 40 * DAY },
-      ] }],
-    });
-    const result = await fresh.call("getSenderHistory", { email: "alice", sinceDays: 30 });
-    assert.deepEqual(result.messages.map(m => m.id), ["recent@x"]);
-  });
-
-  it("reports a folder that hits scanCap in notScanned and as truncated", async () => {
-    const h = oneFolder(rowsOf(50, (i) => ({ id: `m${i}@x`, date: i + 1 })));
-    const result = await h.call("getSenderHistory", { email: "alice", scanCap: 10, maxResults: 200 });
-    assert.equal(result.totalScanned, 10);
-    assert.equal(result.messages.length, 10);
-    assert.equal(result.truncated, true);
-    assert.deepEqual(result.notScanned, [INBOX]);
-    assert.match(result.message, /scanCap \(10\)/);
-
-    const exact = await oneFolder(rowsOf(10)).call("getSenderHistory", { email: "alice", scanCap: 10 });
-    assert.equal(exact.truncated, false, "a folder exactly at the cap was fully examined");
-  });
-
-  it("scans past 50,000 rows cooperatively with one shared budget", async () => {
-    const h = oneFolder(rowsOf(60000, i => ({ author: i === 59999 ? "target@example.com" : "other@example.com" })));
-    const result = await h.call("getSenderHistory", { email: "target@", scanCap: 50000 + 10000 });
-    assert.equal(result.messages.length, 0, "scanCap clamps to 50,000 so the last row is not examined");
-    assert.deepEqual(result.notScanned, [INBOX]);
+  it("scans past 50,000 rows cooperatively and clamps scanCap", async () => {
+    const h = oneFolder(rowsOf(60000, i => ({ author: i === 0 ? "target@example.com" : "other@example.com" })));
+    const result = await h.call("getSenderHistory", { email: "target@example.com", scanCap: 99999999 });
+    assert.equal(result.messages.length, 0, "the oldest key is beyond the 50,000 newest examined");
+    assert.deepEqual(result.notScannedFolders, [INBOX]);
+    assert.ok(result.totalScanned >= 50000 && result.totalScanned <= 50001);
     assert.ok(h.stats.yields >= 50000 / 250 - 1);
   });
 
-  it("marks later accounts notScanned when the shared time budget runs out", async () => {
+  it("marks later accounts notScannedFolders when the shared time budget runs out", async () => {
     const h = makeHarness({
       folders: [
         { uri: "imap://account0/INBOX", rows: rowsOf(3000) },
@@ -432,49 +537,74 @@ describe("getSenderHistory", () => {
       ],
       msPerYield: 6000,
     });
-    const result = await h.call("getSenderHistory", { email: "alice", maxResults: 200 });
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", maxResults: 200 });
     assert.equal(result.truncated, true);
-    assert.ok(result.notScanned.includes("imap://account0/INBOX"));
-    assert.ok(result.notScanned.includes("imap://account1/INBOX"));
+    assert.equal(result.notScanned, true);
+    assert.deepEqual(result.notScannedFolders.sort(), ["imap://account0/INBOX", "imap://account1/INBOX"]);
     assert.match(result.message, /20-second time budget/);
     assert.ok(h.stats.headerReads < 3010);
+  });
+
+  it("reports every truncation cause when they mix", async () => {
+    const now = oneFolder([]).now();
+    const h = makeHarness({
+      folders: [
+        { uri: "imap://account0/INBOX", rows: rowsOf(100, () => ({ date: now - DAY })) },
+        { uri: "imap://account1/INBOX", rows: rowsOf(3000, () => ({ date: now - 100 * DAY })) },
+      ],
+      msPerYield: 8000,
+    });
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", scanCap: 50, sinceDays: 30 });
+    assert.match(result.message, /scanCap of 50/);
+    assert.match(result.message, /20-second time budget/);
   });
 
   it("treats unreadable rows as an incomplete scan", async () => {
     const rows = rowsOf(10);
     rows[2].throwOn = ["flags"];
-    const result = await oneFolder(rows).call("getSenderHistory", { email: "alice" });
-    assert.deepEqual(result.notScanned, [INBOX]);
+    const result = await oneFolder(rows).call("getSenderHistory", { email: "alice@example.com" });
+    assert.deepEqual(result.notScannedFolders, [INBOX]);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /unreadable/);
+  });
+
+  it("hydrates only the final page", async () => {
+    const h = oneFolder(rowsOf(100, i => ({ date: i + 1 })));
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", maxResults: 3 });
+    assert.equal(result.messages.length, 3);
+    assert.equal(h.stats.hydrated, 3, "header objects were built for three rows, not for every match");
     assert.equal(result.truncated, true);
   });
 
   it("withholds encrypted subjects like the base header tools", async () => {
     const rows = [{ id: "e@x", enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: "Cached decrypted subject" } }];
-    const result = await oneFolder(rows).call("getSenderHistory", { email: "alice" });
+    const result = await oneFolder(rows).call("getSenderHistory", { email: "alice@example.com" });
     assert.equal(result.messages[0].subject, "Encrypted Message");
     assert.doesNotMatch(JSON.stringify(result), /Cached decrypted/);
   });
 
-  it("drops rows from an account revoked during the scan", async () => {
+  it("exposes nothing about an account revoked mid-scan, and keeps totals consistent", async () => {
     const h = makeHarness({
       folders: [
         { uri: "imap://account0/INBOX", rows: rowsOf(600) },
-        { uri: "imap://account1/INBOX", rows: rowsOf(5) },
+        { uri: "imap://account1/INBOX", rows: rowsOf(5, i => ({ id: `kept${i}@x` })) },
       ],
     });
     h.setOnYield(() => h.revoke("imap://account0/INBOX"));
-    const result = await h.call("getSenderHistory", { email: "alice", maxResults: 200 });
-    assert.ok(result.messages.every(m => m.folderPath !== "imap://account0/INBOX"));
-    assert.ok(result.notScanned.includes("imap://account0/INBOX"));
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", maxResults: 200 });
+    assert.deepEqual(idsOf(result.messages).sort(), Array.from({ length: 5 }, (_, i) => `kept${i}@x`));
+    assert.ok(result.messages.every(m => m.folderPath === "imap://account1/INBOX"));
+    assert.doesNotMatch(JSON.stringify(result), /account0/);
+    assert.equal(result.totalScanned, 5);
+    assert.equal(result.truncated, false);
   });
 
   it("clamps maxResults to 200 and returns { error } for bad input or exceptions", async () => {
     const h = oneFolder(rowsOf(300));
-    const result = await h.call("getSenderHistory", { email: "alice", maxResults: 99999 });
+    const result = await h.call("getSenderHistory", { email: "alice@example.com", maxResults: 99999 });
     assert.equal(result.messages.length, 200);
     assert.equal(result.truncated, true);
-    assert.match((await h.runtime.getSenderHistory("  ")).error, /non-empty string/);
     h.runtime.getAccessibleAccounts = () => { throw new Error("boom"); };
-    assert.match((await h.runtime.getSenderHistory("alice")).error, /boom/);
+    assert.match((await h.runtime.getSenderHistory("alice@example.com")).error, /boom/);
   });
 });
