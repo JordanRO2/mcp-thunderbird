@@ -531,3 +531,124 @@ describe("inReplyTo from parsed references", () => {
     assert.equal((await read(2)).inReplyTo, "c@example.com");
   });
 });
+
+describe("scanFolderCooperatively", () => {
+  const scanOf = (deadline = 1e9) => ({ deadline, truncated: false });
+  async function run(h, visit, options, scan = scanOf()) {
+    const outcome = await h.runtime.scanFolderCooperatively(h.folder, scan, visit, options);
+    return { ...outcome };
+  }
+
+  it("visits live headers in key order, yielding every SEARCH_YIELD_EVERY rows", async () => {
+    const h = makeHarness({ rows: rowsOf(600) });
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr.messageId); });
+    assert.deepEqual(outcome, { complete: true, stopped: false, scanned: 600 });
+    assert.deepEqual(seen, ids(600));
+    assert.equal(h.stats.listAllKeys, 1);
+    assert.equal(h.stats.yields, 2, "three chunks of 250 yield twice");
+  });
+
+  it("walks the snapshot from the end with newestFirst, across chunks", async () => {
+    const h = makeHarness({ rows: rowsOf(600) });
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr.messageId); }, { newestFirst: true });
+    assert.equal(outcome.complete, true);
+    assert.equal(outcome.scanned, 600);
+    assert.deepEqual(seen, ids(600).reverse());
+  });
+
+  it("stops when visit returns true, without yielding or visiting further", async () => {
+    const h = makeHarness({ rows: rowsOf(1000) });
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr.messageId); return seen.length === 3; }, { newestFirst: true });
+    assert.deepEqual(outcome, { complete: true, stopped: true, scanned: 3 });
+    assert.deepEqual(seen, ["m-999@example.com", "m-998@example.com", "m-997@example.com"]);
+    assert.equal(h.stats.yields, 0);
+  });
+
+  it("only a strict true from visit stops the scan", async () => {
+    const h = makeHarness({ rows: rowsOf(10) });
+    const outcome = await run(h, () => 1);
+    assert.deepEqual(outcome, { complete: true, stopped: false, scanned: 10 });
+  });
+
+  it("skips expunged rows without counting them", async () => {
+    const h = makeHarness({ rows: [{ hdr: { flags: 0x8 } }, {}, {}] });
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr.messageId); });
+    assert.deepEqual(outcome, { complete: true, stopped: false, scanned: 2 });
+    assert.deepEqual(seen, ["m-1@example.com", "m-2@example.com"]);
+  });
+
+  it("marks the scan incomplete on unreadable rows and a throwing visitor, but continues", async () => {
+    const rows = rowsOf(6);
+    rows[2].throwOn = ["flags"];
+    const h = makeHarness({ rows });
+    const seen = [];
+    const outcome = await run(h, hdr => {
+      seen.push(hdr.messageId);
+      if (hdr.messageId === "m-4@example.com") throw new Error("visitor failed");
+    });
+    assert.equal(outcome.complete, false);
+    assert.equal(outcome.stopped, false);
+    assert.deepEqual(seen, ["m-0@example.com", "m-1@example.com", "m-3@example.com", "m-4@example.com", "m-5@example.com"]);
+  });
+
+  it("marks rows that vanish after the snapshot as incomplete", async () => {
+    const h = makeHarness({ rows: rowsOf(600) });
+    h.setOnYield(() => h.headers.delete(400));
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr.messageId); });
+    assert.equal(outcome.complete, false);
+    assert.equal(outcome.scanned, 599);
+    assert.ok(!seen.includes("m-399@example.com"));
+  });
+
+  it("reports an expired time budget as incomplete and flags the scan", async () => {
+    const h = makeHarness({ rows: rowsOf(10) });
+    const scan = scanOf(-1);
+    const seen = [];
+    const outcome = await run(h, hdr => { seen.push(hdr); }, undefined, scan);
+    assert.deepEqual(outcome, { complete: false, stopped: false, scanned: 0 });
+    assert.equal(seen.length, 0);
+    assert.equal(scan.timedOut, true);
+  });
+
+  it("stops between chunks when the budget runs out", async () => {
+    const h = makeHarness({ rows: rowsOf(2000), msPerYield: 6000 });
+    const scan = scanOf(20000);
+    const outcome = await run(h, () => {}, undefined, scan);
+    assert.equal(outcome.complete, false);
+    assert.equal(scan.timedOut, true);
+    assert.ok(outcome.scanned < 2000 && outcome.scanned % 250 === 0);
+  });
+
+  it("is incomplete when access is lost, the database getter throws or keys cannot be listed", async () => {
+    const revoked = makeHarness({ rows: rowsOf(1000) });
+    revoked.setOnYield(() => revoked.revokeAccess());
+    const lost = await run(revoked, () => {});
+    assert.equal(lost.complete, false);
+    assert.equal(lost.scanned, 250);
+
+    const throwing = makeHarness({ rows: rowsOf(1000) });
+    let reads = 0;
+    throwing.setDatabaseHook(() => { if (++reads >= 3) throw new Error("closed"); });
+    const closed = await run(throwing, () => {});
+    assert.equal(closed.complete, false);
+    assert.equal(closed.scanned, 250);
+
+    const noKeys = makeHarness({ rows: rowsOf(10) });
+    noKeys.setDatabaseHook(() => { throw new Error("no database"); });
+    assert.deepEqual(await run(noKeys, () => assert.fail("must not visit")), { complete: false, stopped: false, scanned: 0 });
+  });
+
+  it("retains no database across yields", async () => {
+    // The harness fails any database call made after the generation changed,
+    // and every yield bumps the generation.
+    const h = makeHarness({ rows: rowsOf(800) });
+    const outcome = await run(h, () => {}, { newestFirst: true });
+    assert.equal(outcome.complete, true);
+    assert.ok(h.stats.yields >= 3);
+  });
+});

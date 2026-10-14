@@ -9532,6 +9532,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END MESSAGE READ TOOLS
 
             // BEGIN MESSAGE HEADER READ TOOLS
+            /**
+             * Cooperative header scan over one folder. Policy shared with
+             * searchMessages: a listAllKeys snapshot, the database reacquired for
+             * every chunk, no header or enumerator retained across a yield, a yield
+             * every SEARCH_YIELD_EVERY rows, and the time budget carried in `scan`
+             * ({ deadline, ... }, see searchTimeExpired). `visit(msgHdr)` runs on
+             * live, non-expunged headers and returns true to stop the scan early.
+             * With newestFirst the key snapshot is walked from the end (keys follow
+             * arrival order, so the newest messages come first).
+             *
+             * Resolves { complete, stopped, scanned }. complete is false when the
+             * scan hit the time budget, lost folder access, could not read the
+             * database, or met unreadable rows or a throwing visitor, so a missing
+             * match proves nothing; stopped means visit ended the scan; scanned
+             * counts the live headers passed to visit.
+             */
+            async function scanFolderCooperatively(folder, scan, visit, { newestFirst = false } = {}) {
+              const outcome = { complete: true, stopped: false, scanned: 0 };
+              let keys;
+              try {
+                keys = folder.msgDatabase.listAllKeys();
+              } catch {
+                keys = null;
+              }
+              if (!keys || typeof keys.length !== "number") {
+                outcome.complete = false;
+                return outcome;
+              }
+              const keyAt = position => keys[newestFirst ? keys.length - 1 - position : position];
+              for (let index = 0; index < keys.length && !outcome.stopped;) {
+                if (searchTimeExpired(scan)) { outcome.complete = false; break; }
+                if (!isFolderAccessible(folder)) { outcome.complete = false; break; }
+                let scanDb;
+                try {
+                  // The database can be closed, rebuilt or deleted across a yield.
+                  scanDb = folder.msgDatabase;
+                } catch {
+                  scanDb = null;
+                }
+                if (!scanDb) { outcome.complete = false; break; }
+                const end = Math.min(index + SEARCH_YIELD_EVERY, keys.length);
+                for (; index < end && !outcome.stopped; index++) {
+                  try {
+                    const msgHdr = getSearchHeader(scanDb, keyAt(index));
+                    if (!msgHdr) { outcome.complete = false; continue; }
+                    if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
+                    outcome.scanned++;
+                    if (visit(msgHdr) === true) outcome.stopped = true;
+                  } catch {
+                    outcome.complete = false;
+                  }
+                }
+                if (index < keys.length && !outcome.stopped) {
+                  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+                }
+              }
+              return outcome;
+            }
+
             // Thunderbird stores Message-IDs without angle brackets and looks them up
             // by exact text, so callers' "<id@host>" forms are normalised first.
             function normalizeHeaderMessageId(id) {
@@ -9593,46 +9652,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
               let complete = true;
               if (missing.size > 0) {
-                let keys;
-                try {
-                  keys = folder.msgDatabase.listAllKeys();
-                } catch {
-                  keys = null;
-                }
-                if (!keys || typeof keys.length !== "number") {
-                  complete = false;
-                } else {
-                  for (let index = 0; index < keys.length && missing.size > 0;) {
-                    if (searchTimeExpired(scan)) { complete = false; break; }
-                    if (!isFolderAccessible(folder)) { complete = false; break; }
-                    let scanDb;
-                    try {
-                      // The database can be closed, rebuilt or deleted across a yield.
-                      scanDb = folder.msgDatabase;
-                    } catch {
-                      scanDb = null;
-                    }
-                    if (!scanDb) { complete = false; break; }
-                    const end = Math.min(index + SEARCH_YIELD_EVERY, keys.length);
-                    for (; index < end && missing.size > 0; index++) {
-                      try {
-                        const msgHdr = getSearchHeader(scanDb, keys[index]);
-                        if (!msgHdr) { complete = false; continue; }
-                        if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
-                        const key = normalizeHeaderMessageId(msgHdr.messageId);
-                        if (missing.has(key)) {
-                          resolved.set(key, readHeader(msgHdr));
-                          missing.delete(key);
-                        }
-                      } catch {
-                        complete = false;
-                      }
-                    }
-                    if (index < keys.length && missing.size > 0) {
-                      await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
-                    }
+                const outcome = await scanFolderCooperatively(folder, scan, msgHdr => {
+                  const key = normalizeHeaderMessageId(msgHdr.messageId);
+                  if (missing.has(key)) {
+                    resolved.set(key, readHeader(msgHdr));
+                    missing.delete(key);
                   }
-                }
+                  return missing.size === 0;
+                });
+                complete = outcome.complete;
 
                 // Access can be revoked while the scan yields; do not return rows
                 // read before the revocation.
