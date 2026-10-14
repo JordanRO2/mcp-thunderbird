@@ -469,10 +469,10 @@ const sampleTools = [
     inputSchema: {
       type: "object",
       properties: {
-        email: { type: "string" },
-        maxResults: { type: "integer" },
-        scanCap: { type: "integer" },
-        sinceDays: { type: "integer" },
+        email: { type: "string", minLength: 1 },
+        maxResults: { type: "integer", minimum: 1, maximum: 200 },
+        scanCap: { type: "integer", minimum: 1, maximum: 50000 },
+        sinceDays: { type: "integer", minimum: 1 },
       },
       required: ["email"],
     },
@@ -482,9 +482,9 @@ const sampleTools = [
     inputSchema: {
       type: "object",
       properties: {
-        messageId: { type: "string" },
-        folderPath: { type: "string" },
-        maxResults: { type: "integer" },
+        messageId: { type: "string", minLength: 1 },
+        folderPath: { type: "string", minLength: 1 },
+        maxResults: { type: "integer", minimum: 1, maximum: 500 },
       },
       required: ["messageId", "folderPath"],
     },
@@ -2156,10 +2156,17 @@ describe('Validation: getSenderHistory', () => {
     assert.match(errors[0], /must be string/);
   });
 
-  // The "default 50, max 200" / "default 5000, max 50000" caps live in the
-  // handler (silent Math.min clamp + default), NOT the schema, so out-of-range
-  // integers pass validation and are clamped at runtime.
-  it('does not bound maxResults/scanCap at the schema level', () => {
+  it('rejects an empty email', () => {
+    const errors = validate('getSenderHistory', { email: '' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 character/);
+  });
+
+  // minimum/maximum are advisory schema metadata for clients: the validator does
+  // not enforce them, the handler clamps ("default 50, max 200" / "default 5000,
+  // max 50000"), so out-of-range integers pass validation and are clamped at
+  // runtime (see test/message-query.test.cjs).
+  it('leaves maxResults/scanCap clamping to the handler', () => {
     const errors = validate('getSenderHistory', {
       email: 'alice@example.com',
       maxResults: 9999,
@@ -2230,9 +2237,15 @@ describe('Validation: searchByThread', () => {
     assert.match(errors[0], /must be string/);
   });
 
-  // The "default 100, max 500" cap lives in the handler (silent clamp), not the
-  // schema, so an over-cap integer passes validation.
-  it('does not bound maxResults at the schema level', () => {
+  it('rejects an empty messageId', () => {
+    const errors = validate('searchByThread', { messageId: '', folderPath: 'imap://user@server/INBOX' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 character/);
+  });
+
+  // The "default 100, max 500" cap is clamped by the handler; the schema maximum
+  // is advisory (the validator does not enforce it).
+  it('leaves maxResults clamping to the handler', () => {
     const errors = validate('searchByThread', {
       messageId: '<abc@example.com>',
       folderPath: 'imap://user@server/INBOX',
