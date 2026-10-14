@@ -32,74 +32,94 @@ function productionSchema() {
   return sandbox.tool;
 }
 
-const ATTACH = 0x10000000;
+const FLAGS = { Expunged: 0x8, Offline: 0x80, Attachment: 0x10000000 };
 const DECRYPTION_OKAY = 0x00020000;
 const PDF = { name: "Invoice.PDF", contentType: "application/pdf", size: 10 };
 const PNG = { name: "photo.png", contentType: "image/png", size: 20 };
+const PLAIN_RAW = "From: a@example.test\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b--\r\n";
+const SMIME_RAW = "From: a@example.test\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nAAAA\r\n";
 
 /**
- * rows: { attach?: bool, atts?: [...], enigmail?, mime?: "hang"|"null"|"throw"|object }
+ * rows: { attach?: bool, offline?: bool, atts?, enigmail?, raw?, mime?: "hang"|"null"|"throw"|"cbthrow", mimeMessage? }
  * Parsing is driven by the harness: each MsgHdrToMimeMessage call is recorded and
- * completed by `mime(row)` on a later macrotask, so the in-flight count is real.
+ * completed on a later macrotask, so the in-flight count is real. A "hang" row's
+ * parse completes only when the test calls row.release(), like a stuck stream
+ * whose callback arrives late. row.timer is the timer armed for that parse.
+ * extraFolders: more Inbox row lists, one extra account each.
  */
-function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYield = 0, timerThrows = false } = {}) {
+function makeHarness({
+  rows, extraFolders = [], allowEncrypted = false, parseDelayMs = 0, msPerYield = 0,
+  timerThrows = false, serverType = "imap",
+} = {}) {
   const stats = {
-    yields: 0, listAllKeys: 0, mimeCalls: 0, inFlight: 0, maxInFlight: 0,
-    timersCreated: 0, timersCancelled: 0, mimeArgs: [],
+    yields: 0, mimeCalls: 0, inFlight: 0, maxInFlight: 0, timersCreated: 0, timersCancelled: 0,
+    mimeArgs: [], mimeFolders: [],
   };
   let generation = 0;
   let now = 0;
   let accessible = true;
   let onYield = null;
   const timers = [];
-  const headers = new Map();
+  const folders = [];
 
-  const folder = {
-    URI: "imap://account1/INBOX",
-    prettyName: "INBOX",
-    isServer: false,
-    server: null,
-    updateFolder() {},
-    get msgDatabase() {
-      const openedGeneration = generation;
-      const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
-      return {
-        listAllKeys() { assertLive(); stats.listAllKeys++; return Array.from(headers.keys()); },
-        enumerateMessages() { assert.fail("The attachment scan must not open a native message enumerator"); },
-        containsKey(key) { assertLive(); return headers.has(key); },
-        getMsgHdrForKey(key) { assertLive(); return headers.get(key); },
-      };
-    },
-  };
-  const root = { getFolderWithFlags: flag => (flag === 0x1000 ? folder : null) };
-
-  rows.forEach((row, index) => {
-    const header = {
-      messageKey: index + 1,
-      messageId: `m-${index}@example.com`,
-      threadId: 100 + index,
-      date: (index + 1) * 1000000,
-      subject: "Subject",
-      author: "Alice",
-      recipients: "Bob",
-      mime2DecodedSubject: "Subject",
-      mime2DecodedAuthor: "Alice",
-      mime2DecodedRecipients: "Bob",
-      ccList: "",
-      flags: row.attach === false ? 0 : ATTACH,
-      isRead: false,
-      isFlagged: true,
-      messageSize: 5,
-      folder,
-      getStringProperty: () => "",
-      getUint32Property: name => (name === "enigmail" ? (row.enigmail || 0) : 0),
-      row,
+  [rows, ...extraFolders].forEach((folderRows, folderIndex) => {
+    const headers = new Map();
+    const folder = {
+      URI: `imap://account${folderIndex + 1}/INBOX`,
+      prettyName: "INBOX",
+      isServer: false,
+      server: null,
+      updateFolder() {},
+      getMsgInputStream(msgHdr) {
+        let offset = 0;
+        const raw = msgHdr.row.raw || PLAIN_RAW;
+        return {
+          available() { return Math.min(raw.length - offset, 1000); },
+          read(count) { const chunk = raw.slice(offset, offset + count); offset += chunk.length; return chunk; },
+          close() {},
+        };
+      },
+      get msgDatabase() {
+        const openedGeneration = generation;
+        const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
+        return {
+          listAllKeys() { assertLive(); return Array.from(headers.keys()); },
+          enumerateMessages() { assert.fail("The attachment scan must not open a native message enumerator"); },
+          containsKey(key) { assertLive(); return headers.has(key); },
+          getMsgHdrForKey(key) { assertLive(); return headers.get(key); },
+        };
+      },
     };
-    headers.set(header.messageKey, header);
+    folderRows.forEach((row, index) => {
+      const header = {
+        messageKey: index + 1,
+        messageId: folderIndex === 0 ? `m-${index}@example.com` : `f${folderIndex}-m-${index}@example.com`,
+        threadId: 100 + index,
+        date: (index + 1) * 1000000,
+        subject: "Subject",
+        author: "Alice",
+        recipients: "Bob",
+        mime2DecodedSubject: "Subject",
+        mime2DecodedAuthor: "Alice",
+        mime2DecodedRecipients: "Bob",
+        ccList: "",
+        flags: (row.attach === false ? 0 : FLAGS.Attachment) | (row.offline === false ? 0 : FLAGS.Offline),
+        isRead: false,
+        isFlagged: true,
+        messageSize: 5,
+        folder,
+        getStringProperty: () => "",
+        getUint32Property: name => (name === "enigmail" ? (row.enigmail || 0) : 0),
+        row,
+      };
+      headers.set(header.messageKey, header);
+    });
+    const account = { key: `account${folderIndex + 1}`, incomingServer: { type: serverType, rootFolder: null } };
+    account.incomingServer.rootFolder = { getFolderWithFlags: flag => (flag === 0x1000 ? folder : null) };
+    folder.server = account.incomingServer;
+    folder.account = account;
+    folders.push(folder);
   });
-
-  const account = { key: "account1", incomingServer: { type: "imap", rootFolder: root } };
-  folder.server = account.incomingServer;
 
   class FakeDate extends Date {
     static now() { return now; }
@@ -108,9 +128,11 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
   function MsgHdrToMimeMessage(hdr, partsOfInterest, callback, ...rest) {
     stats.mimeCalls++;
     stats.mimeArgs.push(rest.length);
+    stats.mimeFolders.push(hdr.folder.URI);
     stats.inFlight++;
     stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
     const row = hdr.row;
+    row.timer = timers[timers.length - 1];
     if (row.mime === "throw") { stats.inFlight--; throw new Error("sync failure"); }
     const finish = () => {
       stats.inFlight--;
@@ -119,8 +141,7 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
       else callback(hdr, row.mimeMessage || { contentType: "multipart/mixed", parts: [], allUserAttachments: row.atts || [PDF] });
     };
     if (row.mime === "hang") {
-      // Never completes by itself; a late callback may still arrive via row.release().
-      row.release = () => { stats.inFlight--; callback(hdr, { contentType: "multipart/mixed", parts: [], allUserAttachments: [PDF] }); };
+      row.release = () => { finish(); };
       return;
     }
     setTimeout(finish, parseDelayMs);
@@ -143,7 +164,7 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
         },
       },
     },
-    Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    Ci: { nsMsgMessageFlags: FLAGS, nsMsgFolderFlags: { Inbox: 0x1000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
     Cc: {
       "@mozilla.org/timer;1": {
         createInstance() {
@@ -160,11 +181,14 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
       },
     },
     ChromeUtils: { importESModule: () => ({ MsgHdrToMimeMessage }) },
-    NetUtil: { readInputStreamToString: () => "" },
+    NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       mimeConverter: { decodeMimeHeader: value => value },
-      folderLookup: { getFolderForURL: uri => (uri === folder.URI ? folder : null) },
-      accounts: { accounts: [account], findAccountForServer: () => (accessible ? account : null) },
+      folderLookup: { getFolderForURL: uri => folders.find(candidate => candidate.URI === uri) || null },
+      accounts: {
+        accounts: folders.map(folder => folder.account),
+        findAccountForServer: server => (accessible ? folders.find(folder => folder.server === server).account : null),
+      },
     },
     isAccountAllowed: () => true,
     getAllowedAccountIds: () => [],
@@ -183,14 +207,14 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
     snippet("function isFolderAccessible(", "function toColumnarTable("),
     snippet("function getUserTags(", "// BEGIN OUTBOUND ATTACHMENT CONVERSION"),
     snippet("function openFolder(", "function findTrashFolder("),
+    snippet("// BEGIN MESSAGE HEADER READ TOOLS", "// END MESSAGE HEADER READ TOOLS"),
     snippet("// BEGIN ATTACHMENT SEARCH TOOL", "// END ATTACHMENT SEARCH TOOL"),
     "this.run = searchAttachments; this.constants = { MAX_MIME_CONCURRENCY, MIME_PARSE_TIMEOUT_MS };",
   ].join("\n"), runtime);
 
   return {
-    runtime, folder, stats, headers, timers,
+    runtime, folder: folders[0], folders, stats, timers,
     get constants() { return runtime.constants; },
-    advance(ms) { now += ms; },
     revokeAccess() { accessible = false; },
     setOnYield(callback) { onYield = callback; },
     async call(...args) {
@@ -200,6 +224,9 @@ function makeHarness({ rows, allowEncrypted = false, parseDelayMs = 0, msPerYiel
 }
 
 const rowsOf = (count, extra = {}) => Array.from({ length: count }, () => ({ ...extra }));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Newest messages are scanned and parsed first, so hung rows go LAST in the list.
+const hungRows = count => Array.from({ length: count }, () => ({ mime: "hang" }));
 
 describe("searchAttachments schema", () => {
   it("bounds its inputs and declares no required parameters", () => {
@@ -212,6 +239,9 @@ describe("searchAttachments schema", () => {
     assert.equal(tool.inputSchema.properties.maxResults.type, "integer");
     assert.equal(tool.inputSchema.properties.scanCap.type, "integer");
     assert.match(tool.description, /untrusted external data/);
+    assert.match(tool.description, /heuristic/);
+    assert.match(tool.description, /notOffline/);
+    assert.match(tool.description, /takes precedence over scanCap/);
   });
 });
 
@@ -220,6 +250,7 @@ describe("searchAttachments results", () => {
     const h = makeHarness({ rows: [{ atts: [PDF, PNG] }] });
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.truncated, false);
+    assert.equal("message" in result, false);
     assert.equal(result.matches.length, 1);
     const match = result.matches[0];
     assert.equal(match.id, "m-0@example.com");
@@ -264,19 +295,27 @@ describe("searchAttachments results", () => {
   });
 
   it("scans the inbox of each accessible account when no folder is given", async () => {
-    const h = makeHarness({ rows: [{}] });
+    const h = makeHarness({ rows: [{}], extraFolders: [[{}]] });
     const result = await h.call("invoice");
-    assert.equal(result.matches.length, 1);
+    assert.equal(result.matches.length, 2);
+  });
+
+  it("combines every applicable reason in one message", async () => {
+    const h = makeHarness({ rows: [{ offline: false }, ...rowsOf(6), { mime: "null" }] });
+    const result = await h.call("invoice", undefined, h.folder.URI, 2);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /more messages matched than maxResults/);
+    assert.match(result.message, /no offline copy/);
+    assert.match(result.message, /could not be parsed/);
   });
 });
 
 describe("searchAttachments cooperative scan", () => {
-  it("snapshots keys, yields, never retains a database or opens a native enumerator", async () => {
+  it("scans through the shared helper, yields, and never opens a native enumerator", async () => {
     const h = makeHarness({ rows: rowsOf(600, { attach: false }) });
     const result = await h.call("x", undefined, h.folder.URI);
     assert.equal(result.totalScanned, 600);
     assert.equal(result.truncated, false);
-    assert.equal(h.stats.listAllKeys, 1);
     assert.ok(h.stats.yields >= 2, "the scan must yield between batches");
     assert.equal(h.stats.mimeCalls, 0, "messages without the attachment flag are never parsed");
   });
@@ -286,7 +325,7 @@ describe("searchAttachments cooperative scan", () => {
     const result = await h.call("invoice", undefined, h.folder.URI, 200, 5);
     assert.equal(result.totalScanned, 5);
     assert.equal(result.candidates, 5);
-    assert.deepEqual(result.matches.map(m => m.id)[0], "m-49@example.com");
+    assert.equal(result.matches[0].id, "m-49@example.com");
     assert.equal(result.truncated, true);
     assert.match(result.message, /scanCap/);
   });
@@ -297,6 +336,7 @@ describe("searchAttachments cooperative scan", () => {
     assert.equal(result.candidates, 8);
     assert.equal(h.stats.mimeCalls, 8);
     assert.equal(result.truncated, true);
+    assert.match(result.message, /candidate limit/);
   });
 
   it("does not report a candidate limit when the buffer fills on the very last message", async () => {
@@ -305,6 +345,29 @@ describe("searchAttachments cooperative scan", () => {
     assert.equal(result.candidates, 8);
     assert.equal(result.matches.length, 0);
     assert.equal(result.truncated, false);
+  });
+
+  it("shares the candidate limit fairly so the first inbox cannot starve the others", async () => {
+    const h = makeHarness({ rows: rowsOf(100), extraFolders: [rowsOf(100)] });
+    const result = await h.call("invoice", undefined, undefined, 5);
+    assert.equal(result.candidates, 20);
+    const perFolder = uri => h.stats.mimeFolders.filter(folder => folder === uri).length;
+    assert.equal(perFolder(h.folders[0].URI), 10);
+    assert.equal(perFolder(h.folders[1].URI), 10);
+    assert.equal(result.truncated, true);
+  });
+
+  it("lets a later folder reuse the share an earlier folder did not need", async () => {
+    const h = makeHarness({ rows: rowsOf(3), extraFolders: [rowsOf(100)] });
+    await h.call("invoice", undefined, undefined, 5);
+    const second = h.stats.mimeFolders.filter(folder => folder === h.folders[1].URI).length;
+    assert.equal(second, 17);
+  });
+
+  it("yields between folders", async () => {
+    const h = makeHarness({ rows: rowsOf(1), extraFolders: [rowsOf(1), rowsOf(1)] });
+    await h.call("invoice");
+    assert.ok(h.stats.yields >= 2);
   });
 
   it("stops at the time budget during the scan and says so", async () => {
@@ -319,8 +382,30 @@ describe("searchAttachments cooperative scan", () => {
     const h = makeHarness({ rows: rowsOf(600) });
     h.setOnYield(count => { if (count === 1) h.revokeAccess(); });
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.deepEqual(result.matches, []);
+    assert.equal(result.matches.length, 0);
     assert.equal(result.truncated, true);
+  });
+});
+
+describe("searchAttachments remote messages without an offline copy", () => {
+  it("counts them separately, spends no timer and no parse, and explains why", async () => {
+    const h = makeHarness({ rows: [{ offline: false }, { offline: false }, {}] });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(result.notOffline, 2);
+    assert.equal(result.candidates, 1);
+    assert.equal(h.stats.mimeCalls, 1);
+    assert.equal(h.stats.timersCreated, 1);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /no offline copy/);
+    assert.doesNotMatch(result.message, /retry/i);
+    assert.equal("notParsed" in result, false);
+  });
+
+  it("does not apply the offline check to local folders", async () => {
+    const h = makeHarness({ rows: [{ offline: false }], serverType: "none" });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(result.matches.length, 1);
+    assert.equal("notOffline" in result, false);
   });
 });
 
@@ -347,23 +432,50 @@ describe("searchAttachments bounded MIME pool", () => {
     assert.ok(h.timers.every(timer => timer.ms === h.constants.MIME_PARSE_TIMEOUT_MS));
   });
 
-  it("frees the slot when a parse times out, reports notParsed, and ignores the late callback", async () => {
-    const rows = [{ mime: "hang" }, ...rowsOf(3)];
+  it("reports a timed-out parse as not parsed and ignores its late callback", async () => {
+    const rows = [...rowsOf(3), ...hungRows(1)];
     const h = makeHarness({ rows });
     const pending = h.call("invoice", undefined, h.folder.URI);
-    // Let the pool start, then fire the hung parse's timer.
-    await new Promise(resolve => setTimeout(resolve, 20));
-    const hung = h.timers.find(timer => !timer.cancelled);
-    assert.ok(hung, "the hung parse still holds a live timer");
-    hung.callback.notify();
+    await sleep(20);
+    rows[3].timer.callback.notify();
     const result = await pending;
     assert.equal(result.matches.length, 3);
     assert.equal(result.notParsed, 1);
     assert.equal(result.truncated, true);
-    assert.match(result.message, /could not be parsed/);
-    // A callback arriving after the timeout must not add a match or reopen the slot.
-    rows[0].release();
-    assert.equal(h.timers.every(timer => timer.cancelled || timer === hung), true);
+    assert.match(result.message, /not parsed because MIME parses stalled/);
+    rows[3].release();
+    assert.equal(h.stats.inFlight, 0);
+    assert.ok(h.timers.every(timer => timer.cancelled));
+  });
+
+  it("keeps a timed-out parse counted as in flight until its callback arrives", async () => {
+    const rows = [...rowsOf(40), ...hungRows(4)];
+    const h = makeHarness({ rows, parseDelayMs: 3 });
+    const pending = h.call("invoice", undefined, h.folder.URI, 50);
+    await sleep(15);
+    for (const row of rows.slice(40)) row.timer.callback.notify();
+    const result = await pending;
+    // 4 stalled parses plus at most 4 live ones: never more than 8 in flight.
+    assert.equal(h.stats.maxInFlight, 8);
+    assert.equal(result.matches.length, 40);
+    assert.equal(result.notParsed, 4);
+    for (const row of rows.slice(40)) row.release();
+    assert.equal(h.stats.inFlight, 0);
+  });
+
+  it("stops launching once every slot is held by a stalled parse and says so", async () => {
+    const rows = [...rowsOf(20), ...hungRows(8)];
+    const h = makeHarness({ rows, parseDelayMs: 1 });
+    const pending = h.call("invoice", undefined, h.folder.URI, 50);
+    await sleep(15);
+    for (const row of rows.slice(20)) row.timer.callback.notify();
+    const result = await pending;
+    assert.equal(h.stats.maxInFlight, 8);
+    assert.equal(h.stats.mimeCalls, 8 + result.matches.length);
+    assert.equal(result.matches.length + result.notParsed, 28);
+    assert.match(result.message, /stalled/);
+    for (const row of rows.slice(20)) row.release();
+    assert.equal(h.stats.inFlight, 0);
   });
 
   it("treats null MIME, throwing callbacks and synchronous MIME throws as unparsed without hanging", async () => {
@@ -378,8 +490,30 @@ describe("searchAttachments bounded MIME pool", () => {
   it("survives timer allocation failure without rejecting", async () => {
     const h = makeHarness({ rows: rowsOf(3), timerThrows: true });
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.deepEqual(result.matches, []);
+    assert.equal(result.matches.length, 0);
     assert.equal(result.notParsed, 3);
+  });
+
+  it("clamps each parse timeout to what is left of the shared budget", async () => {
+    // Three flagged messages sit in the newest chunk; four more yields of 4500 ms
+    // remain in the scan, so 20000 - 13500 = 6500 ms is left when parsing starts.
+    const rows = [...rowsOf(997, { attach: false }), ...rowsOf(3)];
+    const h = makeHarness({ rows, msPerYield: 4500 });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(h.stats.timersCreated, 3);
+    assert.ok(h.timers.every(timer => timer.ms === 6500), `timer ms: ${h.timers.map(t => t.ms)}`);
+    assert.equal(result.matches.length, 3);
+  });
+
+  it("does not start parsing once the budget is spent and counts the candidates as not parsed", async () => {
+    const rows = [...rowsOf(997, { attach: false }), ...rowsOf(3)];
+    const h = makeHarness({ rows, msPerYield: 7000 });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(h.stats.timersCreated, 0);
+    assert.equal(h.stats.mimeCalls, 0);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /20-second/);
+    assert.equal(result.notParsed, result.candidates);
   });
 
   it("stops pulling candidates at the shared deadline and counts the rest as not parsed", async () => {
@@ -400,8 +534,18 @@ describe("searchAttachments encrypted messages", () => {
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(h.stats.mimeCalls, 1);
     assert.equal(result.matches.length, 1);
-    assert.equal(result.encryptedWithheld, 1);
+    assert.equal(result.protectedWithheld, 1);
     assert.equal(result.truncated, false);
+  });
+
+  it("skips S/MIME and multipart/encrypted outer structures before any parse", async () => {
+    const encrypted = 'From: a@example.test\r\nContent-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"\r\n\r\n--b--\r\n';
+    const h = makeHarness({ rows: [{ raw: SMIME_RAW }, { raw: encrypted }, {}] });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(h.stats.mimeCalls, 1);
+    assert.equal(h.stats.timersCreated, 1);
+    assert.equal(result.protectedWithheld, 2);
+    assert.equal(result.matches.length, 1);
   });
 
   it("withholds messages whose parsed MIME tree is encrypted", async () => {
@@ -413,15 +557,16 @@ describe("searchAttachments encrypted messages", () => {
     };
     const h = makeHarness({ rows: [{ mimeMessage }] });
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.deepEqual(result.matches, []);
-    assert.equal(result.encryptedWithheld, 1);
+    assert.equal(result.matches.length, 0);
+    assert.equal(result.protectedWithheld, 1);
     assert.doesNotMatch(JSON.stringify(result), /Invoice/);
   });
 
   it("inspects encrypted messages only when the option allows it", async () => {
-    const h = makeHarness({ rows: encryptedRows(), allowEncrypted: true });
+    const h = makeHarness({ rows: [{ enigmail: DECRYPTION_OKAY }, { raw: SMIME_RAW }, {}], allowEncrypted: true });
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(result.matches.length, 2);
-    assert.equal("encryptedWithheld" in result, false);
+    assert.equal(result.matches.length, 3);
+    assert.equal("protectedWithheld" in result, false);
+    assert.deepEqual(h.stats.mimeArgs, [0, 0, 0]);
   });
 });
