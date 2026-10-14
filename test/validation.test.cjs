@@ -452,7 +452,8 @@ const sampleTools = [
       properties: {
         messageIds: {
           type: "array",
-          items: { type: "string" },
+          maxItems: 200,
+          items: { type: "string", minLength: 1 },
         },
         folderPath: { type: "string" },
       },
@@ -2044,14 +2045,18 @@ describe('Validation: batchGetMessageHeaders', () => {
     assert.deepStrictEqual(errors, []);
   });
 
-  // No schema maxItems: the 200-id hard cap lives in the handler (returning a
-  // clear { error } value), not in validation, so large arrays pass validation.
-  it('does not bound messageIds at the schema level', () => {
+  it('accepts exactly 200 ids and rejects 201 with a single bounds error', () => {
+    const ids = count => Array.from({ length: count }, (_, index) => `<message-${index}@example.com>`);
+    assert.deepStrictEqual(validate('batchGetMessageHeaders', {
+      messageIds: ids(200),
+      folderPath: 'imap://user@server/INBOX',
+    }), []);
     const errors = validate('batchGetMessageHeaders', {
-      messageIds: Array.from({ length: 250 }, (_, index) => `<message-${index}@example.com>`),
+      messageIds: ids(201),
       folderPath: 'imap://user@server/INBOX',
     });
-    assert.deepStrictEqual(errors, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at most 200 item/);
   });
 
   it('rejects messageIds passed as a non-array', () => {
@@ -2071,15 +2076,23 @@ describe('Validation: batchGetMessageHeaders', () => {
     assert.match(errors[0], /Missing required parameter: folderPath/);
   });
 
-  // Validation is SHALLOW: it enforces the messageIds array type but does NOT
-  // recurse into items, so a null element passes top-level validation (per-id
-  // handling happens inside the handler, which records a per-item "not found in
-  // this folder" error rather than aborting the batch).
-  it('does not reject a null array item at the top level (shallow validation)', () => {
+  // The recursive validator walks the items, so a null element is rejected
+  // before the handler runs.
+  it('rejects a null array item', () => {
     const errors = validate('batchGetMessageHeaders', {
       messageIds: ['<abc@example.com>', null],
       folderPath: 'imap://user@server/INBOX',
     });
-    assert.deepStrictEqual(errors, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /messageIds\[1\]/);
+  });
+
+  it('rejects an empty-string id', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: [''],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 character/);
   });
 });
