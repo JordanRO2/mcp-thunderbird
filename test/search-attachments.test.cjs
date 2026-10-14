@@ -95,7 +95,7 @@ function makeHarness({
         messageKey: index + 1,
         messageId: folderIndex === 0 ? `m-${index}@example.com` : `f${folderIndex}-m-${index}@example.com`,
         threadId: 100 + index,
-        date: (index + 1) * 1000000,
+        date: row.date !== undefined ? row.date : (index + 1) * 1000000,
         subject: "Subject",
         author: "Alice",
         recipients: "Bob",
@@ -209,12 +209,13 @@ function makeHarness({
     snippet("function openFolder(", "function findTrashFolder("),
     snippet("// BEGIN MESSAGE HEADER READ TOOLS", "// END MESSAGE HEADER READ TOOLS"),
     snippet("// BEGIN ATTACHMENT SEARCH TOOL", "// END ATTACHMENT SEARCH TOOL"),
-    "this.run = searchAttachments; this.constants = { MAX_MIME_CONCURRENCY, MIME_PARSE_TIMEOUT_MS };",
+    "this.run = searchAttachments; this.constants = { MAX_MIME_CONCURRENCY, MIME_PARSE_TIMEOUT_MS }; this.pool = attachmentParsePool;",
   ].join("\n"), runtime);
 
   return {
     runtime, folder: folders[0], folders, stats, timers,
     get constants() { return runtime.constants; },
+    advance(ms) { now += ms; },
     revokeAccess() { accessible = false; },
     setOnYield(callback) { onYield = callback; },
     async call(...args) {
@@ -347,21 +348,32 @@ describe("searchAttachments cooperative scan", () => {
     assert.equal(result.truncated, false);
   });
 
-  it("shares the candidate limit fairly so the first inbox cannot starve the others", async () => {
-    const h = makeHarness({ rows: rowsOf(100), extraFolders: [rowsOf(100)] });
-    const result = await h.call("invoice", undefined, undefined, 5);
-    assert.equal(result.candidates, 20);
-    const perFolder = uri => h.stats.mimeFolders.filter(folder => folder === uri).length;
-    assert.equal(perFolder(h.folders[0].URI), 10);
-    assert.equal(perFolder(h.folders[1].URI), 10);
+  it("examines the full candidate limit when one inbox is busy and the others are empty", async () => {
+    const h = makeHarness({ rows: rowsOf(300), extraFolders: [[], []] });
+    const result = await h.call("invoice", undefined, undefined, 50);
+    assert.equal(result.candidates, 200);
+    assert.equal(h.stats.mimeCalls, 200);
     assert.equal(result.truncated, true);
   });
 
-  it("lets a later folder reuse the share an earlier folder did not need", async () => {
-    const h = makeHarness({ rows: rowsOf(3), extraFolders: [rowsOf(100)] });
-    await h.call("invoice", undefined, undefined, 5);
-    const second = h.stats.mimeFolders.filter(folder => folder === h.folders[1].URI).length;
-    assert.equal(second, 17);
+  it("keeps the newest candidates across folders, not the first folder's", async () => {
+    const older = Array.from({ length: 100 }, (_, i) => ({ date: 1000 + i }));
+    const newer = Array.from({ length: 100 }, (_, i) => ({ date: 5000 + i }));
+    const h = makeHarness({ rows: older, extraFolders: [newer] });
+    const result = await h.call("invoice", undefined, undefined, 5);
+    assert.equal(result.candidates, 20);
+    assert.ok(h.stats.mimeFolders.every(uri => uri === h.folders[1].URI));
+    assert.ok(result.matches.every(match => match.folderPath === h.folders[1].URI));
+    assert.equal(result.truncated, true);
+  });
+
+  it("interleaves folders by date when both hold recent mail", async () => {
+    const a = Array.from({ length: 10 }, (_, i) => ({ date: 2 * i + 1 }));
+    const b = Array.from({ length: 10 }, (_, i) => ({ date: 2 * i + 2 }));
+    const h = makeHarness({ rows: a, extraFolders: [b] });
+    const result = await h.call("invoice", undefined, undefined, 3);
+    assert.equal(result.candidates, 12);
+    assert.deepEqual(result.matches.map(m => m.id), ["f1-m-9@example.com", "m-9@example.com", "f1-m-8@example.com"]);
   });
 
   it("yields between folders", async () => {
@@ -401,11 +413,21 @@ describe("searchAttachments remote messages without an offline copy", () => {
     assert.equal("notParsed" in result, false);
   });
 
+  it("treats every non-local server type as remote, including native Exchange", async () => {
+    for (const serverType of ["ews", "graph", "nntp", "someaddon"]) {
+      const h = makeHarness({ rows: [{ offline: false }], serverType });
+      const result = await h.call("invoice", undefined, h.folder.URI);
+      assert.equal(result.notOffline, 1, serverType);
+      assert.equal(h.stats.mimeCalls, 0, serverType);
+    }
+  });
+
   it("does not apply the offline check to local folders", async () => {
-    const h = makeHarness({ rows: [{ offline: false }], serverType: "none" });
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(result.matches.length, 1);
-    assert.equal("notOffline" in result, false);
+    for (const serverType of ["none", "pop3", "movemail", "rss"]) {
+      const h = makeHarness({ rows: [{ offline: false }], serverType });
+      const result = await h.call("invoice", undefined, h.folder.URI);
+      assert.equal(result.matches.length, 1, serverType);
+    }
   });
 });
 
@@ -548,6 +570,16 @@ describe("searchAttachments encrypted messages", () => {
     assert.equal(result.matches.length, 1);
   });
 
+  it("withholds messages whose outer headers cannot be read in full instead of parsing them", async () => {
+    const oversized = ["From: a@example.test", `X-Pad: ${"x".repeat(20000)}`, "Content-Type: application/pkcs7-mime", "", "AAAA"].join("\r\n");
+    const h = makeHarness({ rows: [{ raw: oversized }, {}] });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(h.stats.mimeCalls, 1);
+    assert.equal(result.protectedWithheld, 1);
+    const allowed = makeHarness({ rows: [{ raw: oversized }], allowEncrypted: true });
+    assert.equal((await allowed.call("invoice", undefined, allowed.folder.URI)).matches.length, 1);
+  });
+
   it("withholds messages whose parsed MIME tree is encrypted", async () => {
     const mimeMessage = {
       contentType: "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
@@ -568,5 +600,61 @@ describe("searchAttachments encrypted messages", () => {
     assert.equal(result.matches.length, 3);
     assert.equal("protectedWithheld" in result, false);
     assert.deepEqual(h.stats.mimeArgs, [0, 0, 0]);
+  });
+});
+
+describe("searchAttachments in-flight limit across calls", () => {
+  it("counts streams left by a timed-out parse of an earlier call against later calls", async () => {
+    const hung = hungRows(3);
+    const rows = [...rowsOf(40), ...hung];
+    const h = makeHarness({ rows, parseDelayMs: 2 });
+    const first = h.call("invoice", undefined, h.folder.URI, 50);
+    await sleep(15);
+    for (const row of hung) row.timer.callback.notify();
+    await first;
+    for (const row of hung) row.mime = undefined; // later calls parse them normally
+    assert.equal(h.stats.inFlight, 3, "three streams are still running");
+    h.stats.maxInFlight = 0;
+    const second = await h.call("invoice", undefined, h.folder.URI, 50);
+    assert.equal(second.matches.length, 43, "normal messages still parse");
+    assert.ok(h.stats.maxInFlight <= 8, `max in flight ${h.stats.maxInFlight}`);
+    assert.equal(h.stats.maxInFlight, 8);
+    for (const row of hung) row.release();
+    assert.equal(h.stats.inFlight, 0);
+  });
+
+  it("refuses new parses while every slot is held by an earlier call's stalled streams, then recovers", async () => {
+    const hung = hungRows(8);
+    const h = makeHarness({ rows: [{}, {}, ...hung] });
+    const first = h.call("invoice", undefined, h.folder.URI, 50);
+    await sleep(15);
+    for (const row of hung) row.timer.callback.notify();
+    await first;
+    for (const row of hung) row.mime = undefined;
+    const calls = h.stats.mimeCalls;
+    const blocked = await h.call("invoice", undefined, h.folder.URI, 50);
+    assert.equal(h.stats.mimeCalls, calls, "nothing new may start while all slots are stalled");
+    assert.equal(blocked.matches.length, 0);
+    assert.match(blocked.message, /stalled/);
+    for (const row of hung) row.release();
+    const recovered = await h.call("invoice", undefined, h.folder.URI, 50);
+    assert.equal(recovered.matches.length, 10);
+  });
+
+  it("reclaims slots of streams that never call back after the stall TTL", async () => {
+    const hung = hungRows(8);
+    const h = makeHarness({ rows: [{}, {}, ...hung] });
+    const first = h.call("invoice", undefined, h.folder.URI, 50);
+    await sleep(15);
+    for (const row of hung) row.timer.callback.notify();
+    await first;
+    for (const row of hung) row.mime = undefined;
+    h.advance(6 * 60 * 1000);
+    const later = await h.call("invoice", undefined, h.folder.URI, 50);
+    assert.equal(later.matches.length, 10);
+    // A callback arriving after reclamation must not free a slot twice.
+    for (const row of hung) row.release();
+    assert.equal(h.runtime.pool.live, 0);
+    assert.equal(h.runtime.pool.stalledSlots.size, 0);
   });
 });
