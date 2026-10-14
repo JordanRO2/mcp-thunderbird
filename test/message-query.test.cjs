@@ -39,7 +39,9 @@ const INBOX_FLAG = 0x1000;
 const NO_THREAD = 0xffffffff;
 
 // Minimal stand-in for MailServices.headerParser.parseEncodedHeader.
+let parseCalls = 0;
 function parseEncodedHeader(raw) {
+  parseCalls++;
   return (raw.match(/(?:[^,"]|"[^"]*")+/g) || []).map(part => {
     const angle = part.match(/<([^>]+)>/);
     const email = (angle ? angle[1] : part).trim();
@@ -56,6 +58,8 @@ function parseEncodedHeader(raw) {
  */
 function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
   const stats = { yields: 0, listAllKeys: 0, headerReads: 0, hydrated: 0 };
+  let onDirectLookup = null;
+  parseCalls = 0;
   let generation = 0;
   let now = 1700000000000;
   const revoked = new Set();
@@ -92,7 +96,12 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
           getMsgHdrForKey(key) { assertLive(); stats.headerReads++; return headers.get(key); },
         };
         if (spec.direct !== false) {
-          db.getMsgHdrForMessageID = id => { assertLive(); return byMessageId.get(id) || null; };
+          db.getMsgHdrForMessageID = id => {
+            assertLive();
+            const found = byMessageId.get(id) || null;
+            if (found && onDirectLookup) onDirectLookup(found);
+            return found;
+          };
         }
         if (spec.threadApi !== false) {
           db.getThreadContainingMsgHdr = hdr => {
@@ -190,7 +199,10 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
   const keywordEnd = source.indexOf("]);", keywordStart);
   const tools = productionTools();
   runtime.buildTools = () => tools;
+  const calendarPattern = source.match(/^\s*const CALENDAR_EMAIL_PATTERN = [^\r\n]+;/m);
+  assert.ok(calendarPattern, "Production constant missing: CALENDAR_EMAIL_PATTERN");
   vm.runInContext([
+    calendarPattern[0],
     ...[
       "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "MAX_HEADER_BATCH_IDS", "PREF_ALLOW_ENCRYPTED_MESSAGES",
       "DEFAULT_THREAD_RESULTS", "MAX_THREAD_RESULTS", "DEFAULT_SENDER_RESULTS", "MAX_SENDER_RESULTS",
@@ -215,6 +227,14 @@ function makeHarness({ folders, allowEncrypted = false, msPerYield = 0 } = {}) {
     runtime,
     stats,
     now: () => now,
+    parses: () => parseCalls,
+    setOnDirectLookup(callback) { onDirectLookup = callback; },
+    removeRow(uri, key) {
+      const { headers } = byUri.get(uri);
+      const header = headers.get(key);
+      headers.delete(key);
+      return header;
+    },
     revoke(uri) { revoked.add(byUri.get(uri).account.key); },
     setOnYield(callback) { onYield = callback; },
     async call(name, args) {
@@ -382,6 +402,25 @@ describe("searchByThread", () => {
     assert.match(unknown.error, /time budget/);
   });
 
+  it("re-reads the anchor for the final page and flags it when it vanished during the read", async () => {
+    const h = oneFolder(rowsOf(600, () => ({ thread: 1 })));
+    h.setOnYield(count => { if (count === 1) h.removeRow(INBOX, 1); });
+    const result = await h.call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX });
+    assert.equal(result.anchorId, "f0-m0@example.com");
+    assert.ok(!idsOf(result.thread).includes("f0-m0@example.com"), "a stale anchor is not returned");
+    assert.equal(result.notScanned, true);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /disappeared/);
+  });
+
+  it("reports a vanished anchor instead of scanning the folder", async () => {
+    const h = oneFolder(rowsOf(2000, i => ({ thread: i < 3 ? 1 : 1000 + i })));
+    h.setOnDirectLookup(hdr => h.removeRow(INBOX, hdr.messageKey));
+    const result = await h.call("searchByThread", { messageId: "f0-m0@example.com", folderPath: INBOX });
+    assert.deepEqual(result, { error: "Message not found: f0-m0@example.com" });
+    assert.equal(h.stats.listAllKeys, 0, "no fallback folder scan");
+  });
+
   it("withholds encrypted subjects like the base header tools", async () => {
     const rows = [{ id: "e@x", thread: 1, enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: "Cached decrypted subject" } }];
     const blocked = await oneFolder(rows).call("searchByThread", { messageId: "e@x", folderPath: INBOX });
@@ -422,18 +461,34 @@ describe("getSenderHistory", () => {
       { id: "comma@x", author: '"Doe, Ann" <ann@example.com>', date: 2000 },
       { id: "other@x", author: "Bob <bob@example.com>", date: 9000 },
     ]);
-    for (const query of ["Ann@Example.com", "mailto:ann@example.com", "Ann <ann@example.com>"]) {
+    for (const query of ["Ann@Example.com", "mailto:ann@example.com", "MAILTO:ANN@example.com"]) {
       const result = await h.call("getSenderHistory", { email: query });
       assert.deepEqual(idsOf(result.messages), ["hit2@x", "comma@x", "hit1@x"], query);
       assert.equal(result.truncated, false);
     }
   });
 
-  it("rejects a query that is not a single address", async () => {
+  it("rejects a query that is not one plain address, instead of returning a confident empty result", async () => {
     const h = oneFolder(rowsOf(2));
-    for (const query of ["alice", "a@x.test, b@x.test", "   "]) {
-      assert.match((await h.call("getSenderHistory", { email: query })).error, /single email address|non-empty/, query);
+    for (const query of [
+      "alice", "a@x.test, b@x.test", "   ", "Ann <ann@example.com>",
+      "mailto:alice@example.com?subject=x", "mailto:alice@example.com?cc=b@x.test",
+      "http://alice@example.com", "alice@example.com\n", "ali ce@example.com",
+    ]) {
+      const result = await h.call("getSenderHistory", { email: query });
+      assert.match(result.error, /single email address|non-empty/, JSON.stringify(query));
+      assert.equal(result.messages, undefined, JSON.stringify(query));
     }
+  });
+
+  it("skips the header parser for rows that cannot match", async () => {
+    const h = oneFolder([
+      ...rowsOf(500, () => ({ author: "Bob <bob@example.com>" })),
+      { id: "hit@x", author: "=?utf-8?q?Ann?= <ann@example.com>" },
+    ]);
+    const result = await h.call("getSenderHistory", { email: "ann@example.com" });
+    assert.deepEqual(idsOf(result.messages), ["hit@x"]);
+    assert.ok(h.parses() <= 3, `parser ran ${h.parses()} times for 501 rows`);
   });
 
   it("returns the shared shape plus folderPath, newest by date despite key order", async () => {

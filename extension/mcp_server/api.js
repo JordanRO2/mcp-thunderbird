@@ -9933,17 +9933,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let complete = true;
                 let scanned = 0;
                 let childKeys = null;
+                let anchorGone = false;
                 try {
                   const threadDb = folder.msgDatabase;
                   const anchorHdr = getSearchHeader(threadDb, anchorKey);
-                  const thread = anchorHdr && threadDb.getThreadContainingMsgHdr(anchorHdr);
-                  if (thread) {
-                    childKeys = [];
-                    for (let i = 0; i < thread.numChildren; i++) childKeys.push(thread.getChildKeyAt(i));
+                  if (!anchorHdr || (anchorHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                    anchorGone = true;
+                  } else if (typeof threadDb.getThreadContainingMsgHdr === "function") {
+                    const thread = threadDb.getThreadContainingMsgHdr(anchorHdr);
+                    if (thread) {
+                      childKeys = [];
+                      for (let i = 0; i < thread.numChildren; i++) childKeys.push(thread.getChildKeyAt(i));
+                    }
                   }
                 } catch {
                   childKeys = null;
                 }
+                // The anchor vanished since the lookup: say so rather than scanning on.
+                if (anchorGone) return { error: `Message not found: ${messageId}` };
                 if (childKeys) {
                   for (let index = 0; index < childKeys.length;) {
                     if (searchTimeExpired(scan) || !isFolderAccessible(folder)) { complete = false; break; }
@@ -9996,7 +10003,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   pageDb = null;
                 }
                 for (const key of page) {
-                  if (key === anchorKey) { thread.push(anchorHeader); continue; }
+                  // The anchor is re-read like every member: it can be stale after a yield.
                   try {
                     const msgHdr = pageDb && getSearchHeader(pageDb, key);
                     if (!msgHdr || (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) { vanished = true; continue; }
@@ -10054,11 +10061,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (typeof email !== "string" || !email.trim()) {
                   return { error: "email must be a non-empty string" };
                 }
-                const queryEmails = parseAuthorEmails(email.trim().replace(/^mailto:/i, ""));
-                if (queryEmails.length !== 1 || !queryEmails[0].includes("@")) {
-                  return { error: "email must be a single email address" };
+                // One plain mailbox only (as for attendees): no display-address
+                // syntax, URI headers such as ?subject=, or other URI schemes.
+                const queryEmail = email.replace(/^mailto:/i, "");
+                if (/[\x00-\x1f\x7f-\x9f]/.test(email) || !CALENDAR_EMAIL_PATTERN.test(queryEmail)) {
+                  return { error: "email must be a single email address (optionally prefixed with mailto:)" };
                 }
-                const wanted = queryEmails[0];
+                const wanted = queryEmail.toLowerCase();
                 const cap = clampQueryLimit(maxResults, DEFAULT_SENDER_RESULTS, MAX_SENDER_RESULTS);
                 const scanLimit = clampQueryLimit(scanCap, DEFAULT_SENDER_SCAN_CAP, MAX_SENDER_SCAN_CAP);
                 const sinceMicros = Number.isFinite(sinceDays) && sinceDays > 0
@@ -10096,7 +10105,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (sinceMicros !== null && msgHdr.date && msgHdr.date < sinceMicros) return false;
                     if (examined >= scanLimit) { capped = true; return true; }
                     examined++;
-                    if (!parseAuthorEmails(msgHdr.author).includes(wanted)) return false;
+                    // Cheap prefilter before the XPCOM parse: an address cannot be
+                    // hidden in an encoded-word, so a raw miss is a real miss.
+                    const rawAuthor = msgHdr.author || "";
+                    if (!rawAuthor.toLowerCase().includes(wanted)) return false;
+                    if (!parseAuthorEmails(rawAuthor).includes(wanted)) return false;
                     state.matched++;
                     rows.push({ key: msgHdr.messageKey, date: msgHdr.date || 0, uri: inbox.URI });
                     // Bound memory: keep only the newest rows.
