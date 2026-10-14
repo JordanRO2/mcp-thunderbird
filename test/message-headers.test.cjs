@@ -43,6 +43,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
   let now = 0;
   let accessible = true;
   let onYield = null;
+  let databaseHook = null;
   const headers = new Map();
   const byMessageId = new Map();
 
@@ -62,6 +63,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
       };
     },
     get msgDatabase() {
+      if (databaseHook) databaseHook();
       const openedGeneration = generation;
       const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
       const db = {
@@ -172,6 +174,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
     advance(ms) { now += ms; },
     revokeAccess() { accessible = false; },
     setOnYield(callback) { onYield = callback; },
+    setDatabaseHook(callback) { databaseHook = callback; },
     async call(name, args) {
       const result = await runtime.callTool(name, args);
       return JSON.parse(JSON.stringify(result));
@@ -435,5 +438,96 @@ describe("handler guards and error surfacing", () => {
     assert.deepEqual(result.headers["m-0@example.com"], { error: "Could not read message header" });
     assert.equal(result.headers["m-1@example.com"].id, "m-1@example.com");
     assert.equal(result.failed, 1);
+  });
+});
+
+describe("bracketed and untrimmed ids", () => {
+  it("matches bracketed ids on the direct path and keys results by the caller's id", async () => {
+    const h = makeHarness({ rows: rowsOf(50) });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["<m-1@example.com>", " m-2@example.com ", "m-1@example.com"],
+      folderPath: h.folder.URI,
+    });
+    assert.equal(result.failed, 0);
+    assert.equal(result.total, 3);
+    assert.deepEqual(Object.keys(result.headers).sort(), [" m-2@example.com ", "<m-1@example.com>", "m-1@example.com"]);
+    assert.equal(result.headers["<m-1@example.com>"].id, "m-1@example.com");
+    assert.equal(result.headers[" m-2@example.com "].id, "m-2@example.com");
+    assert.equal(h.stats.listAllKeys, 0, "no scan for a resolvable id");
+    assert.equal(h.stats.yields, 0);
+    const single = await h.call("getMessageHeaders", { messageId: "<m-3@example.com>", folderPath: h.folder.URI });
+    assert.equal(single.id, "m-3@example.com");
+  });
+
+  it("matches bracketed ids on the scan path", async () => {
+    const rows = rowsOf(800);
+    rows[700].indirectOnly = true;
+    const h = makeHarness({ rows });
+    const result = await h.call("batchGetMessageHeaders", { messageIds: ["<m-700@example.com>"], folderPath: h.folder.URI });
+    assert.equal(result.failed, 0);
+    assert.equal(result.headers["<m-700@example.com>"].id, "m-700@example.com");
+    assert.equal(h.stats.listAllKeys, 1);
+    const single = await h.call("getMessageHeaders", { messageId: "<m-700@example.com>", folderPath: h.folder.URI });
+    assert.equal(single.id, "m-700@example.com");
+  });
+
+  it("reports an id that normalises to nothing as not found without scanning", async () => {
+    const h = makeHarness({ rows: [{ hdr: { messageId: "" } }, ...rowsOf(500)] });
+    const result = await h.call("batchGetMessageHeaders", { messageIds: ["<>", "m-1@example.com"], folderPath: h.folder.URI });
+    assert.deepEqual(result.headers["<>"], { error: "not found in this folder" });
+    assert.equal(result.headers["m-1@example.com"].id, "m-1@example.com");
+    assert.equal(h.stats.listAllKeys, 0);
+  });
+});
+
+describe("scan robustness", () => {
+  it("keeps resolved headers and reports the rest as notScanned when the database getter throws after a yield", async () => {
+    const rows = rowsOf(2000);
+    rows[1500].indirectOnly = true;
+    const h = makeHarness({ rows });
+    let reads = 0;
+    // 1 openFolder, 2 listAllKeys, 3 first chunk, 4 second chunk (throws).
+    h.setDatabaseHook(() => { if (++reads >= 4) throw new Error("database closed"); });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["m-1@example.com", "m-1500@example.com"],
+      folderPath: h.folder.URI,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.headers["m-1@example.com"].id, "m-1@example.com");
+    assert.equal(result.headers["m-1500@example.com"].notScanned, true);
+    assert.deepEqual(result.notScanned, ["m-1500@example.com"]);
+    assert.equal(result.truncated, true);
+    assert.equal(h.stats.yields, 1);
+  });
+
+  it("treats an expunged direct-lookup hit as gone", async () => {
+    const h = makeHarness({ rows: [{ hdr: { flags: 0x8 } }, {}] });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["m-0@example.com", "m-1@example.com"],
+      folderPath: h.folder.URI,
+    });
+    assert.deepEqual(result.headers["m-0@example.com"], { error: "not found in this folder" });
+    assert.equal(result.headers["m-1@example.com"].id, "m-1@example.com");
+    assert.equal(result.truncated, undefined);
+    const single = await h.call("getMessageHeaders", { messageId: "m-0@example.com", folderPath: h.folder.URI });
+    assert.deepEqual(single, { error: "Message not found: m-0@example.com" });
+  });
+});
+
+describe("inReplyTo from parsed references", () => {
+  it("prefers Thunderbird's parsed references and falls back to the stored string", async () => {
+    const parsed = ["root@example.com", "parent@example.com"];
+    const h = makeHarness({
+      rows: [
+        { properties: { references: "<other@example.com>" }, hdr: { numReferences: 2, getStringReference: index => parsed[index] } },
+        { properties: { references: "<a@example.com> <b@example.com>" }, hdr: { numReferences: 0, getStringReference: () => assert.fail("not used") } },
+        { properties: { references: "<c@example.com>" }, throwOn: ["numReferences"] },
+      ],
+    });
+    const read = async index => h.call("getMessageHeaders", { messageId: `m-${index}@example.com`, folderPath: h.folder.URI });
+    assert.equal((await read(0)).inReplyTo, "parent@example.com");
+    assert.equal((await read(0)).references, "<other@example.com>");
+    assert.equal((await read(1)).inReplyTo, "b@example.com");
+    assert.equal((await read(2)).inReplyTo, "c@example.com");
   });
 });

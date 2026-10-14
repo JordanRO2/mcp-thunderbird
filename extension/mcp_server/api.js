@@ -2159,7 +2159,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Keep in sync with MAX_HEADER_BATCH_IDS (handler-side guard).
               maxItems: 200,
               description: "Message IDs to read headers for, max 200. All must live in folderPath.",
-              items: { type: "string", minLength: 1, description: "An RFC Message-ID (from searchMessages results)" },
+              items: { type: "string", minLength: 1, description: "An RFC Message-ID (from searchMessages results); surrounding angle brackets are optional" },
             },
             folderPath: { type: "string", description: "The folder URI path shared by every id" },
           },
@@ -3717,6 +3717,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Direct parent Message-ID for a header: Thunderbird's own parsed
+             * references (numReferences / getStringReference, bracket-free) when
+             * available, otherwise the last entry of the raw references string.
+             */
+            function getHeaderParentId(msgHdr, references) {
+              try {
+                const count = msgHdr.numReferences;
+                if (typeof count === "number" && count > 0 && typeof msgHdr.getStringReference === "function") {
+                  const last = msgHdr.getStringReference(count - 1);
+                  if (last) return String(last).trim().replace(/^<|>$/g, "");
+                }
+              } catch {
+                // Fall back to parsing the stored string.
+              }
+              return getParentMessageId(references);
+            }
+
+            /**
              * Single shared header-shape extractor used by getMessageHeaders and
              * batchGetMessageHeaders so the two tools return field-identical
              * objects. Field names and types match the other read tools
@@ -3751,7 +3769,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 flagged: msgHdr.isFlagged,
                 tags: getUserTags(msgHdr),
                 references,
-                inReplyTo: getParentMessageId(references),
+                inReplyTo: getHeaderParentId(msgHdr, references),
                 size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
               };
               if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasRecordedEncryption(msgHdr)) {
@@ -9514,6 +9532,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END MESSAGE READ TOOLS
 
             // BEGIN MESSAGE HEADER READ TOOLS
+            // Thunderbird stores Message-IDs without angle brackets and looks them up
+            // by exact text, so callers' "<id@host>" forms are normalised first.
+            function normalizeHeaderMessageId(id) {
+              return typeof id === "string" ? id.trim().replace(/^</, "").replace(/>$/, "") : "";
+            }
+
             /**
              * Resolves headers for message IDs in one folder. Direct lookups run
              * first (synchronous and indexed). Remaining ids share ONE cooperative
@@ -9531,8 +9555,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (opened.error) return opened;
               const { folder, db } = opened;
 
-              const wanted = new Set(messageIds);
-              const headers = new Map();
+              // Look up by normalised id; report by the caller's original ids.
+              const originalsByKey = new Map();
+              for (const id of messageIds) {
+                const key = normalizeHeaderMessageId(id);
+                if (!originalsByKey.has(key)) originalsByKey.set(key, []);
+                originalsByKey.get(key).push(id);
+              }
+              const resolved = new Map();
               function readHeader(msgHdr) {
                 try {
                   return msgHdrToHeaderObject(msgHdr);
@@ -9541,72 +9571,87 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
+              // An id that normalises to nothing can match no message; looking it
+              // up would only match headers that have no Message-ID.
+              const lookupKeys = [...originalsByKey.keys()].filter(Boolean);
+
               if (typeof db.getMsgHdrForMessageID === "function") {
-                for (const id of wanted) {
+                for (const key of lookupKeys) {
                   try {
-                    const msgHdr = db.getMsgHdrForMessageID(id);
-                    if (msgHdr) headers.set(id, readHeader(msgHdr));
+                    const msgHdr = db.getMsgHdrForMessageID(key);
+                    // An expunged row is gone, as it is for the scan and search.
+                    if (msgHdr && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                      resolved.set(key, readHeader(msgHdr));
+                    }
                   } catch {
                     // Leave the id for the scan below.
                   }
                 }
               }
 
-              const missing = new Set();
-              for (const id of wanted) {
-                if (!headers.has(id)) missing.add(id);
-              }
-              if (missing.size === 0) {
-                return { headers, notFound: [], notScanned: [], timedOut: false };
-              }
-
+              const missing = new Set(lookupKeys.filter(key => !resolved.has(key)));
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
               let complete = true;
-              let keys;
-              try {
-                keys = folder.msgDatabase.listAllKeys();
-              } catch {
-                keys = null;
-              }
-              if (!keys || typeof keys.length !== "number") {
-                complete = false;
-              } else {
-                for (let index = 0; index < keys.length && missing.size > 0;) {
-                  if (searchTimeExpired(scan)) { complete = false; break; }
-                  if (!isFolderAccessible(folder)) { complete = false; break; }
-                  const scanDb = folder.msgDatabase;
-                  const end = Math.min(index + SEARCH_YIELD_EVERY, keys.length);
-                  for (; index < end && missing.size > 0; index++) {
+              if (missing.size > 0) {
+                let keys;
+                try {
+                  keys = folder.msgDatabase.listAllKeys();
+                } catch {
+                  keys = null;
+                }
+                if (!keys || typeof keys.length !== "number") {
+                  complete = false;
+                } else {
+                  for (let index = 0; index < keys.length && missing.size > 0;) {
+                    if (searchTimeExpired(scan)) { complete = false; break; }
+                    if (!isFolderAccessible(folder)) { complete = false; break; }
+                    let scanDb;
                     try {
-                      const msgHdr = getSearchHeader(scanDb, keys[index]);
-                      if (!msgHdr) { complete = false; continue; }
-                      if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
-                      const id = msgHdr.messageId;
-                      if (missing.has(id)) {
-                        headers.set(id, readHeader(msgHdr));
-                        missing.delete(id);
-                      }
+                      // The database can be closed, rebuilt or deleted across a yield.
+                      scanDb = folder.msgDatabase;
                     } catch {
-                      complete = false;
+                      scanDb = null;
+                    }
+                    if (!scanDb) { complete = false; break; }
+                    const end = Math.min(index + SEARCH_YIELD_EVERY, keys.length);
+                    for (; index < end && missing.size > 0; index++) {
+                      try {
+                        const msgHdr = getSearchHeader(scanDb, keys[index]);
+                        if (!msgHdr) { complete = false; continue; }
+                        if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
+                        const key = normalizeHeaderMessageId(msgHdr.messageId);
+                        if (missing.has(key)) {
+                          resolved.set(key, readHeader(msgHdr));
+                          missing.delete(key);
+                        }
+                      } catch {
+                        complete = false;
+                      }
+                    }
+                    if (index < keys.length && missing.size > 0) {
+                      await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                     }
                   }
-                  if (index < keys.length && missing.size > 0) {
-                    await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
-                  }
+                }
+
+                // Access can be revoked while the scan yields; do not return rows
+                // read before the revocation.
+                if (!isFolderAccessible(folder)) {
+                  return { error: `Account not accessible for folder: ${folderPath}` };
                 }
               }
 
-              // Access can be revoked while the scan yields; do not return rows read
-              // before the revocation.
-              if (!isFolderAccessible(folder)) {
-                return { error: `Account not accessible for folder: ${folderPath}` };
+              const headers = new Map();
+              const notFound = new Set();
+              const notScanned = new Set();
+              for (const [key, originals] of originalsByKey) {
+                for (const id of originals) {
+                  if (resolved.has(key)) headers.set(id, resolved.get(key));
+                  else if (missing.has(key) && !complete) notScanned.add(id);
+                  else notFound.add(id);
+                }
               }
-              return {
-                headers,
-                notFound: complete ? [...missing] : [],
-                notScanned: complete ? [] : [...missing],
-                timedOut: !!scan.timedOut,
-              };
+              return { headers, notFound: [...notFound], notScanned: [...notScanned], timedOut: !!scan.timedOut };
             }
 
             function describeIncompleteHeaderScan(count, timedOut) {
