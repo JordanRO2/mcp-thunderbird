@@ -825,7 +825,7 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
 // paths like /data/... or the host's /tmp; passing those paths through to the
 // extension fails when file.exists() returns false inside the sandbox. Reading
 // on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
-const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage', 'dryRunCompose']);
 
 // Minimal MIME map covering common attachment types (documents, images,
 // archives, A/V). Falls back to application/octet-stream which Thunderbird
@@ -1621,6 +1621,7 @@ module.exports = {
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
+  ATTACHMENT_TOOLS,
   attachmentLimits: {
     MAX_ATTACHMENT_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,

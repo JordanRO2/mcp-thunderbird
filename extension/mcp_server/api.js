@@ -3714,11 +3714,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Any refused entry throws before a send/draft/window can proceed,
              * and removes temporary files created by this conversion.
              *
-             * With { dryRun: true } every check runs unchanged, but inline entries
-             * are neither decoded nor written (their decoded size is derived from
-             * the validated base64 length) and no native attachment is built, so
-             * the call has no side effects. Descriptors then carry no url for
-             * inline entries.
+             * With { dryRun: true } every validation step runs unchanged, but inline
+             * entries are neither decoded nor written (their decoded size is derived
+             * from the validated base64 length) and the final native-attachment
+             * materialization (descsToMsgAttachments) is skipped, so the call has no
+             * side effects. Descriptors then carry no url for inline entries.
              */
             // BEGIN OUTBOUND ATTACHMENT CONVERSION
             function filePathsToAttachDescs(filePaths, { dryRun = false } = {}) {
@@ -9564,13 +9564,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // BEGIN DRY-RUN COMPOSE TOOL
             /**
-             * Approximate recipient count of a comma-separated address header string.
-             * Comma-splits, trims, drops empties (a quoted comma in a display name is
-             * over-counted). Informational only. Pure (no I/O).
+             * Recipient count of an address header, using the same splitter as the
+             * reply/forward paths (quoted commas are not split). Pure (no I/O).
              */
-            function countRecipients(s) {
-              if (typeof s !== "string" || !s.trim()) return 0;
-              return s.split(",").map(p => p.trim()).filter(Boolean).length;
+            function countRecipients(header) {
+              return splitAddressHeader(typeof header === "string" ? header : "").filter(a => a.trim()).length;
             }
 
             /**
@@ -9579,26 +9577,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * params object), format resolution and attachment validation
              * (filePathsToAttachDescs in dryRun mode) as the real path, and reports
              * what would be sent. It never sends, saves, opens a compose window,
-             * writes a file, or mutates audit/state. Never throws.
+             * writes a file, or mutates audit/state. Gated on sendMail being
+             * enabled, since it probes the same paths sendMail would attach.
              */
             function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, includeSignature = true) {
+              if (!isToolEnabled("sendMail")) {
+                return { error: "dryRunCompose requires the sendMail tool to be enabled" };
+              }
               const blockers = [];
+              const direct = !!skipReview;
+              const recipients = { to: countRecipients(to), cc: countRecipients(cc), bcc: countRecipients(bcc) };
               const result = {
                 wouldSucceed: false,
                 blockers,
-                mode: skipReview ? "direct-send" : "review-window",
+                mode: direct ? "direct-send" : "review-window",
                 skipReviewBlocked: isSkipReviewBlocked(),
                 resolvedIdentity: null,
                 isHtml: null,
                 subject: typeof subject === "string" ? subject : "",
                 bodyLength: typeof body === "string" ? body.length : 0,
-                includeSignature: includeSignature !== false,
-                recipients: { to: countRecipients(to), cc: countRecipients(cc), bcc: countRecipients(bcc) },
+                includeSignature: direct ? includeSignature !== false : null,
+                recipients,
                 attachments: [],
               };
               try {
-                if (skipReview && result.skipReviewBlocked) {
+                if (direct && result.skipReviewBlocked) {
                   blockers.push("User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead.");
+                } else if (direct && recipients.to + recipients.cc + recipients.bcc === 0) {
+                  blockers.push("A direct send needs at least one recipient (to, cc or bcc)");
                 }
                 const params = { identity: null };
                 const identityResult = setComposeIdentity(params, from, null);

@@ -2087,6 +2087,8 @@ describe('dryRunCompose behavior', () => {
       return '';
     };
     runtime.resolveComposeFormat = (_identity, isHtml) => ({ useHtml: isHtml === true, format: 0 });
+    runtime.splitAddressHeader = header => (header || '').match(/(?:[^,"]|"[^"]*")+/g) || [];
+    if (options.sendMailDisabled) runtime.isToolEnabled = name => name !== 'sendMail';
     return { runtime, state };
   }
   const noSideEffects = state => {
@@ -2153,6 +2155,51 @@ describe('dryRunCompose behavior', () => {
     assert.equal(result.wouldSucceed, false);
     assert.match(result.blockers[0], /unknown identity/);
     assert.equal(result.resolvedIdentity, null);
+  });
+
+  it('is refused when sendMail is disabled and probes no paths', () => {
+    const { runtime, state } = makeRuntime({ sendMailDisabled: true });
+    const result = runtime.dryRunCompose('a@example.com', 's', 'b', null, null, false, null, ['/home/user/Documents/report.pdf']);
+    assert.match(result.error, /requires the sendMail tool/);
+    assert.equal(state.fileCalls, 0);
+  });
+
+  it('fails a direct send with no recipients, but not a review window', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const direct = runtime.dryRunCompose('', 's', 'b', '', null, false, null, undefined, true);
+    assert.equal(direct.wouldSucceed, false);
+    assert.match(direct.blockers[0], /at least one recipient/);
+    assert.equal(runtime.dryRunCompose('', 's', 'b', null, 'x@example.com', false, null, undefined, true).wouldSucceed, true);
+    assert.equal(runtime.dryRunCompose('', 's', 'b', null, null, false, null, undefined, false).wouldSucceed, true);
+  });
+
+  it('counts recipients without splitting quoted commas and echoes includeSignature only for direct sends', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const review = runtime.dryRunCompose('"Doe, Jane" <j@example.com>, k@example.com', 's', 'b', null, null, false, null);
+    assert.equal(review.recipients.to, 2);
+    assert.equal(review.includeSignature, null);
+    const direct = runtime.dryRunCompose('a@example.com', 's', 'b', null, null, false, null, undefined, true, false);
+    assert.equal(direct.includeSignature, false);
+  });
+
+  it('derives inline sizes that match the real decoded size, including padding', () => {
+    for (const raw of ['A', 'AB', 'ABC', 'ABCD', 'ABCDE']) {
+      const b64 = Buffer.from(raw).toString('base64');
+      const { runtime } = makeRuntime();
+      const result = runtime.dryRunCompose('a@example.com', 's', 'b', null, null, false, null, [{ name: 'x.bin', base64: b64 }]);
+      assert.equal(result.attachments[0].size, Buffer.from(b64, 'base64').length, b64);
+    }
+  });
+
+  it('applies the aggregate attachment limit to inline entries like the real path', () => {
+    const { runtime } = makeRuntime();
+    const chunk = 'A'.repeat(20 * 1024 * 1024); // 15 MiB decoded each
+    const entries = [1, 2, 3, 4].map(i => ({ name: `part${i}.bin`, base64: chunk }));
+    const dry = runtime.dryRunCompose('a@example.com', 's', 'b', null, null, false, null, entries);
+    const real = runtime.composeMail('a@example.com', 's', 'b', null, null, false, null, entries, false);
+    assert.equal(dry.wouldSucceed, false);
+    assert.match(dry.blockers[0], /aggregate attachment limit/);
+    assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
   });
 
   it('enforces the attachment count limit', () => {
