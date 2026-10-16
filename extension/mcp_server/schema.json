@@ -187,6 +187,20 @@
             "description": "When true, server binds to 0.0.0.0 instead of 127.0.0.1. Server will be restarted."
           }
         ]
+      },
+      {
+        "name": "setSendLaterInfo",
+        "type": "function",
+        "async": true,
+        "description": "Record the Send Later add-on instance UUID and version (null when absent). Called by the background script; not exposed over MCP.",
+        "parameters": [
+          {
+            "name": "info",
+            "type": "any",
+            "optional": true,
+            "description": "{ uuid, version } as answered by Send Later, or an empty object."
+          }
+        ]
       }
     ]
   }

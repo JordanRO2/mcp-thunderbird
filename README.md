@@ -87,7 +87,7 @@ Structured MIME extraction keeps the first body's representation outside multipa
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers and reports an accessible Drafts folder |
+| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers, delayed delivery through Send Later (`sendAt`), and reports an accessible Drafts folder |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
@@ -104,6 +104,19 @@ Direct sends report success only after SMTP succeeds, and only then mark origina
 - `includeSignature`: append the identity's signature, defaulting to `true` for a new draft and `false` for a replacement so re-saving a fetched draft does not duplicate its signature. Set it explicitly when needed. `sendMail` with `skipReview: true` accepts the same option, defaulting to `true`; review windows use Thunderbird's own signature preferences. Signature files are limited to 1 MiB; unreadable or oversized signature files are omitted.
 
 On success, `saveDraft` returns `folderPath` when Thunderbird exposes the destination and that folder is accessible under account restrictions. Otherwise the save still succeeds without disclosing the folder URI. It does not return the saved message's ID; look up the draft in the returned folder when available.
+
+### Delayed delivery with Send Later
+
+Thunderbird has no scheduled send of its own. When the [Send Later](https://github.com/Extended-Thunder/send-later) add-on is installed, `saveDraft` accepts `sendAt`, an ISO 8601 date-time (`2026-10-17T10:00` is read as local time; `Z` or `+02:00` are accepted). The draft is saved with the `X-Send-Later-At` and `X-Send-Later-Uuid` headers, and Send Later sends it at that time like a normal message, without a review window. On success the result carries `sendAt` (UTC) and a message naming the scheduled time.
+
+The draft is refused, and nothing is saved, unless every condition holds:
+
+- **Block skipReview is off**, since a scheduled draft is sent without review.
+- **Send Later answered.** The background script asks Send Later for its instance UUID through its external messaging API at startup and every minute; Send Later only sends drafts carrying its own UUID. A request that fails clears the information, so scheduling stops within a minute of Send Later being disabled or removed.
+- **Send Later actually sends drafts**: its "send scheduled drafts" option is on and its check interval is above zero.
+- **The date is valid**: in the future and at most 366 days ahead.
+
+Thunderbird must be running at the scheduled time; otherwise Send Later sends the message at the next start. To cancel, delete the draft; to reschedule, replace it through `replaceMessageId` with a new `sendAt` (a replacement without `sendAt` unschedules it). Servers that strip custom headers (Exchange through its IMAP gateway, Proton Mail Bridge) break Send Later.
 
 Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
 
