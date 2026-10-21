@@ -25,7 +25,7 @@ function loadFolderTools({
   virtualFolderHelper = {}, saveVirtualFolders = () => {},
   isAddressBookAccessRestricted = () => false,
   openFolderDB = folder => folder.msgDatabase,
-  openDBs = [], cachedDBForFolder = () => null,
+  openDBs = [], cachedDBForFolder = () => null, cachedDBForFilePath = () => null,
 }) {
   // Thunderbird first escapes a UTF-8 byte string as a path (128/140), then
   // escapes slash as a filename component (153/158). Preserve both URI forms.
@@ -42,6 +42,7 @@ function loadFolderTools({
   const runtime = vm.createContext({
     console,
     TextEncoder,
+    TextDecoder,
     Ci: {
       ...makeCi(),
       nsMsgFolderFlags: { Virtual: 0x20, Trash: 0x100, AllMail: 0x8000, SpecialUse: 0x40405f00 },
@@ -50,7 +51,7 @@ function loadFolderTools({
     Cc: {
       "@mozilla.org/messenger/searchSession;1": { createInstance: makeSearchSession },
       "@mozilla.org/network/io-service;1": { getService: () => netUtil },
-      "@mozilla.org/msgDatabase/msgDBService;1": { getService: () => ({ openFolderDB, openDBs, cachedDBForFolder }) },
+      "@mozilla.org/msgDatabase/msgDBService;1": { getService: () => ({ openFolderDB, openDBs, cachedDBForFolder, cachedDBForFilePath }) },
     },
     ChromeUtils: { importESModule: () => ({ VirtualFolderHelper: virtualFolderHelper }) },
     Services: { prefs: {
@@ -84,6 +85,7 @@ function loadFolderTools({
     snippet("function listFolders(", "function findIdentityIn("),
     snippet("function openFolder(", "function findMessage("),
     snippet("// BEGIN UPDATE MESSAGE TOOL", "// END UPDATE MESSAGE TOOL"),
+    snippet("// BEGIN RAW MIME ATTACHMENT HELPERS", "// END RAW MIME ATTACHMENT HELPERS"),
     snippet("function createFolder(", "function deleteFolder("),
     snippet("function moveFolder(", "// BEGIN FILTER TOOL HANDLERS"),
     snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
