@@ -246,6 +246,7 @@ const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
 const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_EMAIL_TYPES = ["work", "home"];
 const CONTACT_EMAIL_CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f]/;
+const CONTACT_VCARD_PROPERTY = "_vCard";
 const CONTACT_CACHED_FIELDS = {
   displayName: "DisplayName",
   firstName: "FirstName",
@@ -561,7 +562,7 @@ function readContactFields(card) {
       // AddrBookCard can swallow a parse error and return only VERSION:4.0.
       // Saved cards normally also contain UID; preserve their cached fields
       // when parsing lost every entry, as well as when the getter throws.
-      if (getContactCardProperty(card, "_vCard") &&
+      if (getContactCardProperty(card, CONTACT_VCARD_PROPERTY) &&
           !card.vCardProperties.entries.some(entry => entry.name !== "version")) {
         return readFlatContactFields(card);
       }
@@ -6306,7 +6307,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (unmatched.length) {
                       // Like Thunderbird's address lookup, avoid parsing cards
                       // whose raw vCard cannot contain the remaining tokens.
-                      const raw = getContactCardProperty(card, "_vCard")
+                      const raw = getContactCardProperty(card, CONTACT_VCARD_PROPERTY)
                         .replace(/\r?\n[ \t]/g, "").toLowerCase();
                       if (!unmatched.every(token => raw.includes(token))) {
                         // EMAIL text may escape punctuation or backslashes.
