@@ -172,7 +172,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
         accounts: { accounts, findAccountForServer: server => accounts.find(account => account.incomingServer === server) },
       },
       isAccountAllowed: key => allowedAccounts.has(key),
-      getAllowedAccountIds: () => [],
+      getAllowedAccountIds: () => allowedAccounts.size ? Array.from(allowedAccounts) : ["__denied__"],
       buildTools: () => [{ name: "searchMessages", group: "messages" }],
     },
   });
@@ -812,9 +812,12 @@ describe("searchMessages cooperative count finalization", () => {
 
   it("does no database work if validation starts after the deadline", async () => {
     const h = makeHarness();
+    let lookups = 0;
+    h.runtime.MailServices.folderLookup.getFolderForURL = uri => { lookups++; return h.folders.get(uri); };
     const result = await h.finishCount(collectedRows(h.roots[0]), { deadline: 0 });
     assert.equal(result.count, 0);
     assert.equal(result.truncated, true);
+    assert.equal(lookups, 0);
     assert.equal(h.roots[0].stats.databaseReads, 0);
   });
 
@@ -828,6 +831,43 @@ describe("searchMessages cooperative count finalization", () => {
     assert.equal(h.roots[0].stats.headerReads, 0);
   });
 
+  it("does not open a database when resolving its access used the remaining budget", async () => {
+    const h = makeHarness();
+    let lookups = 0;
+    h.runtime.MailServices.folderLookup.getFolderForURL = uri => {
+      // Initial filtering precedes the validation chunk's fresh access lookup.
+      if (++lookups === 2) h.advance(SEARCH_BUDGET_MS);
+      return h.folders.get(uri);
+    };
+    const result = await h.finishCount(collectedRows(h.roots[0]));
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(h.roots[0].stats.databaseReads, 0);
+    assert.equal(h.roots[0].stats.headerReads, 0);
+  });
+
+  for (const revoke of [false, true]) it(`finalizes many folders without post-deadline lookups (revoke=${revoke})`, async () => {
+    const roots = Array.from({ length: VALIDATION_CHUNK_SIZE + 1 }, (_, index) =>
+      makeFolder(`Folder-${index}`, { messages: [{ messageId: `unique-${index}@example.com` }] }));
+    const h = makeHarness({ roots, onYield(runtime) {
+      if (revoke) runtime.allowedAccounts.clear();
+      runtime.advance(SEARCH_BUDGET_MS);
+    } });
+    let lookupsAfterDeadline = 0;
+    h.runtime.MailServices.folderLookup.getFolderForURL = uri => {
+      if (h.clock.now >= SEARCH_BUDGET_MS) {
+        lookupsAfterDeadline++;
+        h.advance(UPDATE_MS);
+      }
+      return h.folders.get(uri);
+    };
+    const result = await h.finishCount(roots.flatMap(collectedRows));
+    assert.equal(result.count, revoke ? 0 : VALIDATION_CHUNK_SIZE);
+    assert.equal(result.truncated, true);
+    assert.equal(lookupsAfterDeadline, 0);
+    assert.equal(h.clock.now, SEARCH_BUDGET_MS);
+  });
+
   it("removes earlier contributions from an account revoked during validation", async () => {
     const privateFolder = makeFolder("Private", { account: "private", count: 300 });
     const safe = makeFolder("Safe", { account: "safe", messages: [{ messageId: "safe@example.com" }] });
@@ -837,6 +877,12 @@ describe("searchMessages cooperative count finalization", () => {
     assert.equal(result.truncated, true);
     assert.equal(privateFolder.stats.headerReads, VALIDATION_CHUNK_SIZE);
     assert.equal(privateFolder.stats.databaseReads, 1, "no database is opened after revocation");
+  });
+
+  it("preserves unrestricted account access when the configured allow-list is empty", async () => {
+    const h = makeHarness();
+    h.runtime.getAllowedAccountIds = () => [];
+    assert.deepEqual(await h.finishCount(collectedRows(h.roots[0])), { count: 3 });
   });
 
   for (const dedupByMessageId of [true, false]) it(`respects dedupByMessageId=${dedupByMessageId} before validation`, async () => {

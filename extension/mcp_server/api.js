@@ -3521,14 +3521,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 scan.truncated = true;
                 return false;
               }
-              const accessibleResults = results.filter(isCurrentResult);
+              const accessibleResults = [];
+              for (const row of results) {
+                if (countOnly && searchTimeExpired(scan)) break;
+                if (isCurrentResult(row)) accessibleResults.push(row);
+              }
               const finalResults = dedupByMessageId !== false
                 ? dedupeSearchMessageResults(accessibleResults) : accessibleResults;
               let response;
               if (countOnly) {
                 // Validate only within the original search budget. Keep primitive
                 // candidates across yields, never native databases or headers.
-                const validated = [];
+                const countsByAccount = new Map();
                 for (let index = 0; index < finalResults.length;) {
                   if (searchTimeExpired(scan)) break;
                   folders.clear();
@@ -3540,15 +3544,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (searchTimeExpired(scan)) break;
                       const row = finalResults[index];
                       if (!isCurrentResult(row)) continue;
+                      if (searchTimeExpired(scan)) break;
                       if (!databases.has(row.folderPath)) {
-                        try { databases.set(row.folderPath, folders.get(row.folderPath).msgDatabase); }
+                        try {
+                          const folder = folders.get(row.folderPath);
+                          const accountKey = MailServices.accounts.findAccountForServer(folder.server)?.key;
+                          if (searchTimeExpired(scan)) break;
+                          databases.set(row.folderPath, accountKey
+                            ? { db: folder.msgDatabase, accountKey } : null);
+                        }
                         catch { databases.set(row.folderPath, null); }
                       }
                       // Opening a native database may itself consume the budget.
                       if (searchTimeExpired(scan)) break;
                       try {
-                        if (getSearchResultHeader(databases.get(row.folderPath), row)) {
-                          validated.push(row);
+                        const entry = databases.get(row.folderPath);
+                        if (getSearchResultHeader(entry?.db, row)) {
+                          const counts = countsByAccount.get(entry.accountKey) || { public: 0, protected: 0 };
+                          if (row._requiresEncryptedAccess) counts.protected++;
+                          else counts.public++;
+                          countsByAccount.set(entry.accountKey, counts);
                           continue;
                         }
                       } catch { /* gone with its database: not counted */ }
@@ -3559,10 +3574,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                   }
                 }
-                // Revocation during a later chunk also removes earlier counts.
-                folders.clear();
+                // Apply current permission snapshots to primitive per-account
+                // totals. Never reopen folders after the validation deadline.
+                const allowedAccounts = new Set(getAllowedAccountIds());
                 allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
-                response = { count: validated.filter(isCurrentResult).length };
+                let count = 0;
+                for (const [accountKey, counts] of countsByAccount) {
+                  if (allowedAccounts.size && !allowedAccounts.has(accountKey)) {
+                    scan.truncated = true;
+                    continue;
+                  }
+                  count += counts.public + (allowEncrypted ? counts.protected : 0);
+                  if (!allowEncrypted && counts.protected) scan.truncated = true;
+                }
+                response = { count };
               } else {
                 finalResults.sort((a, b) => sortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
                 response = paginate(finalResults, offset, effectiveLimit);
