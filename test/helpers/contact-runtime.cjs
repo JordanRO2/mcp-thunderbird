@@ -186,7 +186,7 @@ class FakeAddrBookCard extends FakeFlatCard {
     entry.value[index] = value;
   }
 
-  get primaryEmail() { return this.emailAddresses[0] ?? ""; }
+  get primaryEmail() { return this.vCardProperties.getAllValuesSorted("email")[0] ?? ""; }
   set primaryEmail(value) {
     const entries = this.vCardProperties.getAllEntriesSorted("email");
     if (entries.length && entries[0].value !== value) {
@@ -209,6 +209,50 @@ class FakeAddrBookCard extends FakeFlatCard {
     );
     copy.isMailList = this.isMailList;
     return copy;
+  }
+}
+
+// AddrBookCard reads cached scalars until the first vCard access. After that,
+// even a failed parse changes what its scalar getters see. The parse outcomes
+// are supplied by tests; this fixture intentionally does not parse vCard text.
+class FakeStoredCard extends FakeAddrBookCard {
+  constructor({ properties = {}, raw = "", entries = [], parseMode = "valid" } = {}) {
+    super({ ...properties, _vCard: raw }, new FakeVCardProperties(entries));
+    this.parseMode = parseMode;
+    this.parsed = false;
+    this.stats = { parses: 0, emailReads: 0, rawReads: 0, events: [] };
+  }
+
+  getProperty(name, fallback = "") {
+    if (name === "_vCard") this.stats.rawReads++;
+    this.stats.events.push(name);
+    return super.getProperty(name, fallback);
+  }
+
+  get vCardProperties() {
+    if (!this.parsed) {
+      this.parsed = true;
+      this.stats.parses++;
+      this.stats.events.push("parse");
+      if (this.parseMode === "empty") {
+        this._vCardProperties = new FakeVCardProperties([
+          new FakeVCardPropertyEntry("version", {}, "text", "4.0"),
+        ]);
+      } else if (this.parseMode === "null") {
+        this._vCardProperties = null;
+      }
+    }
+    if (this.parseMode === "throw") throw new Error("Invalid stored vCard");
+    return this._vCardProperties;
+  }
+
+  get displayName() { return this.parsed ? super.displayName : this.getProperty("DisplayName"); }
+  get firstName() { return this.parsed ? super.firstName : this.getProperty("FirstName"); }
+  get lastName() { return this.parsed ? super.lastName : this.getProperty("LastName"); }
+  get primaryEmail() { return this.parsed ? super.primaryEmail : this.getProperty("PrimaryEmail"); }
+  get emailAddresses() {
+    this.stats.emailReads++;
+    return super.emailAddresses;
   }
 }
 
@@ -338,5 +382,5 @@ function loadContactRuntime({ books = [new FakeAddressBook()], esmUnavailable = 
 
 module.exports = {
   loadContactRuntime, DIRECTORY_TYPES, FakeVCardPropertyEntry, FakeVCardProperties,
-  FakeFlatCard, FakeAddrBookCard, FakeAddressBook,
+  FakeFlatCard, FakeAddrBookCard, FakeStoredCard, FakeAddressBook,
 };

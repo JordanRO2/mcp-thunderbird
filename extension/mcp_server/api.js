@@ -245,6 +245,14 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
 const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_EMAIL_TYPES = ["work", "home"];
+const CONTACT_CACHED_FIELDS = {
+  displayName: "DisplayName",
+  firstName: "FirstName",
+  lastName: "LastName",
+  email: "PrimaryEmail",
+  secondEmail: "SecondEmail",
+};
+const CONTACT_SEARCH_PROPERTIES = Object.values(CONTACT_CACHED_FIELDS);
 const CONTACT_ADDRESS_FIELDS = [
   "poBox",
   "street2",
@@ -349,17 +357,20 @@ function sortContactEmailEntries(entries) {
 
 /**
  * All email addresses of a card, primary first, from nsIAbCard.emailAddresses;
- * a card without that attribute falls back to its two legacy properties.
+ * an unavailable getter falls back to the cached properties without parsing.
  */
 function getContactEmailAddresses(card) {
   let addresses;
   try {
     addresses = card.emailAddresses;
   } catch {
-    // Not implemented by this card: use the legacy properties below.
+    // Unavailable or malformed vCard: use the cached properties below.
   }
   if (!Array.isArray(addresses)) {
-    addresses = [card.primaryEmail, getContactCardProperty(card, "SecondEmail")];
+    addresses = [
+      getContactCardProperty(card, CONTACT_CACHED_FIELDS.email),
+      getContactCardProperty(card, CONTACT_CACHED_FIELDS.secondEmail),
+    ];
   }
   return addresses.filter(address => typeof address === "string" && address);
 }
@@ -491,6 +502,10 @@ function readVCardContactFields(card) {
   const birthdayValue = contactValueToString(vCardProperties.getFirstValue("bday"));
 
   return {
+    displayName: card.displayName || "",
+    email: card.primaryEmail || "",
+    firstName: card.firstName || "",
+    lastName: card.lastName || "",
     emails,
     phones,
     addresses,
@@ -503,7 +518,8 @@ function readVCardContactFields(card) {
 
 function readFlatContactFields(card) {
   // Legacy cards store at most a primary and a second address, without types.
-  const emails = [card.primaryEmail, getContactCardProperty(card, "SecondEmail")]
+  const primaryEmail = getContactCardProperty(card, CONTACT_CACHED_FIELDS.email);
+  const emails = [primaryEmail, getContactCardProperty(card, CONTACT_CACHED_FIELDS.secondEmail)]
     .map(value => contactValueToString(value).trim())
     .filter(Boolean)
     .map(address => ({ address }));
@@ -537,6 +553,10 @@ function readFlatContactFields(card) {
   }
 
   return {
+    displayName: getContactCardProperty(card, CONTACT_CACHED_FIELDS.displayName),
+    email: primaryEmail,
+    firstName: getContactCardProperty(card, CONTACT_CACHED_FIELDS.firstName),
+    lastName: getContactCardProperty(card, CONTACT_CACHED_FIELDS.lastName),
     emails,
     phones,
     addresses,
@@ -550,6 +570,13 @@ function readFlatContactFields(card) {
 function readContactFields(card) {
   if (card.supportsVCard) {
     try {
+      // AddrBookCard can swallow a parse error and return only VERSION:4.0.
+      // Saved cards normally also contain UID; preserve their cached fields
+      // when parsing lost every entry, as well as when the getter throws.
+      if (getContactCardProperty(card, "_vCard") &&
+          !card.vCardProperties.entries.some(entry => entry.name !== "version")) {
+        return readFlatContactFields(card);
+      }
       return readVCardContactFields(card);
     } catch {
       // A malformed vCard should not prevent the rest of an address book from
@@ -563,17 +590,7 @@ function formatContact(card, book) {
   const details = readContactFields(card);
   return {
     id: card.UID,
-    displayName: card.displayName || "",
-    email: card.primaryEmail || "",
-    emails: details.emails,
-    firstName: card.firstName || "",
-    lastName: card.lastName || "",
-    phones: details.phones,
-    addresses: details.addresses,
-    organization: details.organization,
-    title: details.title,
-    note: details.note,
-    birthday: details.birthday,
+    ...details,
     addressBook: book.dirName,
     addressBookId: book.URI,
   };
@@ -6253,6 +6270,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 queryTokens = lowerQuery.split(/[,\s]+/).filter(Boolean);
               }
               const failedQuery = hasQuery && queryTokens.length === 0;
+              if (failedQuery) return results;
               const requestedLimit = Number(maxResults);
               const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
                 ? Math.min(Math.floor(requestedLimit), MAX_SEARCH_RESULTS_CAP)
@@ -6263,20 +6281,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 for (const card of book.childCards) {
                   if (card.isMailList) continue;
 
-                  const emails = getContactEmailAddresses(card)
-                    .map(address => address.toLowerCase());
-                  const displayName = (card.displayName || "").toLowerCase();
-                  const firstName = (card.firstName || "").toLowerCase();
-                  const lastName = (card.lastName || "").toLowerCase();
-                  const fields = [...emails, displayName, firstName, lastName];
-
-                  if (failedQuery) continue;
-                  const matches = !hasQuery || queryTokens.every(token =>
-                    fields.some(field => field.includes(token))
-                  );
-                  if (matches) {
-                    results.push(formatContact(card, book));
+                  if (hasQuery) {
+                    // Access the property bag before any lazy vCard getter.
+                    const fields = CONTACT_SEARCH_PROPERTIES.map(name =>
+                      getContactCardProperty(card, name).toLowerCase()
+                    );
+                    const unmatched = queryTokens.filter(token =>
+                      !fields.some(field => field.includes(token))
+                    );
+                    if (unmatched.length) {
+                      // Like Thunderbird's address lookup, avoid parsing cards
+                      // whose raw vCard cannot contain the remaining tokens.
+                      const raw = getContactCardProperty(card, "_vCard")
+                        .replace(/\r?\n[ \t]/g, "").toLowerCase();
+                      if (!unmatched.every(token => raw.includes(token))) {
+                        // EMAIL text may escape punctuation or backslashes.
+                        // This only admits candidates; parsed addresses below
+                        // still decide the match, never other vCard fields.
+                        const unescaped = raw.replace(/\\([\\,;:])/g, "$1");
+                        if (!unmatched.every(token => raw.includes(token) || unescaped.includes(token))) continue;
+                      }
+                      const emails = getContactEmailAddresses(card)
+                        .map(address => address.toLowerCase());
+                      if (!unmatched.every(token => emails.some(address => address.includes(token)))) continue;
+                    }
                   }
+                  results.push(formatContact(card, book));
 
                   if (results.length >= limit) { truncated = true; break; }
                 }

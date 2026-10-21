@@ -657,7 +657,8 @@ describe("contact email addresses", () => {
 
     const throwing = {
       get emailAddresses() { throw new Error("not implemented"); },
-      primaryEmail: "only@example.com",
+      get primaryEmail() { throw new Error("vCard unavailable"); },
+      getProperty(name, fallback) { return name === "PrimaryEmail" ? "only@example.com" : fallback; },
     };
     assert.deepEqual(plain(helpers.getContactEmailAddresses(throwing)), ["only@example.com"]);
   });
