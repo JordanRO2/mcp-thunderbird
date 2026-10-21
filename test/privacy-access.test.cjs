@@ -139,6 +139,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     getMarkedApiSnippet("// BEGIN SERVER ACCESS HELPERS", "// END SERVER ACCESS HELPERS"),
     getMarkedApiSnippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
     getMarkedApiSnippet("// BEGIN FILTER SEARCH TERM HELPERS", "// END FILTER SEARCH TERM HELPERS"),
+    getMarkedApiSnippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
     getMarkedApiSnippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER"),
     getMarkedApiSnippet("// BEGIN TOOL DISPATCH", "// END TOOL DISPATCH"),
     "this.options = {",

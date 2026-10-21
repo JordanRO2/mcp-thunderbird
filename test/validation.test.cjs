@@ -55,6 +55,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
     getMarkedApiSnippet('// BEGIN FILTER SEARCH TERM HELPERS', '// END FILTER SEARCH TERM HELPERS'),
+    getMarkedApiSnippet('// BEGIN BOUNDED REFRESH HELPERS', '// END BOUNDED REFRESH HELPERS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
@@ -670,6 +671,119 @@ function convertProductionFileAttachments(entries, files) {
     result: runtime.filePathsToAttachDescs(entries),
   };
 }
+
+const REFRESH_TEST_FOLDER_URI = 'imap://user@server/INBOX';
+const REFRESH_TEST_FRACTIONAL_TIMEOUT_MS = 1500.5;
+const REFRESH_TEST_STRING_TIMEOUT_MS = '15000';
+
+describe('Validation: refreshFolder', () => {
+  it('requires folderPath', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter/);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('accepts a valid folderPath alone', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts a valid folderPath with integer timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: 20000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects number for folderPath', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects non-integer timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: REFRESH_TEST_FRACTIONAL_TIMEOUT_MS,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: REFRESH_TEST_STRING_TIMEOUT_MS,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown params', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      force: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: refreshCalendar production schema', () => {
+  it('accepts omitted arguments for all enabled refreshable calendars', () => {
+    assert.equal(validateProductionToolArgs('refreshCalendar', {}).length, 0);
+  });
+
+  it('accepts a calendar ID and an integer wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', {
+      calendarId: 'calendar-a', timeoutMs: 5000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects a non-string calendar ID', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { calendarId: 123 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /calendarId.*must be string/);
+  });
+
+  it('rejects a non-integer wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { timeoutMs: REFRESH_TEST_FRACTIONAL_TIMEOUT_MS });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /timeoutMs.*must be an integer/);
+  });
+
+  it('rejects a string wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { timeoutMs: REFRESH_TEST_STRING_TIMEOUT_MS });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /timeoutMs.*must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { force: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter.*force/);
+  });
+
+  it('advertises the same bounded wait and preserves each refresh tool access group', () => {
+    const schemas = productionAttachmentValidation.buildTools();
+    for (const [name, group] of [['refreshFolder', 'messages'], ['refreshCalendar', 'calendar']]) {
+      const tool = schemas.find(candidate => candidate.name === name);
+      assert.equal(tool.group, group);
+      assert.equal(tool.crud, 'read');
+      const timeout = tool.inputSchema.properties.timeoutMs;
+      assert.equal(timeout.type, 'integer');
+      assert.equal(timeout.minimum, 1000);
+      assert.equal(timeout.maximum, 25000);
+    }
+  });
+});
 
 describe('Validation: attachment sending', () => {
   it('accepts attachments as array of strings (file paths)', () => {

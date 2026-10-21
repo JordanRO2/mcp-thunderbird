@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/40_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/42_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-128%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 42 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
@@ -50,6 +50,7 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
+| `refreshFolder` | Refresh an individual IMAP, built-in Exchange (EWS/Graph), or Owl folder. Reports counts, completion status, and whether a successful server update was confirmed. Account roots are refused. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
@@ -59,6 +60,8 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+
+`refreshFolder` returns `status: "loaded"` when Thunderbird reports loading; `updateConfirmed: true` additionally means a folder-update URL reported success. Otherwise a warning explains that server success was not confirmed. If a busy folder reports loading without starting an update, the warning says "No update ran"; retry later. `netMessageDelta` is the net count change during this call, not a count of arrivals. Account roots, saved searches and no-select folders are refused; individual local, POP, RSS and news folders are skipped.
 
 `searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
 
@@ -153,6 +156,7 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with disabled, read-only, event, and task support flags |
+| `refreshCalendar` | Refresh one calendar or all enabled refreshable calendars, using their providers (built-in Exchange, Owl, CalDAV, Google). Reports completion, provider errors, or an unconfirmed timeout. |
 | `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
 | `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
 | `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
@@ -162,6 +166,10 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
 
 `recurrence` accepts a single RRULE, such as `FREQ=WEEKLY;BYDAY=MO,TU` or `RRULE:FREQ=DAILY;COUNT=10`. The optional prefix is case-insensitive. Control characters (including CR/LF), malformed rules, `SECONDLY`/`MINUTELY`, and `HOURLY` on all-day events are rejected; Thunderbird's recurrence parser validates the rule before saving. On update, `recurrence: ""` or `null` clears the rule. Replacing a rule discards existing EXDATEs and modified occurrences.
+
+`refreshCalendar` returns `loaded` with a warning if a provider reports an error and then completes. If it reports an error but no completion within the wait, the result is `error` carrying that provider error. A silent provider returns `timeout`, meaning completion is unconfirmed. In all-calendar mode, inspect the individual results; disabled and non-refreshable calendars are excluded.
+
+Both refresh tools refuse requests while Thunderbird is offline. `timeoutMs` defaults to 15000 and is clamped to 1000–25000. Concurrent calls and retries share an operation while it is younger than 25 seconds; joining does not renew that age, and a later call starts a fresh attempt once it is stale. A timeout does not cancel Thunderbird's work. Completion is best effort: a timer cannot interrupt a provider's synchronous work.
 
 Thunderbird creates the initial **Home** calendar disabled. Check `listCalendars[].disabled` and enable the calendar in Thunderbird's calendar properties before using it. Event and task tools report an error for an explicitly selected disabled calendar; listings and default direct creation use enabled calendars, and report an error if all calendars are disabled. MCP leaves the enabled/disabled setting unchanged.
 
@@ -363,7 +371,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 40 MCP tools + auth + access control
+│       ├── api.js              # All 42 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
