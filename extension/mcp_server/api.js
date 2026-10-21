@@ -2373,15 +2373,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         required: ["email"],
       };
       const contactFieldProperties = {
-        email: { type: "string", description: "Primary email address. On update, a non-empty value replaces the current primary address and keeps the others. May be omitted for phone-only contacts." },
+        email: { type: "string", description: "Primary email address; control characters are rejected. On update, a non-empty value replaces the primary and keeps the others. An empty string clears all addresses on vCard cards, but only the primary on flat cards; prefer emails: [] to clear all. May be omitted for phone-only contacts." },
         emails: {
           type: "array",
-          description: "All email addresses, primary first. On update, replaces the email collection; use [] to clear it. If email is also given, it must equal the first address. Cards that are not vCard-backed keep at most two addresses and no types.",
+          description: "All email addresses in preference order. On update, replaces the collection; use [] to clear it or omit to keep it. If email is also given, it must equal the first trimmed address (or be empty with []). Duplicate addresses are rejected case-insensitively, even if a read returned duplicates. Local and CardDAV books create vCard cards preserving all addresses and types; other book types keep at most two addresses without types. Reads trim addresses and omit empty entries without changing Thunderbird's primary email, so emails[0].address can differ from email.",
           items: {
             type: "object",
             properties: {
               type: { type: "string", enum: CONTACT_EMAIL_TYPES, description: "Email type (omit for an untyped address)" },
-              address: { type: "string", description: "Email address" },
+              address: { type: "string", description: "Non-empty email address; surrounding whitespace is trimmed and control characters are rejected" },
             },
             required: ["address"],
             additionalProperties: false,
