@@ -265,9 +265,10 @@
   </ul>
   <p class="mode-note">
     When mail account access is restricted, calendars and address books are blocked unless you
-    allow them below. These permissions allow access to all calendars or all address books,
-    including changes. With unrestricted mail account access, their behavior is unchanged.
-    These settings can only be changed here.
+    allow them below. These permissions allow access to all calendars or all address books.
+    Without mail account restrictions, these two permissions are not required.
+    Tool Access and other safety settings still apply: contact changes always require
+    Allow contact writes below. These settings can only be changed here.
   </p>
   <ul class="account-list">
     <li>
@@ -396,6 +397,30 @@
   <div class="save-row">
     <button id="saveFilterSendActionsBtn" disabled>Save</button>
     <span id="saveFilterSendActionsStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Contact Writes</h2>
+  <p class="mode-note">
+    Disabled by default. Enabling this lets MCP clients create, change, and
+    delete contacts in your address books. Changes are saved immediately without
+    a review step. Reading contacts does not require this permission.
+    Tool Access still applies. If mail account access is restricted, also enable
+    Allow all address books in Privacy. Turning this off blocks future MCP changes;
+    it does not undo saved changes.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowContactWrites" disabled>
+        <span>Allow contact writes (createContact, updateContact, deleteContact)</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="saveContactWritesBtn" disabled>Save</button>
+    <span id="saveContactWritesStatus" class="save-status"></span>
   </div>
 </div>
 

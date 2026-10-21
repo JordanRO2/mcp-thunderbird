@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadContactRuntime } = require("./helpers/contact-runtime.cjs");
 
 const optionsSource = fs.readFileSync(path.resolve(__dirname, "../extension/options.js"), "utf8");
 
@@ -49,7 +50,7 @@ const corruptTools = {
 
 // Only the DOM and browser API boundaries are stubbed. Access decisions and
 // event listeners come from the production options script's marked sections.
-function loadOptions(overrides = {}) {
+function loadOptions(overrides = {}, apiOverrides = {}) {
   const byId = new Map();
   class Element {
     constructor(tagName) {
@@ -106,6 +107,7 @@ function loadOptions(overrides = {}) {
     toolList: "ul", saveToolsBtn: "button", saveToolsStatus: "span",
     allowEncryptedMessages: "input", allowAllCalendars: "input", allowAllAddressBooks: "input",
     savePrivacyBtn: "button", savePrivacyStatus: "span",
+    allowContactWrites: "input", saveContactWritesBtn: "button", saveContactWritesStatus: "span",
   })) {
     elements[id] = document.createElement(tagName);
     elements[id].id = id;
@@ -116,12 +118,14 @@ function loadOptions(overrides = {}) {
     accountConfig: structuredClone(restrictedAccounts),
     toolConfig: structuredClone(restrictedTools),
     privacySettings: { allowEncryptedMessages: false, allowAllCalendars: false, allowAllAddressBooks: false },
+    contactWrites: { allowContactWrites: false },
+    contactWritesResult: { success: true },
     accountResult: { success: true },
     toolResult: { success: true },
     privacyResult: { success: true },
     ...overrides,
   };
-  const calls = { accounts: [], tools: [], privacy: [] };
+  const calls = { accounts: [], tools: [], privacy: [], contactWrites: [] };
   const api = {
     async getAccountAccessConfig() {
       if (state.accountConfig instanceof Error) throw state.accountConfig;
@@ -134,6 +138,15 @@ function loadOptions(overrides = {}) {
     async getPrivacySettings() {
       if (state.privacySettings instanceof Error) throw state.privacySettings;
       return structuredClone(state.privacySettings);
+    },
+    async getAllowContactWrites() {
+      if (state.contactWrites instanceof Error) throw state.contactWrites;
+      return structuredClone(state.contactWrites);
+    },
+    async setAllowContactWrites(value) {
+      calls.contactWrites.push(value);
+      if (state.contactWritesResult instanceof Error) throw state.contactWritesResult;
+      return structuredClone(state.contactWritesResult);
     },
     async setAccountAccess(ids) {
       calls.accounts.push(Array.from(ids));
@@ -153,12 +166,15 @@ function loadOptions(overrides = {}) {
       return structuredClone(state.privacyResult);
     },
   };
-  const sandbox = { ...elements, document, browser: { mcpServer: api } };
+  // Reuse this DOM/listener harness for persistence checks with the production
+  // contact preference API; ordinary UI error tests keep their boundary mocks.
+  const sandbox = { ...elements, document, browser: { mcpServer: { ...api, ...apiOverrides } } };
   vm.createContext(sandbox);
   vm.runInContext([
     markedOptionsSnippet("OPTIONS ACCESS STATE"),
     markedOptionsSnippet("OPTIONS ACCOUNT ACCESS"),
     markedOptionsSnippet("OPTIONS TOOL ACCESS"),
+    markedOptionsSnippet("OPTIONS CONTACT WRITES"),
     markedOptionsSnippet("OPTIONS PRIVACY SETTINGS"),
   ].join("\n"), sandbox);
   return {
@@ -166,6 +182,7 @@ function loadOptions(overrides = {}) {
     loadAccountAccess: sandbox.loadAccountAccess,
     loadToolAccess: sandbox.loadToolAccess,
     loadPrivacySettings: sandbox.loadPrivacySettings,
+    loadContactWritesPref: sandbox.loadContactWritesPref,
   };
 }
 
@@ -379,6 +396,111 @@ describe("Options privacy preferences", () => {
       await ui.savePrivacyBtn.fire("click");
       assert.equal(ui.calls.privacy.length, 2);
       assert.equal(ui.savePrivacyStatus.textContent, "Saved.");
+    });
+  }
+});
+
+describe("Options contact writes", () => {
+  it("starts unchecked and locked until the stored value has been read", async () => {
+    const ui = loadOptions();
+    ui.allowContactWrites.checked = true;
+    ui.allowContactWrites.disabled = false;
+    const loading = ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, true);
+    assert.equal(ui.saveContactWritesBtn.disabled, true);
+    await loading;
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, false);
+    assert.equal(ui.saveContactWritesBtn.disabled, false);
+  });
+
+  it("loads an enabled value and saves the user's choice", async () => {
+    const ui = loadOptions({ contactWrites: { allowContactWrites: true } });
+    await ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, true);
+    ui.allowContactWrites.checked = false;
+    await ui.saveContactWritesBtn.fire("click");
+    assert.deepEqual(ui.calls.contactWrites, [false]);
+    assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal(ui.saveContactWritesBtn.disabled, false);
+  });
+
+  it("persists consent and revocation across Options reloads through the production preference API", async () => {
+    const runtime = loadContactRuntime();
+    const fields = { emails: [{ address: "roundtrip@example.com", type: "work" }], displayName: "Round Trip" };
+    const first = loadOptions({}, runtime.options);
+    await first.loadContactWritesPref();
+    assert.equal(first.allowContactWrites.checked, false);
+    assert.match(runtime.create(fields).error, /Allow contact writes/);
+
+    first.allowContactWrites.checked = true;
+    await first.saveContactWritesBtn.fire("click");
+    assert.equal(first.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, true);
+    const created = runtime.create(fields);
+    assert.equal(created.success, true);
+
+    await first.loadPrivacySettings();
+    first.allowAllAddressBooks.checked = true;
+    await first.savePrivacyBtn.fire("click");
+    assert.equal((await runtime.options.getPrivacySettings()).allowAllAddressBooks, true);
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, true);
+
+    const reopened = loadOptions({}, runtime.options);
+    await reopened.loadContactWritesPref();
+    assert.equal(reopened.allowContactWrites.checked, true);
+    reopened.allowContactWrites.checked = false;
+    await reopened.saveContactWritesBtn.fire("click");
+    assert.equal(reopened.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, false);
+
+    const revoked = loadOptions({}, runtime.options);
+    await revoked.loadContactWritesPref();
+    assert.equal(revoked.allowContactWrites.checked, false);
+    await revoked.loadPrivacySettings();
+    assert.equal(revoked.allowAllAddressBooks.checked, true);
+    await revoked.savePrivacyBtn.fire("click");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, false);
+    assert.match(runtime.create(fields).error, /Allow contact writes/);
+    assert.match(runtime.update(created.id, { displayName: "Blocked" }).error, /Allow contact writes/);
+    assert.match(runtime.deleteContact(created.id).error, /Allow contact writes/);
+    assert.equal(runtime.getContact(created.id).displayName, fields.displayName);
+  });
+
+  it("treats anything but true as off", async () => {
+    for (const value of ["true", 1, null, undefined]) {
+      const ui = loadOptions({ contactWrites: { allowContactWrites: value } });
+      await ui.loadContactWritesPref();
+      assert.equal(ui.allowContactWrites.checked, false);
+    }
+  });
+
+  it("keeps the setting locked when loading fails", async () => {
+    const ui = loadOptions({ contactWrites: new Error("unavailable") });
+    await ui.loadContactWritesPref();
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowContactWrites.disabled, true);
+    assert.equal(ui.saveContactWritesBtn.disabled, true);
+    assert.match(ui.saveContactWritesStatus.textContent, /Error loading setting/);
+    assert.equal(ui.saveContactWritesStatus.className, "save-status error");
+    assert.deepEqual(ui.calls.contactWrites, []);
+  });
+
+  for (const errorKind of ["thrown", "returned"]) {
+    it(`shows ${errorKind} save errors and permits retry`, async () => {
+      const contactWritesResult = errorKind === "thrown" ? new Error("cannot save") : { error: "cannot save" };
+      const ui = loadOptions({ contactWritesResult });
+      await ui.loadContactWritesPref();
+      ui.allowContactWrites.checked = true;
+      await ui.saveContactWritesBtn.fire("click");
+      assert.deepEqual(ui.calls.contactWrites, [true]);
+      assert.match(ui.saveContactWritesStatus.textContent, /cannot save/);
+      assert.equal(ui.saveContactWritesStatus.className, "save-status error");
+      assert.equal(ui.saveContactWritesBtn.disabled, false);
+      ui.state.contactWritesResult = { success: true };
+      await ui.saveContactWritesBtn.fire("click");
+      assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
     });
   }
 });

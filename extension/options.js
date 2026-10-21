@@ -632,6 +632,46 @@ saveFilterSendActionsBtn.addEventListener("click", async () => {
   }
   saveFilterSendActionsBtn.disabled = false;
 });
+// BEGIN OPTIONS CONTACT WRITES
+const allowContactWritesCheckbox = document.getElementById("allowContactWrites");
+const saveContactWritesBtn = document.getElementById("saveContactWritesBtn");
+const saveContactWritesStatus = document.getElementById("saveContactWritesStatus");
+
+async function loadContactWritesPref() {
+  allowContactWritesCheckbox.checked = false;
+  allowContactWritesCheckbox.disabled = true;
+  saveContactWritesBtn.disabled = true;
+  try {
+    const { allowContactWrites } = await browser.mcpServer.getAllowContactWrites();
+    allowContactWritesCheckbox.checked = allowContactWrites === true;
+    allowContactWritesCheckbox.disabled = false;
+    saveContactWritesBtn.disabled = false;
+    saveContactWritesStatus.textContent = "";
+  } catch (e) {
+    saveContactWritesStatus.textContent = "Error loading setting: " + e.message;
+    saveContactWritesStatus.className = "save-status error";
+  }
+}
+
+saveContactWritesBtn.addEventListener("click", async () => {
+  saveContactWritesBtn.disabled = true;
+  saveContactWritesStatus.textContent = "Saving...";
+  saveContactWritesStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setAllowContactWrites(allowContactWritesCheckbox.checked);
+    if (result.error) {
+      saveContactWritesStatus.textContent = result.error;
+      saveContactWritesStatus.className = "save-status error";
+    } else {
+      saveContactWritesStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveContactWritesStatus.textContent = "Error: " + e.message;
+    saveContactWritesStatus.className = "save-status error";
+  }
+  saveContactWritesBtn.disabled = false;
+});
+// END OPTIONS CONTACT WRITES
 // BEGIN OPTIONS PRIVACY SETTINGS
 const allowEncryptedMessagesCheckbox = document.getElementById("allowEncryptedMessages");
 const allowAllCalendarsCheckbox = document.getElementById("allowAllCalendars");
@@ -685,6 +725,7 @@ loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAc
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
 loadFilterSendActionsPref().catch(e => console.error("thunderbird-mcp options:", "loadFilterSendActionsPref failed:", e));
+loadContactWritesPref().catch(e => console.error("thunderbird-mcp options:", "loadContactWritesPref failed:", e));
 loadPrivacySettings().catch(e => console.error("thunderbird-mcp options:", "loadPrivacySettings failed:", e));
 
 const listenAllCheckbox = document.getElementById("listenAll");

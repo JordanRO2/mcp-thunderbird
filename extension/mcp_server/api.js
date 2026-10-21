@@ -1473,6 +1473,7 @@ const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
 const PREF_ALLOW_ENCRYPTED_MESSAGES = "extensions.thunderbird-mcp.allowEncryptedMessages";
 const PREF_ALLOW_ALL_CALENDARS = "extensions.thunderbird-mcp.allowAllCalendars";
 const PREF_ALLOW_ALL_ADDRESS_BOOKS = "extensions.thunderbird-mcp.allowAllAddressBooks";
+const PREF_ALLOW_CONTACT_WRITES = "extensions.thunderbird-mcp.allowContactWrites";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -2417,6 +2418,22 @@ function readAccessListPref(prefName) {
 function isPrivacyOptInEnabled(prefName) {
   try { return Services.prefs.getBoolPref(prefName, false) === true; } catch { return false; }
 }
+// BEGIN CONTACT WRITE GATE
+// Contact writes are persistent, reach every writable address book and have no
+// review step, so a prompt-injected client could repoint a trusted contact at an
+// attacker address. They are refused unless the user opts in on the Options page.
+const CONTACT_WRITE_OPTION = '"Allow contact writes" in Thunderbird MCP Options';
+const CONTACT_WRITE_TOOLS = new Set(["createContact", "updateContact", "deleteContact"]);
+
+function isContactWriteAllowed() {
+  return isPrivacyOptInEnabled(PREF_ALLOW_CONTACT_WRITES);
+}
+
+function getContactWriteBlockedResult(toolName) {
+  if (!CONTACT_WRITE_TOOLS.has(toolName) || isContactWriteAllowed()) return null;
+  return { error: `Contact writes are disabled. Enable ${CONTACT_WRITE_OPTION} to allow ${toolName}.` };
+}
+// END CONTACT WRITE GATE
 // END PRIVACY PREFERENCE HELPERS
 
 // BEGIN MCP TEXT SANITIZATION
@@ -2998,7 +3015,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createContact",
         group: "contacts", crud: "create",
         title: "Create Contact",
-        description: "Create a new contact in an address book",
+        description: "Create a new contact in an address book. Requires \"Allow contact writes\" in Thunderbird MCP Options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3012,7 +3029,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateContact",
         group: "contacts", crud: "update",
         title: "Update Contact",
-        description: "Update an existing contact's properties",
+        description: "Update an existing contact's properties. Requires \"Allow contact writes\" in Thunderbird MCP Options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3026,7 +3043,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteContact",
         group: "contacts", crud: "delete",
         title: "Delete Contact",
-        description: "Delete a contact from its address book",
+        description: "Delete a contact from its address book. Requires \"Allow contact writes\" in Thunderbird MCP Options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -6827,6 +6844,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               addressBookId
             ) {
               try {
+                const contactWriteBlocked = getContactWriteBlockedResult("createContact");
+                if (contactWriteBlocked) return contactWriteBlocked;
                 const fields = {
                   email,
                   emails,
@@ -6907,6 +6926,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               birthday
             ) {
               try {
+                const contactWriteBlocked = getContactWriteBlockedResult("updateContact");
+                if (contactWriteBlocked) return contactWriteBlocked;
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -6949,6 +6970,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function deleteContact(contactId) {
               try {
+                const contactWriteBlocked = getContactWriteBlockedResult("deleteContact");
+                if (contactWriteBlocked) return contactWriteBlocked;
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -14681,6 +14704,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           return { success: true, allowFilterSendActions };
         },
         // END FILTER SEND PREFERENCE METHODS
+        // BEGIN CONTACT WRITE PREFERENCE METHODS
+        getAllowContactWrites: async function() {
+          return { allowContactWrites: isContactWriteAllowed() };
+        },
+
+        setAllowContactWrites: async function(allowContactWrites) {
+          if (typeof allowContactWrites !== "boolean") {
+            return { error: "allowContactWrites must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_ALLOW_CONTACT_WRITES, allowContactWrites);
+          return { success: true, allowContactWrites };
+        },
+        // END CONTACT WRITE PREFERENCE METHODS
         // BEGIN PRIVACY OPTIONS API
         getPrivacySettings: async function() {
           return {
