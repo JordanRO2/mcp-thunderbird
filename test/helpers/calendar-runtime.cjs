@@ -496,7 +496,9 @@ function loadCalendarRuntime({
     "DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "UNDISABLEABLE_TOOLS",
   ];
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../extension/tool-access.js"), "utf8"), sandbox);
   vm.runInContext([
+    "const toolAccess = globalThis.ToolAccess;",
     ...names.map(constant),
     snippet("// BEGIN CONTACT FIELD CONSTANTS", "// END CONTACT FIELD CONSTANTS"),
     snippet("// BEGIN OUTBOUND ATTACHMENT LIMITS", "// END OUTBOUND ATTACHMENT LIMITS"),

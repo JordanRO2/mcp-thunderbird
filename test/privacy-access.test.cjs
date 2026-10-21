@@ -2,189 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
-
-const apiSource = fs.readFileSync(
-  path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8"
-);
-const manifest = JSON.parse(fs.readFileSync(
-  path.resolve(__dirname, "../extension/manifest.json"), "utf8"
-));
-
-// Use the marker assertions and VM loading pattern from validation.test.cjs.
-function getMarkedApiSnippet(startMarker, endMarker) {
-  const start = apiSource.indexOf(startMarker);
-  const end = apiSource.indexOf(endMarker, start + startMarker.length);
-  assert.ok(start >= 0, `api.js marker missing: ${startMarker}`);
-  assert.ok(end > start, `api.js marker missing: ${endMarker}`);
-  return apiSource.slice(start, end);
-}
-
-function getConstantDeclaration(name) {
-  const declaration = apiSource.match(new RegExp(`^\\s*const ${name} = [^\\n]+;`, "m"));
-  assert.ok(declaration, `api.js constant missing: ${name}`);
-  return declaration[0];
-}
-
-function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager = false } = {}) {
-  const values = new Map();
-  const readErrors = new Set();
-  const writes = [];
-  const calls = [];
-  const handlerResults = new Map();
-  const addonListeners = new Set();
-  const addedListeners = [];
-  const removedListeners = [];
-  const warnings = [];
-  const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_INT: 64, PREF_BOOL: 128 };
-  const prefs = {
-    getPrefType(name) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      if (!values.has(name)) return prefTypes.PREF_INVALID;
-      const value = values.get(name);
-      if (typeof value === "string") return prefTypes.PREF_STRING;
-      if (typeof value === "boolean") return prefTypes.PREF_BOOL;
-      if (Number.isInteger(value)) return prefTypes.PREF_INT;
-      throw new Error("Unsupported preference value");
-    },
-    getStringPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
-      if (typeof value === "string") return value;
-      if (arguments.length > 1) return fallback;
-      throw new Error("Preference is not a string");
-    },
-    getBoolPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
-      if (typeof value === "boolean") return value;
-      if (arguments.length > 1) return fallback;
-      throw new Error("Preference is not a boolean");
-    },
-    getIntPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
-      if (Number.isInteger(value)) return value;
-      if (arguments.length > 1) return fallback;
-      throw new Error("Preference is not an integer");
-    },
-    setStringPref(name, value) {
-      writes.push({ name, value });
-      values.set(name, value);
-    },
-    setBoolPref(name, value) {
-      writes.push({ name, value });
-      values.set(name, value);
-    },
-    setIntPref(name, value) {
-      writes.push({ name, value });
-      values.set(name, value);
-    },
-    clearUserPref(name) {
-      writes.push({ name });
-      values.delete(name);
-    },
-  };
-  const AddonManager = {
-    addAddonListener(listener) {
-      addedListeners.push(listener);
-      addonListeners.add(listener);
-    },
-    removeAddonListener(listener) {
-      removedListeners.push(listener);
-      addonListeners.delete(listener);
-    },
-  };
-  const accounts = [
-    { key: "account1", incomingServer: { prettyName: "First account", type: "imap" } },
-    { key: "account2", incomingServer: { prettyName: "Second account", type: "pop3" } },
-  ];
-  const sandbox = {
-    Services: { prefs },
-    Ci: { nsIPrefBranch: prefTypes },
-    ChromeUtils: {
-      importESModule(uri) {
-        if (uri === "resource:///modules/MailServices.sys.mjs") {
-          return { MailServices: { accounts: { accounts } } };
-        }
-        assert.equal(uri, "resource://gre/modules/AddonManager.sys.mjs");
-        if (legacyAddonManager) throw new Error("ES module unavailable");
-        return { AddonManager };
-      },
-      import(uri) {
-        assert.equal(uri, "resource://gre/modules/AddonManager.jsm");
-        return { AddonManager };
-      },
-    },
-    console: { warn: (...args) => warnings.push(args), error() {} },
-  };
-  const prefConstants = [
-    "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_BLOCK_SKIPREVIEW",
-    "PREF_STABLE_AUTH_TOKEN", "PREF_GET_MESSAGES_LIMIT", "PREF_ALLOW_ENCRYPTED_MESSAGES",
-    "PREF_ALLOW_ALL_CALENDARS", "PREF_ALLOW_ALL_ADDRESS_BOOKS",
-  ];
-  const constants = [
-    ...prefConstants, "DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT",
-    "UNDISABLEABLE_TOOLS", "GROUP_ORDER", "GROUP_LABELS", "CRUD_ORDER",
-  ];
-  vm.createContext(sandbox);
-  vm.runInContext([
-    ...constants.map(getConstantDeclaration),
-    getMarkedApiSnippet("// BEGIN CONTACT FIELD CONSTANTS", "// END CONTACT FIELD CONSTANTS"),
-    getMarkedApiSnippet("// BEGIN OUTBOUND ATTACHMENT LIMITS", "// END OUTBOUND ATTACHMENT LIMITS"),
-    getMarkedApiSnippet("function normalizeGetMessagesLimit(", "// BEGIN TOOL SCHEMA BUILDER"),
-    getMarkedApiSnippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
-    getMarkedApiSnippet("// BEGIN SERVER ACCESS HELPERS", "// END SERVER ACCESS HELPERS"),
-    getMarkedApiSnippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
-    getMarkedApiSnippet("// BEGIN FILTER SEARCH TERM HELPERS", "// END FILTER SEARCH TERM HELPERS"),
-    getMarkedApiSnippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
-    getMarkedApiSnippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER"),
-    getMarkedApiSnippet("// BEGIN TOOL DISPATCH", "// END TOOL DISPATCH"),
-    "this.options = {",
-    getMarkedApiSnippet("// BEGIN OPTIONS ACCESS API", "// END OPTIONS ACCESS API"),
-    getMarkedApiSnippet("// BEGIN PRIVACY OPTIONS API", "// END PRIVACY OPTIONS API"),
-    "};",
-    `this.prefNames = { ${prefConstants.join(", ")} };`,
-    "this.tools = buildTools();",
-    "this.readAccessListPref = readAccessListPref;",
-    "this.isAccountAllowed = isAccountAllowed;",
-    "this.isToolEnabled = isToolEnabled;",
-    "this.isPrivacyOptInEnabled = isPrivacyOptInEnabled;",
-    "this.isAddressBookAccessRestricted = isAddressBookAccessRestricted;",
-    "this.callTool = callTool;",
-    "this.stripInvisibleCharacters = stripInvisibleCharacters;",
-    "this.sanitizeToolResultText = sanitizeToolResultText;",
-    "this.registerUninstallListener = function(context) {",
-    getMarkedApiSnippet("// BEGIN UNINSTALL LISTENER REGISTRATION", "// END UNINSTALL LISTENER REGISTRATION"),
-    "};",
-    "this.removeUninstallListener = function() {",
-    getMarkedApiSnippet("// BEGIN UNINSTALL LISTENER REMOVAL", "// END UNINSTALL LISTENER REMOVAL"),
-    "};",
-  ].join("\n"), sandbox);
-
-  for (const [name, value] of Object.entries(initial)) {
-    assert.ok(sandbox.prefNames[name], `Unknown preference constant: ${name}`);
-    values.set(sandbox.prefNames[name], value);
-  }
-  for (const name of unreadable) {
-    assert.ok(sandbox.prefNames[name], `Unknown preference constant: ${name}`);
-    readErrors.add(sandbox.prefNames[name]);
-  }
-  for (const tool of sandbox.tools) {
-    const handler = tool.name === "sendMail" ? "composeMail" : tool.name;
-    sandbox[handler] = (...args) => {
-      calls.push({ name: tool.name, args });
-      return handlerResults.has(tool.name)
-        ? handlerResults.get(tool.name) : { handled: tool.name };
-    };
-  }
-  return {
-    ...sandbox, values, writes, calls, handlerResults, addonListeners,
-    addedListeners, removedListeners, warnings,
-  };
-}
+const { loadPrivacyRuntime, manifest } = require("./helpers/privacy-access.cjs");
 
 describe("Folder and message options in production schemas and dispatch", () => {
   it("exposes favoritesOnly and copyTo and forwards both to their handlers", async () => {
@@ -568,5 +386,55 @@ describe("Stable-token cleanup during enabled uninstall", () => {
     assert.equal(owner._addonManager, null);
     assert.equal(runtime.values.get(runtime.prefNames.PREF_STABLE_AUTH_TOKEN), "b".repeat(64));
     assert.equal(runtime.writes.length, 0);
+  });
+});
+
+
+describe("production tool dependency access", () => {
+  for (const disabled of [[], ["sendMail"], ["dryRunCompose"], ["sendMail", "dryRunCompose"]]) {
+    it(`shares list/call/Options decisions and preserves own choices for ${JSON.stringify(disabled)}`, async () => {
+      const runtime = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: JSON.stringify(disabled) } });
+      const enabled = !disabled.includes("sendMail") && !disabled.includes("dryRunCompose");
+      const listed = (await runtime.http("tools/list")).result.tools;
+      assert.equal(listed.some(tool => tool.name === "dryRunCompose"), enabled);
+      assert.equal(listed.some(tool => tool.name === "sendMail"), !disabled.includes("sendMail"));
+      const call = await runtime.http("tools/call", { name: "dryRunCompose", arguments: { to: "x", subject: "s", body: "b" } });
+      if (enabled) assert.equal(JSON.parse(call.result.content[0].text).handled, "dryRunCompose");
+      else {
+        assert.match(call.error.message, /Tool is disabled/);
+        assert.equal(runtime.calls.length, 0);
+      }
+      const config = await runtime.options.getToolAccessConfig();
+      const child = config.tools.find(tool => tool.name === "dryRunCompose");
+      assert.equal(child.enabled, enabled);
+      assert.equal(child.configuredEnabled, !disabled.includes("dryRunCompose"));
+      assert.deepEqual(Array.from(child.dependencies), ["sendMail"]);
+      await runtime.options.setToolAccess(disabled, 7);
+      assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools), disabled);
+    });
+  }
+
+  it("retains corrupt-pref fail-closed access and required tools", async () => {
+    for (const value of ["{", '["__all__"]', '42']) {
+      const runtime = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: value } });
+      const listed = (await runtime.http("tools/list")).result.tools;
+      assert.deepEqual(listed.map(tool => tool.name).sort(), ["getAccountAccess", "listAccounts", "listFolders"]);
+      const response = await runtime.http("tools/call", { name: "dryRunCompose", arguments: {} });
+      assert.match(response.error.message, /Tool is disabled/);
+      assert.equal(runtime.calls.length, 0);
+    }
+  });
+
+  it("handles transitive dependencies and fails closed on dependency cycles using the production registry function", () => {
+    for (const cycle of [false, true]) {
+      const runtime = loadPrivacyRuntime({
+        initial: { PREF_DISABLED_TOOLS: '["saveDraft"]' },
+        policyTransform: code => code.replace('dryRunCompose: Object.freeze(["sendMail"])',
+          `dryRunCompose: ["sendMail"], sendMail: [${cycle ? '"dryRunCompose"' : '"saveDraft"'}]`),
+      });
+      assert.equal(runtime.isToolEnabled("dryRunCompose"), false);
+      assert.equal(runtime.isToolEnabled("sendMail"), false);
+      assert.equal(runtime.isToolEnabled("listAccounts"), true);
+    }
   });
 });

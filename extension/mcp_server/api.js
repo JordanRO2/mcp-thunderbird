@@ -2254,6 +2254,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
+    // BEGIN TOOL ACCESS IMPORT
+    const toolAccessScope = {};
+    Services.scriptloader.loadSubScript(extensionRoot.resolve("tool-access.js"), toolAccessScope);
+    const toolAccess = toolAccessScope.ToolAccess;
+    // END TOOL ACCESS IMPORT
+
     // BEGIN UNINSTALL LISTENER REGISTRATION
     if (!this._uninstallListener) {
       try {
@@ -3801,10 +3807,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
              */
             function isToolEnabled(toolName) {
-              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
-              const disabled = getDisabledTools();
-              if (disabled.includes("__all__")) return false;
-              return !disabled.includes(toolName);
+              return toolAccess.isEnabled(toolName, getDisabledTools(), UNDISABLEABLE_TOOLS);
             }
 
             /**
@@ -13466,7 +13469,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               name: t.name,
               group: t.group,
               crud: t.crud,
-              enabled: UNDISABLEABLE_TOOLS.has(t.name) || (!corrupt && !disabled.includes(t.name)),
+              enabled: toolAccess.isEnabled(t.name, corrupt ? ["__all__"] : disabled, UNDISABLEABLE_TOOLS),
+              configuredEnabled: UNDISABLEABLE_TOOLS.has(t.name) || (!corrupt && !disabled.includes(t.name)),
+              dependencies: toolAccess.dependencies[t.name] || [],
               undisableable: UNDISABLEABLE_TOOLS.has(t.name),
               ...(t.name === "getMessages" ? {
                 getMessagesLimit,
