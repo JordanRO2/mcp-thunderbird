@@ -56,7 +56,7 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `createFolder` | Create new subfolders to organize your mail |
 | `createVirtualFolder` | Create a saved search over accessible real folders without moving or copying mail. Existing folder names, special root names, hidden servers, and unsuitable parents are refused. |
 | `listVirtualFolders` | List saved searches with account keys, scope, and conditions. Omit the entire view if any scope is inaccessible, hidden, wildcard, unresolved, or unreadable. |
-| `deleteVirtualFolder` | Remove only a saved-search view. Refuse real folders, views with subfolders or their own message headers, and unreadable state. |
+| `deleteVirtualFolder` | Remove only a saved-search view. Refuse real folders, views with subfolders, their own message headers or nonempty backing storage, and unreadable or unexpected storage. |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
 | `moveFolder` | Move a folder to a new parent within the same account |
@@ -64,6 +64,8 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
 
 A saved search is a live view in Thunderbird's folder pane. Its message counts populate after it is first opened. MCP message tools read folder storage, not saved-search results; use `searchMessages` on the source folders for retrieval. Saved searches cannot be move/copy destinations or parents for `createFolder`/`moveFolder`.
+
+`deleteVirtualFolder` checks both the database and raw storage. An mbox must be absent or empty; a maildir may contain only empty `cur`/`tmp` directories; the folder's `.sbd` directory must be absent or empty. Unreadable paths, links, unexpected contents, and unsupported storage types are refused.
 
 `createVirtualFolder` uses the same condition vocabulary as `createFilter`. `booleanAnd: true` means AND with the previous term; `false` means OR (default true). Use the same value for all conditions when editing the view through Thunderbird's single all/any choice. Supply individual real folders, not account roots or other saved searches; duplicate folders are searched once. Address-book conditions (`isInAB`/`isntInAB`) require **Allow all address books** while account restrictions are active. A failed native creation can leave an empty folder; the tool never deletes a folder to undo a failed creation.
 

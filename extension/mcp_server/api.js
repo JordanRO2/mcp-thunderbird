@@ -2915,7 +2915,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteVirtualFolder",
         group: "folders", crud: "delete",
         title: "Delete Saved Search",
-        description: "Delete a virtual folder (saved search). Only the view is removed -- no messages are deleted. Refuses real folders, views with subfolders or stored message headers, and unreadable state; use deleteFolder for real folders.",
+        description: "Delete a virtual folder (saved search). Only the view is removed -- no messages are deleted. Refuses real folders, views with subfolders, stored message headers or nonempty backing storage, and unreadable or unexpected storage; use deleteFolder for real folders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -11423,6 +11423,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX = ".sbd";
             const SAVED_SEARCH_SUMMARY_SUFFIX = ".msf";
             const SAVED_SEARCH_DATABASE_SERVICE = "@mozilla.org/msgDatabase/msgDBService;1";
+            const SAVED_SEARCH_STORAGE_ERROR = "Cannot delete a saved search with nonempty, unreadable or unexpected storage";
+            const SAVED_SEARCH_MBOX_STORE = "mbox";
+            const SAVED_SEARCH_MAILDIR_STORE = "maildir";
+            // nsMsgMaildirStore uses cur and tmp; Thunderbird does not use new.
+            const SAVED_SEARCH_MAILDIR_DIRECTORIES = new Set(["cur", "tmp"]);
 
             // Applies to the view, its parent and every scope folder. Do not
             // broaden the global account-access helper's policy for other tools.
@@ -11467,6 +11472,77 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
               return { directory, names };
+            }
+
+            function assertReadableSavedSearchStorage(file) {
+              if (file.isReadable() !== true || file.isSymlink() !== false) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              // As in attachment validation, Windows isSymlink misses junctions.
+              // Resolve each existing component before comparing its target.
+              if (Services.appinfo?.OS === "WINNT") {
+                for (let component = file.clone(); component; component = component.parent) {
+                  if (component.isReadable() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  const target = component.target;
+                  if (!target || target.replace(/\\/g, "/").toLowerCase() !==
+                      component.path.replace(/\\/g, "/").toLowerCase()) {
+                    throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  }
+                }
+              }
+            }
+
+            function visitSavedSearchStorageDirectory(directory, visit) {
+              assertReadableSavedSearchStorage(directory);
+              if (directory.isDirectory() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const entries = directory.directoryEntries;
+              try {
+                for (const entry of entries) visit(entry);
+              } finally {
+                entries.close();
+              }
+            }
+
+            function assertEmptySavedSearchStorage(folder) {
+              const storeType = folder.msgStore.storeType;
+              if (storeType !== SAVED_SEARCH_MBOX_STORE && storeType !== SAVED_SEARCH_MAILDIR_STORE) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              const file = folder.filePath;
+              if (!file || typeof file.leafName !== "string" || !file.leafName) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              const childDirectory = file.clone();
+              childDirectory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+              const paths = [file, childDirectory];
+              const found = [null, null];
+              // exists() can report false on access errors. Establish absence
+              // through a successful parent-directory scan, not a false exists.
+              visitSavedSearchStorageDirectory(file.parent, entry => {
+                for (let i = 0; i < paths.length; i++) {
+                  if (paths[i].equals(entry) || paths[i].leafName.normalize().toLowerCase() ===
+                      entry.leafName.normalize().toLowerCase()) {
+                    if (found[i]) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                    found[i] = entry;
+                  }
+                }
+              });
+              const refuseEntry = () => { throw new Error(SAVED_SEARCH_STORAGE_ERROR); };
+              const [backing, children] = found;
+              if (backing) {
+                assertReadableSavedSearchStorage(backing);
+                if (storeType === SAVED_SEARCH_MBOX_STORE) {
+                  if (backing.isFile() !== true || backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                } else {
+                  visitSavedSearchStorageDirectory(backing, entry => {
+                    if (!SAVED_SEARCH_MAILDIR_DIRECTORIES.has(entry.leafName)) {
+                      throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                    }
+                    visitSavedSearchStorageDirectory(entry, refuseEntry);
+                  });
+                }
+              }
+              if (children) visitSavedSearchStorageDirectory(children, refuseEntry);
             }
 
             function getVirtualFolderHelper() {
@@ -11771,6 +11847,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const label = folder.prettyName || folder.name;
+                // nsMailDatabase::GetSummaryValid bypasses store validation for
+                // Virtual folders. An empty DB alone cannot prove storage empty:
+                // native deletion also removes the backing store and .sbd tree.
+                assertEmptySavedSearchStorage(folder);
                 // Two arguments on every supported version. Never retry a delete
                 // after an exception: native work may already be partly complete.
                 parent.propagateDelete(folder, true);

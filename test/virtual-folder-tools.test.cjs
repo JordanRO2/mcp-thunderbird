@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { Buffer } = require("node:buffer");
 const path = require("node:path").posix;
 const { loadFolderTools } = require("./helpers/folder-tools.cjs");
 
@@ -21,6 +22,8 @@ const DB_CLOSE_ERROR = "database close failed";
 const CHILDREN_UNREADABLE_ERROR = "children unavailable";
 const SUBFOLDER_SUFFIX = ".sbd";
 const SUMMARY_SUFFIX = ".msf";
+const MBOX_STORE = "mbox";
+const MAILDIR_STORE = "maildir";
 const TOOLS = { CREATE: "createVirtualFolder", LIST: "listVirtualFolders", DELETE: "deleteVirtualFolder" };
 const EVENT = {
   FLAGS: "flags", SET_FLAG: "setFlag", ADD: "addSubfolder", NOTIFY: "notifyFolderAdded",
@@ -49,34 +52,80 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
 
   // nsIFile snapshots must observe pre-existing native storage without touching
   // the host filesystem. Each clone shares disk entries but has its own path.
+  // A sparse map still implies intermediate directories, as a real filesystem
+  // does: backing/cur/message must be visible when enumerating backing.
+  function diskEntry(filePath) {
+    if (disk.has(filePath)) return disk.get(filePath);
+    const prefix = filePath.endsWith("/") ? filePath : `${filePath}/`;
+    return [...disk.keys()].some(entry => entry.startsWith(prefix))
+      ? { directory: true } : undefined;
+  }
+
   function file(initialPath) {
     let currentPath = initialPath;
     return {
       get path() { return currentPath; },
-      get parent() { return file(path.dirname(currentPath)); },
+      get parent() {
+        const parentPath = path.dirname(currentPath);
+        return parentPath === currentPath ? null : file(parentPath);
+      },
+      get target() {
+        if (fileFailures.get(currentPath)?.target) throw new Error("resolved target unreadable");
+        const entry = diskEntry(currentPath);
+        return entry && "target" in entry ? entry.target : currentPath;
+      },
       get leafName() {
         if (fileFailures.get(currentPath)?.leafName) throw new Error("directory entry unreadable");
         return path.basename(currentPath);
       },
       set leafName(value) { currentPath = path.join(path.dirname(currentPath), value); },
       clone: () => file(currentPath),
-      equals: other => other.path === currentPath,
+      equals(other) {
+        if (fileFailures.get(currentPath)?.equals) throw new Error("storage identity unreadable");
+        return other.path === currentPath;
+      },
       exists() {
         if (fileFailures.get(currentPath)?.exists) throw new Error("storage existence unreadable");
-        return disk.has(currentPath);
+        const entry = diskEntry(currentPath);
+        return !!entry && entry.exists !== false;
       },
       isDirectory() {
         if (fileFailures.get(currentPath)?.isDirectory) throw new Error("storage type unreadable");
-        return disk.get(currentPath)?.directory === true;
+        return diskEntry(currentPath)?.directory === true;
+      },
+      isFile() {
+        if (fileFailures.get(currentPath)?.isFile) throw new Error("file type unreadable");
+        const entry = diskEntry(currentPath);
+        return entry?.directory === false && entry.regular !== false;
+      },
+      isReadable() {
+        if (fileFailures.get(currentPath)?.isReadable) throw new Error("storage permissions unreadable");
+        const entry = diskEntry(currentPath);
+        return !!entry && entry.readable !== false;
+      },
+      isSymlink() {
+        if (fileFailures.get(currentPath)?.isSymlink) throw new Error("symlink state unreadable");
+        return diskEntry(currentPath)?.symlink === true;
+      },
+      get fileSize() {
+        if (fileFailures.get(currentPath)?.fileSize) throw new Error("storage size unreadable");
+        const entry = diskEntry(currentPath);
+        if (!entry) throw new Error("storage unavailable");
+        return "size" in entry ? entry.size : Buffer.byteLength(entry.content || "");
       },
       get directoryEntries() {
         if (fileFailures.get(currentPath)?.directoryEntries) throw new Error("directory unreadable");
         return {
           *[Symbol.iterator]() {
             if (fileFailures.get(currentPath)?.iterate) throw new Error("directory iteration failed");
+            const children = new Set();
+            const prefix = currentPath.endsWith("/") ? currentPath : `${currentPath}/`;
             for (const entry of disk.keys()) {
-              if (path.dirname(entry) === currentPath) yield file(entry);
+              if (!entry.startsWith(prefix)) continue;
+              const child = entry.slice(prefix.length).split("/")[0];
+              children.add(path.join(currentPath, child));
             }
+            for (const child of children) yield file(child);
           },
           close() {
             events.push([EVENT.DIRECTORY_CLOSE, currentPath]);
@@ -99,6 +148,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
       URI: parent ? `${parent.URI}/${encodeURIComponent(name)}` : `mailbox://${server.key}`,
       isServer: !parent,
       canCreateSubfolders: true,
+      msgStore: { storeType: MBOX_STORE },
       filePath: file(storagePath),
       summaryFile: file(`${storagePath}${SUMMARY_SUFFIX}`),
       subFolders: [],
@@ -718,6 +768,217 @@ describe("saved-search deletion is view-only", () => {
     assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
     assert.ok(wasReleased(h, target));
   });
+});
+
+describe("saved-search deletion proves backing storage is empty", () => {
+  const STORED_MAIL = "From sender@example.invalid\nMessage-ID: <must-survive>\n\nStored mail\n";
+  const MAILDIR_CUR = "cur";
+  const MAILDIR_TMP = "tmp";
+
+  for (const kind of [MBOX_STORE, MAILDIR_STORE, "orphan child directory"]) {
+    it(`preserves unindexed ${kind} mail despite a valid empty database and no registered children`, async () => {
+      const h = makeHarness();
+      const target = h.view();
+      if (kind === MAILDIR_STORE) target.msgStore.storeType = MAILDIR_STORE;
+      const backing = target.filePath.path;
+      const childDirectory = `${backing}${SUBFOLDER_SUFFIX}`;
+      const storedPath = kind === MBOX_STORE ? backing
+        : kind === MAILDIR_STORE ? `${backing}/${MAILDIR_CUR}/message` : `${childDirectory}/UnindexedMail`;
+      if (kind !== MBOX_STORE) h.disk.set(kind === MAILDIR_STORE ? backing : childDirectory, { directory: true });
+      const stored = { directory: false, content: STORED_MAIL };
+      h.disk.set(storedPath, stored);
+      if (kind === MAILDIR_STORE) {
+        assert.equal(h.disk.has(`${backing}/${MAILDIR_CUR}`), false,
+          "sparse fixture must reveal the implied cur directory without an explicit map entry");
+      }
+      assert.equal(target.database.summaryValid, true);
+      assert.equal(target.headers.length, 0);
+      assert.equal(target.hasSubFolders, false);
+      let deletions = 0;
+      h.root.propagateDelete = (folder, deleteStorage) => {
+        assert.equal(folder, target);
+        assert.equal(deleteStorage, true);
+        deletions++;
+        for (const entry of [...h.disk.keys()]) {
+          if (entry === backing || entry.startsWith(`${backing}/`) ||
+              entry === childDirectory || entry.startsWith(`${childDirectory}/`)) h.disk.delete(entry);
+        }
+      };
+      assertRefused(await h.runtime.callTool(TOOLS.DELETE, { folderPath: target.URI }));
+      assert.equal(deletions, 0);
+      assert.equal(h.disk.get(storedPath), stored);
+      assert.equal(target.flags, VIRTUAL_FLAG);
+      h.assertNoMutation();
+    });
+  }
+
+  for (const [kind, arrange] of [
+    ["absent storage", () => {}],
+    ["zero-byte regular backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, size: 0 })],
+    ["absent maildir storage", (_h, target) => { target.msgStore.storeType = MAILDIR_STORE; }],
+    ["empty backing directory", (h, target) => {
+      target.msgStore.storeType = MAILDIR_STORE;
+      h.disk.set(target.filePath.path, { directory: true });
+    }],
+    ["empty expected maildir directories", (h, target) => {
+      target.msgStore.storeType = MAILDIR_STORE;
+      h.disk.set(`${target.filePath.path}/${MAILDIR_CUR}`, { directory: true });
+      h.disk.set(`${target.filePath.path}/${MAILDIR_TMP}`, { directory: true });
+    }],
+    ["empty orphan child directory", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, { directory: true })],
+    ["nonempty summary with absent backing", (h, target) => h.disk.set(target.summaryFile.path, { directory: false, content: "saved-search definition" })],
+  ]) {
+    it(`allows view-only deletion with ${kind}, retaining the own-header check`, async () => {
+      const h = makeHarness();
+      const target = h.view();
+      arrange(h, target);
+      const result = await h.runtime.callTool(TOOLS.DELETE, { folderPath: target.URI });
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
+      assert.ok(h.events.some(([event, uri]) => event === EVENT.ENUMERATE && uri === target.URI));
+      assert.ok(wasReleased(h, target));
+    });
+  }
+
+  for (const [kind, arrange] of [
+    ["unreadable backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, readable: false })],
+    ["unreadable backing directory", (h, target) => h.disk.set(target.filePath.path, { directory: true, readable: false })],
+    ["nonregular backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, regular: false })],
+    ["unknown backing type", (h, target) => h.disk.set(target.filePath.path, {})],
+    ["directory backing for mbox", (h, target) => h.disk.set(target.filePath.path, { directory: true })],
+    ["regular backing for maildir", (h, target) => h.disk.set(target.filePath.path, { directory: false })],
+    ["symlink backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, symlink: true })],
+    ["symlink backing directory", (h, target) => h.disk.set(target.filePath.path, { directory: true, symlink: true })],
+    ["dangling backing symlink", (h, target) => h.disk.set(target.filePath.path, { directory: false, symlink: true, exists: false })],
+    ["unexpected empty maildir subdirectory", (h, target) => h.disk.set(`${target.filePath.path}/new`, { directory: true })],
+    ["unexpected empty maildir file", (h, target) => h.disk.set(`${target.filePath.path}/lock`, { directory: false })],
+    ["message in temporary maildir", (h, target) => h.disk.set(`${target.filePath.path}/${MAILDIR_TMP}/inflight`, { directory: false, content: STORED_MAIL })],
+    ["non-directory maildir cur entry", (h, target) => h.disk.set(`${target.filePath.path}/${MAILDIR_CUR}`, { directory: false })],
+    ["symlink maildir cur entry", (h, target) => h.disk.set(`${target.filePath.path}/${MAILDIR_CUR}`, { directory: true, symlink: true })],
+    ["unreadable maildir cur entry", (h, target) => h.disk.set(`${target.filePath.path}/${MAILDIR_CUR}`, { directory: true, readable: false })],
+    ["non-directory child storage", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, { directory: false })],
+    ["symlink child directory", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, { directory: true, symlink: true })],
+    ["unreadable child directory", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, { directory: true, readable: false })],
+    ["unknown child storage type", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, {})],
+    ["unreadable parent directory", (h, target) => h.disk.set(target.filePath.parent.path, { directory: true, readable: false })],
+    ["symlink parent directory", (h, target) => h.disk.set(target.filePath.parent.path, { directory: true, symlink: true })],
+    ["missing backing path", (_h, target) => { target.filePath = null; }],
+  ]) {
+    it(`refuses ${kind} without deleting raw storage`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      if (kind.includes(MAILDIR_STORE)) target.msgStore.storeType = MAILDIR_STORE;
+      arrange(h, target);
+      const before = Array.from(h.disk.entries());
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      assert.deepEqual(Array.from(h.disk.entries()), before);
+      h.assertNoMutation();
+    });
+  }
+
+  for (const size of [undefined, null, "0", -1, NaN, Infinity, 0.5]) {
+    it(`refuses invalid backing file size ${String(size)} without deletion`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      h.disk.set(target.filePath.path, { directory: false, size });
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+  }
+
+  for (const storeType of [undefined, null, "", "future-store"]) {
+    it(`refuses unsupported storage backend ${String(storeType)} even with absent backing`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      target.msgStore.storeType = storeType;
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+  }
+
+  it("refuses an unreadable storage backend without deleting anything", () => {
+    const h = makeHarness();
+    const target = h.view();
+    Object.defineProperty(target, "msgStore", { get() { throw new Error("message store unavailable"); } });
+    assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+    h.assertNoMutation();
+  });
+
+  it("allows readable Windows storage whose resolved ancestor targets are unchanged", () => {
+    const h = makeHarness();
+    const target = h.view();
+    h.runtime.Services.appinfo = { OS: "WINNT" };
+    h.disk.set(target.filePath.path, { directory: false });
+    const result = h.runtime.deleteVirtualFolder(target.URI);
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
+  });
+
+  for (const [kind, arrange] of [
+    ["redirected backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, target: "/redirected/mail" })],
+    ["junction ancestor", (h, target) => h.disk.set(target.filePath.parent.path, { directory: true, target: "/redirected/account" })],
+    ["empty target", (h, target) => h.disk.set(target.filePath.path, { directory: false, target: "" })],
+    ["unreadable target", (h, target) => h.fileFailures.set(target.filePath.path, { target: true })],
+  ]) {
+    it(`refuses a Windows ${kind} even when isSymlink reports false`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      h.runtime.Services.appinfo = { OS: "WINNT" };
+      h.disk.set(target.filePath.path, { directory: false });
+      arrange(h, target);
+      assert.equal(target.filePath.isSymlink(), false);
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+  }
+
+  for (const failure of ["isFile", "isDirectory", "isReadable", "isSymlink", "fileSize", "equals"]) {
+    it(`refuses unreadable backing ${failure} metadata without deletion`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      if (failure === "isDirectory") target.msgStore.storeType = MAILDIR_STORE;
+      h.disk.set(target.filePath.path, { directory: failure === "isDirectory" });
+      h.fileFailures.set(target.filePath.path, { [failure]: true });
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+      assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.parent.path));
+    });
+  }
+
+  for (const location of ["parent", "backing", "cur", "child directory"]) {
+    for (const failure of ["directoryEntries", "iterate", "close"]) {
+      it(`refuses ${location} ${failure} failure and closes acquired enumerators`, () => {
+        const h = makeHarness();
+        const target = h.view();
+        if (location === "backing" || location === MAILDIR_CUR) target.msgStore.storeType = MAILDIR_STORE;
+        const targetPath = location === "parent" ? target.filePath.parent.path
+          : location === "backing" ? target.filePath.path
+            : location === "cur" ? `${target.filePath.path}/${MAILDIR_CUR}`
+              : `${target.filePath.path}${SUBFOLDER_SUFFIX}`;
+        h.disk.set(targetPath, { directory: true });
+        h.fileFailures.set(targetPath, { [failure]: true });
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+        if (failure !== "directoryEntries") {
+          assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === targetPath));
+        }
+      });
+    }
+  }
+
+  for (const failure of ["leafName", "isDirectory", "isReadable", "isSymlink"]) {
+    it(`refuses unreadable maildir entry ${failure} and closes its parent enumerator`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      target.msgStore.storeType = MAILDIR_STORE;
+      const current = `${target.filePath.path}/${MAILDIR_CUR}`;
+      h.disk.set(current, { directory: true });
+      h.fileFailures.set(current, { [failure]: true });
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+      assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.path));
+    });
+  }
 });
 
 describe("saved-search production schemas", () => {
