@@ -867,17 +867,19 @@ function applyVCardContactFields(card, fields, VCardPropertyEntry) {
       else delete entry.params.pref;
       const previousTypes = Array.isArray(entry.params.type)
         ? entry.params.type : entry.params.type ? [entry.params.type] : [];
-      const requestedType = fields.emails[index].type;
+      const requestedType = fields.emails[index].type || "";
+      const typeChanged = requestedType !== getContactEmailType(entry);
       const types = previousTypes.filter(type => {
         const normalized = typeof type === "string" ? type.toLowerCase() : "";
-        return (!CONTACT_EMAIL_TYPES.includes(normalized) || normalized === requestedType) &&
+        return (!typeChanged || !CONTACT_EMAIL_TYPES.includes(normalized) || normalized === requestedType) &&
           (index === 0 || normalized !== "pref");
       });
       if (requestedType && !types.some(type => typeof type === "string" && type.toLowerCase() === requestedType)) {
         types.push(requestedType);
       }
-      // Preserve unrelated TYPE values, groups and the original parameter
-      // object; only change work/home and non-primary vCard-3 TYPE=PREF.
+      // The API exposes only the first recognized type. Preserve all existing
+      // TYPE tokens on an unchanged round trip; an actual type change replaces
+      // work/home. Always remove non-primary vCard-3 TYPE=PREF.
       if (types.length !== previousTypes.length || types.some((type, i) => type !== previousTypes[i])) {
         if (types.length) entry.params.type = types.length === 1 ? types[0] : types;
         else delete entry.params.type;

@@ -3,7 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  loadContactRuntime, FakeVCardPropertyEntry, FakeVCardProperties, FakeFlatCard, FakeAddrBookCard,
+  loadContactRuntime, FakeVCardPropertyEntry, FakeVCardProperties, FakeFlatCard, FakeAddrBookCard, FakeAddressBook,
 } = require("./helpers/contact-runtime.cjs");
 
 const helpers = loadContactRuntime();
@@ -588,6 +588,71 @@ describe("contact email addresses", () => {
       assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
     });
   }
+
+  it("preserves all TYPE tokens and metadata when writing the exposed type back unchanged", () => {
+    const firstParams = {
+      type: ["work", "home", "INTERNET"], pref: "1", group: "item1", "x-custom": "Keep me",
+    };
+    const secondParams = { type: ["HOME", "work", "INTERNET"], group: "item2", altid: "other" };
+    const first = new FakeVCardPropertyEntry("email", firstParams, "text", "first@example.com");
+    const second = new FakeVCardPropertyEntry("email", secondParams, "text", "second@example.com");
+    const label = new FakeVCardPropertyEntry("x-ablabel", { group: "item1" }, "text", "Research");
+    const properties = new FakeVCardProperties([label, first, second]);
+    const card = new FakeAddrBookCard({}, properties);
+    const before = structuredClone([firstParams, secondParams]);
+    const read = helpers.readContactFields(card);
+    assert.deepEqual(plain(read.emails), [
+      { type: "work", address: "first@example.com" }, { type: "home", address: "second@example.com" },
+    ]);
+
+    assert.equal(helpers.applyContactFields(card, { emails: read.emails }, FakeVCardPropertyEntry), null);
+    assert.deepEqual(properties.getAllEntries("email"), [first, second]);
+    assert.strictEqual(first.params, firstParams);
+    assert.strictEqual(second.params, secondParams);
+    assert.deepEqual([first.params, second.params], before);
+    assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
+  });
+
+  it("preserves serialized email metadata across getContact, unchanged updateContact and reload", () => {
+    const rawProperty = "_vCard";
+    const params = [
+      { type: ["work", "home", "INTERNET"], pref: "1", group: "item1", "x-custom": "keep" },
+      { type: ["HOME", "work", "INTERNET"], group: "item2", altid: "other" },
+    ];
+    const properties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("fn", {}, "text", "Round Trip"),
+      new FakeVCardPropertyEntry("x-ablabel", { group: "item1" }, "text", "Research"),
+      new FakeVCardPropertyEntry("note", {}, "text", "Keep this note"),
+      ...params.map((value, index) => new FakeVCardPropertyEntry("email", value, "text", `address${index}@example.com`)),
+    ]);
+    const book = new FakeAddressBook();
+    const { UID } = book.addCard(new FakeAddrBookCard({}, properties));
+    const runtime = loadContactRuntime({ books: [book] });
+    const beforeRaw = book.savedCards.get(UID).getProperty(rawProperty);
+    const beforeParams = structuredClone(params);
+    const read = runtime.getContact(UID);
+    assert.deepEqual(plain(read.emails).map(email => email.type), ["work", "home"]);
+
+    assert.equal(runtime.update(UID, { emails: read.emails }).success, true);
+    const reloaded = book.reloadCard(UID);
+    const afterRaw = reloaded.getProperty(rawProperty);
+    const emailLines = [beforeRaw, afterRaw].map(raw =>
+      raw.split(/\r?\n/).filter(line => /(?:^|\.)EMAIL[;:]/i.test(line))
+    );
+    assert.equal(emailLines[0].length, 2);
+    assert.deepEqual(emailLines[1], emailLines[0], "stored TYPE tokens, groups and parameters are unchanged");
+    assert.deepEqual(reloaded.vCardProperties.getAllEntries("email").map(entry => entry.params), beforeParams);
+    assert.equal(reloaded.vCardProperties.getFirstValue("note"), "Keep this note");
+    assert.equal(reloaded.vCardProperties.getFirstValue("x-ablabel"), "Research");
+
+    const changed = [{ ...read.emails[0], type: "home" }, { address: read.emails[1].address }];
+    assert.equal(runtime.update(UID, { emails: changed }).success, true);
+    const changedEntries = book.reloadCard(UID).vCardProperties.getAllEntries("email");
+    assert.deepEqual(plain(changedEntries.map(entry => entry.params)), [
+      { ...beforeParams[0], type: ["home", "INTERNET"] },
+      { ...beforeParams[1], type: "INTERNET" },
+    ], "an actual type change updates work/home while preserving other metadata");
+  });
 
   it("reserves all address matches before reusing a type bucket for a new address", () => {
     const retained = new FakeVCardPropertyEntry("email", { type: "work", group: "retained-label" }, "text", "kept@example.com");
