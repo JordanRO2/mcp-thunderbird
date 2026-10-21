@@ -2423,7 +2423,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             includeSignature: { type: "boolean", description: "Append the identity signature. Defaults to true for a new draft and false when replacing a draft, whose body may already include it. Set false for a body with its own signature, or true to append one explicitly." },
             inReplyTo: { type: "string", minLength: 5, maxLength: 998, description: "One bracketed Message-ID, e.g. <id@example.com>, at most 998 characters, without whitespace or control characters. Invalid input is rejected, never repaired. Sets In-Reply-To and defaults References to this ID. Subject and quoted text remain the caller's responsibility." },
             references: { type: "string", minLength: 5, maxLength: 16384, description: "Up to 100 bracketed Message-IDs separated by single ASCII spaces, oldest first; at most 998 characters per ID and 16384 total. No whitespace within IDs or control characters. Invalid input is rejected. Defaults to inReplyTo when omitted; may also be supplied independently." },
-            sendAt: { type: "string", minLength: 10, maxLength: 64, description: "Schedule delivery through the Send Later add-on: ISO 8601 date-time (e.g. 2026-10-17T10:00, local time when no offset is given, or with Z / +02:00). The draft gets X-Send-Later-At and X-Send-Later-Uuid headers and Send Later sends it on time, without review. Requires Send Later installed with draft sending enabled, and the skipReview safety block disabled; Thunderbird must be running at that time. Must be in the future and within 366 days. Replacing a scheduled draft without sendAt unschedules it." },
+            sendAt: { type: "string", minLength: 10, maxLength: 64, description: "Schedule delivery through the Send Later add-on: ISO 8601 date-time (e.g. 2026-10-17T10:00, local time when no offset is given, or with Z / +02:00). The draft gets X-Send-Later-At and X-Send-Later-Uuid headers and Send Later sends it on time, without review. Requires sendMail enabled, at least one To/Cc/Bcc recipient, an identity allowed by the unreviewed-send encryption policy, Send Later installed with draft sending enabled, and the skipReview safety block disabled; Thunderbird must be running at that time. Must be in the future and within 366 days. Replacing a scheduled draft without sendAt unschedules it." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -10031,7 +10031,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Searched for identity policy readers: readAccessListPref supplies
             // the strict pref-type pattern, but no identity encryption guard exists.
             // nsIMsgIdentity.encryptionPolicy masks failed preference reads as 0.
-            function getDirectSendIdentityError(identity) {
+            function getDirectSendIdentityError(identity, reviewInstruction = DIRECT_SEND_REVIEW_INSTRUCTION) {
               try {
                 const key = identity?.key;
                 if (typeof key !== "string" || !key.trim()) throw new Error("Missing identity key");
@@ -10050,7 +10050,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const policy = Services.prefs.getIntPref(pref);
                     if (!Number.isInteger(policy) || policy < 0) throw new Error("Invalid encryption policy");
                     if (policy > 0) {
-                      return `Unreviewed sending is blocked because the identity requires encryption. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                      return `Unreviewed sending is blocked because the identity requires encryption. ${reviewInstruction}`;
                     }
                   } else {
                     const value = Services.prefs.getStringPref(pref);
@@ -10067,12 +10067,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const autoEnable = Services.prefs.getBoolPref(AUTO_ENABLE_ENCRYPTION_PREF);
                   if (typeof autoEnable !== "boolean") throw new Error("Invalid automatic encryption setting");
                   if (autoEnable) {
-                    return `Unreviewed sending is blocked because automatic encryption is enabled for this identity. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                    return `Unreviewed sending is blocked because automatic encryption is enabled for this identity. ${reviewInstruction}`;
                   }
                 }
                 return null;
               } catch {
-                return `Unreviewed sending is blocked because the identity's encryption settings could not be read. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                return `Unreviewed sending is blocked because the identity's encryption settings could not be read. ${reviewInstruction}`;
               }
             }
             // END DIRECT SEND ENCRYPTION GUARD
@@ -10385,6 +10385,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // BEGIN SAVE DRAFT TOOL
             // BEGIN SEND LATER SCHEDULING
             const SEND_LATER_MAX_DAYS = 366;
+            const SEND_LATER_REVIEW_INSTRUCTION = "Omit sendAt to save a plain draft, or use sendMail with skipReview: false to send through Thunderbird's review window.";
 
             /**
              * Formats a date as an RFC 5322 date-time in local time, the format
@@ -10414,6 +10415,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (isSkipReviewBlocked()) {
                 return { error: "User preference blocks skipReview, and a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
               }
+              if (!isToolEnabled("sendMail")) {
+                return { error: "sendAt requires the sendMail tool to be enabled; a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
+              }
               const info = globalThis.__tbMcpSendLaterInfo;
               if (!info || typeof info.uuid !== "string" || !info.uuid) {
                 return { error: "Send Later add-on (sendlater3@kamens.us) is not installed, disabled, or has not answered yet; the draft was not saved." };
@@ -10442,6 +10446,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (sendAt !== undefined && sendAt !== null) {
                   scheduled = resolveSendLaterSchedule(sendAt);
                   if (scheduled.error) return { error: scheduled.error };
+                  if (![to, cc, bcc].some(value => typeof value === "string" && value.trim())) {
+                    return { error: "sendAt requires at least one recipient in To, Cc or Bcc. Omit sendAt to save a plain draft." };
+                  }
                 }
                 if (inReplyTo !== undefined && !isValidMessageIdList(inReplyTo, 1)) {
                   return { error: "inReplyTo must be one bracketed Message-ID (<id@example.com>), at most 998 characters, without whitespace or control characters" };
@@ -10511,6 +10518,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
+
+                if (scheduled) {
+                  const error = getDirectSendIdentityError(msgComposeParams.identity, SEND_LATER_REVIEW_INSTRUCTION);
+                  if (error) return { error };
+                }
 
                 if (msgToReplace) {
                   const draftURI = getIdentityDraftFolderURI(msgComposeParams.identity);

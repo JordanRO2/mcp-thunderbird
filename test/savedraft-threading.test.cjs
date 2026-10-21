@@ -13,6 +13,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 
@@ -26,15 +27,16 @@ function snippet(name) {
 }
 
 const Ci = {
+  nsIPrefBranch: prefTypes,
   nsIMsgComposeParams: Symbol("nsIMsgComposeParams"),
   nsIMsgCompFields: Symbol("nsIMsgCompFields"),
   nsIMsgCompType: { New: 0 },
   nsIMsgCompDeliverMode: { SaveAsDraft: 4 },
 };
 
-function loadSaveDraft() {
+function loadSaveDraft(options = {}) {
   const sent = [];
-  const calls = { attachments: 0 };
+  const calls = { attachments: 0, signatures: 0 };
   const composeFields = {
     to: "",
     cc: "",
@@ -50,13 +52,26 @@ function loadSaveDraft() {
 
   const sandbox = {
     Ci,
+    Services: { prefs: makeDirectSendPrefs(options.prefs) },
+    Date,
+    isSkipReviewBlocked: () => options.blocked === true,
+    isToolEnabled: name => !(options.disabledTools || []).includes(name),
+    __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : {
+      uuid: "draft-test-instance", sendDrafts: true, checkTimePref: 1,
+    },
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => composeFields },
     },
-    setComposeIdentity(params) { params.identity = {}; },
+    setComposeIdentity(params, from) {
+      if (options.identityError) return { error: options.identityError };
+      params.identity = { key: from ? "selected" : "default", signMail: true };
+    },
     resolveComposeFormat: () => ({ useHtml: false, format: 1 }),
-    buildBodyWithSignature: body => body || "",
+    buildBodyWithSignature(body) {
+      calls.signatures++;
+      return body || "";
+    },
     getAccessibleFolder: uri => ({ folder: { URI: uri } }),
     filePathsToAttachDescs() {
       calls.attachments++;
@@ -71,12 +86,17 @@ function loadSaveDraft() {
 
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DRAFT HELPERS"),
     snippet("SAVE DRAFT TOOL"),
+    snippet("TOOL CALL DISPATCH"),
     "this.saveDraft = saveDraft;",
   ].join("\n"), sandbox);
 
-  return { saveDraft: sandbox.saveDraft, composeFields, sent, calls };
+  return {
+    saveDraft: sandbox.saveDraft, composeFields, sent, calls,
+    save: args => sandbox.dispatchTool("saveDraft", { to: "a@example.com", subject: "Hi", body: "body", ...args }),
+  };
 }
 
 function saveThreaded(harness, inReplyTo, references) {
@@ -236,4 +256,88 @@ describe("saveDraft threading", () => {
     assert.match((await saveThreaded(invalid, PARENT, tooLong)).error, /references/i);
     assert.equal(invalid.sent.length, 0);
   });
+});
+
+describe("saveDraft scheduling permissions and identity policy", () => {
+  const future = () => new Date(Date.now() + 3600000).toISOString();
+  const identityPrefix = "mail.identity.default.";
+  const autoEnable = "mail.e2ee.auto_enable";
+  const refusals = [
+    ["Block skipReview", { blocked: true }, {}, /blocks skipReview/],
+    ["disabled sendMail", { disabledTools: ["sendMail"] }, {}, /requires the sendMail tool/],
+    ["unavailable add-on", { info: null }, {}, /not installed/],
+    ["disabled draft sending", { info: { uuid: "instance", sendDrafts: false } }, {}, /does not send scheduled drafts/],
+    ["disabled scan", { info: { uuid: "instance", sendDrafts: true, checkTimePref: 0 } }, {}, /check interval/],
+    ["missing recipients", {}, { to: "", cc: " \t", bcc: "" }, /at least one recipient/],
+    ["restricted identity", { identityError: "identity belongs to a restricted account" }, {}, /restricted account/],
+    ["invalid threading", {}, { inReplyTo: "bad" }, /inReplyTo/],
+    ["malformed date", {}, { sendAt: "tomorrow" }, /ISO 8601/],
+  ];
+  for (const [label, options, args, error] of refusals) {
+    it(`refuses ${label} before saving, signatures or attachments`, async () => {
+      const h = loadSaveDraft(options);
+      assert.match((await h.save({ sendAt: future(), ...args })).error, error);
+      assert.equal(h.sent.length, 0);
+      assert.deepEqual(h.calls, { attachments: 0, signatures: 0 });
+    });
+  }
+
+  const encrypted = [
+    ["required encryption", { [`${identityPrefix}encryptionpolicy`]: 1 }],
+    ["unreadable encryption", { [`${identityPrefix}encryptionpolicy`]: undefined }],
+    ["wrong-type policy", { [`${identityPrefix}encryptionpolicy`]: "0" }],
+    ["OpenPGP automatic encryption", { [`${identityPrefix}openpgp_key_id`]: "key", [autoEnable]: true }],
+    ["S/MIME automatic encryption", { [`${identityPrefix}encryption_cert_name`]: "cert", [autoEnable]: true }],
+    ["unreadable automatic encryption", { [`${identityPrefix}openpgp_key_id`]: "key", [autoEnable]: undefined }],
+  ];
+  for (const [label, prefs] of encrypted) {
+    it(`refuses ${label} with saveDraft-specific review guidance`, async () => {
+      const h = loadSaveDraft({ prefs });
+      const result = await h.save({ sendAt: future() });
+      assert.match(result.error, /encryption/);
+      assert.match(result.error, /Omit sendAt to save a plain draft/);
+      assert.match(result.error, /sendMail with skipReview: false.*review window/);
+      assert.equal(h.sent.length, 0);
+      assert.deepEqual(h.calls, { attachments: 0, signatures: 0 });
+    });
+  }
+
+  it("checks the explicitly selected identity, including inherited defaults", async () => {
+    const h = loadSaveDraft({ prefs: { "mail.identity.selected.encryptionpolicy": 2 } });
+    assert.match((await h.save({ from: "selected@example.test", sendAt: future() })).error, /requires encryption/);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.calls.attachments, 0);
+    const inherited = loadSaveDraft({ prefs: { [`${identityPrefix}encryptionpolicy`]: 1 } });
+    assert.match((await inherited.save({ from: "selected@example.test", sendAt: future() })).error, /requires encryption/);
+    assert.equal(inherited.sent.length, 0);
+  });
+
+  for (const recipient of ["to", "cc", "bcc"]) {
+    it(`schedules with only ${recipient}, preserving headers and returning sendAt through dispatch`, async () => {
+      const h = loadSaveDraft();
+      const sendAt = future();
+      const result = await h.save({ to: "", [recipient]: "recipient@example.test", sendAt, inReplyTo: PARENT });
+      assert.equal(result.success, true, result.error);
+      assert.equal(result.sendAt, sendAt);
+      assert.equal(h.sent.length, 1);
+      assert.equal(h.sent[0].deliverMode, Ci.nsIMsgCompDeliverMode.SaveAsDraft);
+      assert.deepEqual([...h.composeFields.headers.keys()], ["In-Reply-To", "X-Send-Later-Uuid", "X-Send-Later-At"]);
+      assert.equal(h.composeFields.headers.get("X-Send-Later-Uuid"), "draft-test-instance");
+      assert.ok(Math.abs(Date.parse(h.composeFields.headers.get("X-Send-Later-At")) - Date.parse(sendAt)) < 1000);
+      assert.equal(h.composeFields.references, PARENT);
+      assert.equal(result.uuid, undefined);
+    });
+  }
+
+  for (const sendAt of [undefined, null]) {
+    it(`keeps a plain draft unchanged with sendAt=${sendAt}`, async () => {
+      const h = loadSaveDraft({ blocked: true, disabledTools: ["sendMail"], info: null,
+        prefs: { [`${identityPrefix}encryptionpolicy`]: undefined } });
+      const result = await h.save({ to: "", sendAt });
+      assert.equal(result.success, true, result.error);
+      assert.equal(result.sendAt, undefined);
+      assert.equal(h.composeFields.headers.size, 0);
+      assert.equal(h.sent.length, 1);
+    });
+  }
 });

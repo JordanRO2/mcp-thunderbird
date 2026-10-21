@@ -21,7 +21,11 @@ const READY = { uuid: "1f0e-uuid", version: "10.7.9", sendDrafts: true, checkTim
 
 function load(options = {}) {
   const blocked = options.blocked ?? false;
-  const context = vm.createContext({ isSkipReviewBlocked: () => blocked, Date });
+  const context = vm.createContext({
+    isSkipReviewBlocked: () => blocked,
+    isToolEnabled: name => !(options.disabledTools || []).includes(name),
+    Date,
+  });
   // An explicit `info: undefined` must reach the code as undefined.
   context.__tbMcpSendLaterInfo = Object.hasOwn(options, "info") ? options.info : READY;
   vm.runInContext(
@@ -61,6 +65,11 @@ describe("saveDraft sendAt (Send Later)", () => {
   it("refuses when the skipReview safety block is on", () => {
     const { resolveSendLaterSchedule } = load({ blocked: true });
     assert.match(resolveSendLaterSchedule(isoInMinutes(30)).error, /blocks skipReview/);
+  });
+
+  it("refuses when sendMail is disabled", () => {
+    const { resolveSendLaterSchedule } = load({ disabledTools: ["sendMail"] });
+    assert.match(resolveSendLaterSchedule(isoInMinutes(30)).error, /requires the sendMail tool/);
   });
 
   it("refuses when Send Later has not answered", () => {
