@@ -10,6 +10,7 @@ const {
   buildConnectionDiscoveryErrorMessage,
   compactToolResultJsonText,
   clearConnectionCache,
+  ATTACHMENT_TOOLS,
   discoverConnectionInfo,
   inlineAttachmentPaths,
   isSensitiveFilePath,
@@ -17,6 +18,7 @@ const {
   readConnectionInfo,
 } = require('./helpers/bridge.cjs');
 const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
+const { loadToolSchema } = require('./helpers/tool-schema.cjs');
 const WINDOWS_TEMP_SUBDIR = path.join('AppData', 'Local', 'Temp');
 
 function makeTempRoot() {
@@ -203,6 +205,20 @@ describe('Tool result serialization', () => {
     assert.equal(compacted.result.content[0].text, '{"inlineImages":1}');
     assert.strictEqual(compacted.result.content[1], imageBlock);
     assert.strictEqual(response.result.content[1], imageBlock);
+  });
+});
+
+describe('Bridge attachment tool routing', () => {
+  it('routes dryRunCompose through the same attachment handling as sendMail', () => {
+    for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage', 'dryRunCompose']) {
+      assert.ok(ATTACHMENT_TOOLS.has(name), `${name} must be inlined by the bridge`);
+    }
+  });
+
+  it('lists every production tool that accepts attachments', () => {
+    const names = new Set(loadToolSchema().buildTools().filter(tool => tool.inputSchema.properties.attachments).map(tool => tool.name));
+    assert.ok(names.has('sendMail') && names.has('dryRunCompose'));
+    for (const name of names) assert.ok(ATTACHMENT_TOOLS.has(name), `${name} accepts attachments but is not in ATTACHMENT_TOOLS`);
   });
 });
 

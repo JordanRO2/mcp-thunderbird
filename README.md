@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/47_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/48_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-128%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 47 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 48 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. The same block refuses `saveDraft` with `sendAt` for scheduled delivery through Send Later; plain drafts remain available. Re-enabling the block does not cancel already scheduled drafts. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
@@ -113,13 +113,18 @@ Structured MIME extraction keeps the first body's representation outside multipa
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
+| `dryRunCompose` | Read-only `sendMail` preflight with the same arguments and first refusal: resolves identity, counts effective recipients, inspects attachments, and assesses encoded size. Requires `sendMail` enabled |
 | `saveDraft` | Save a new or replacement draft without opening a window; supports threading headers, optional delayed delivery through Send Later (`sendAt`), and reports an accessible Drafts folder |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
 `sendMail`, `replyToMessage`, and `forwardMessage` open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference. The block also rejects `saveDraft` with `sendAt`. Direct sends and scheduled drafts are subject to the identity encryption checks under [Send Safety](#access-control). Attachments can be file paths or inline base64 objects.
 
-Direct sends go through Thunderbird's compose pipeline without opening a window, so provider senders such as Owl apply. The selected identity's Reply-To, automatic Cc/Bcc, return receipt, delivery status notification (DSN), and vCard settings apply too. Automatic Cc/Bcc recipients are not listed in tool results.
+Direct sends go through Thunderbird's compose pipeline without opening a window, so provider senders such as Owl apply. The selected identity's Reply-To, automatic Cc/Bcc, return receipt, delivery status notification (DSN), and vCard settings apply too. Automatic Cc/Bcc addresses are not echoed; `dryRunCompose` includes them in its recipient counts.
+
+Use `dryRunCompose` before `sendMail` to check the add-on's preparation without sending, saving, opening a window, creating native attachments, or writing/removing files. It takes the same arguments (including identity-based `isHtml` defaults) and reports the same first preflight refusal. This is not an SMTP or provider delivery check and does not predict other Thunderbird prompts or later changes to settings/files.
+
+The report includes `resolvedIdentity: { id, email, name }`, effective parsed-mailbox counts in `recipients` (including enabled automatic Cc/Bcc; empty groups do not count), and metadata for **caller attachments only** in `attachments`. `inputBodyLength` counts UTF-16 code units in the supplied body. `estimatedEncodedBytes`, when available, is a conservative byte estimate including prepared formatting/signature, headers, identity-added content such as a vCard, and encoding overhead; it is not the input length or an exact MIME size. An unbounded estimate is `null`. Size concerns are blockers for a dry direct send and `warnings` for a dry review window. No subject or signature-setting echo is returned. `sendAt` remains exclusive to `saveDraft`.
 
 Allowed unreviewed sends, including Send Later deliveries, are never encrypted or cryptographically signed, including for identities set to sign by default. The text signature controlled by `includeSignature` is separate from cryptographic signing. Use `skipReview: false` for the review window, where Thunderbird applies its own encryption and signing decisions.
 
@@ -256,6 +261,8 @@ Each event includes `organizer: { id, commonName }`, up to 100 `attendees`, `att
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
+`dryRunCompose` also requires `sendMail` to be enabled: disabling its parent hides it from `tools/list` and refuses calls. Options reflects this dependency immediately, including unsaved parent changes, while preserving the child's separate enabled/disabled choice.
+
 The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`. It also refuses `saveDraft` with `sendAt`; re-enabling the block does not cancel already scheduled drafts. It also blocks adding attendees and makes meetings with attendees other than the calendar user read-only through MCP: `updateEvent` and `deleteEvent` reject every write, including time/description/recurrence edits, attendee removal, and occurrence deletion, even when `attendees` is omitted. Occurrence writes check both the series and selected occurrence; series writes also check stored exceptions. Events without attendees and events whose only attendee is the identified calendar user remain editable. If the calendar identity cannot be established, existing attendees cannot be treated as self-only. Disabling the setting permits these writes, which may email updates or cancellations without review. Event/task creation review dialogs remain available without attendees.
 
 Even with **Block `skipReview`** disabled, unreviewed mail is refused before sending or scheduling when:
@@ -267,6 +274,13 @@ Even with **Block `skipReview`** disabled, unreviewed mail is refused before sen
 For sends, these refusals direct callers to `skipReview: false`, where Thunderbird applies its own encryption in the review window. For `saveDraft`, omit `sendAt` to save a plain draft, or send through `sendMail`'s review window. The checks do not reproduce every compose-window encryption decision. Signing by default, attaching a public key, draft encryption, and subject protection settings alone do not cause refusals. Review windows, plain `saveDraft` calls without `sendAt`, and `replyToMessage(saveAsDraft: true)` retain their existing behavior, including the automatic reply draft's encrypted-message privacy gate.
 
 For an unreviewed reply or forward, the complete stored original must pass raw MIME checks before Thunderbird's structured parser runs. Preflight retrieves uncached IMAP originals as raw bytes without MIME conversion, allows at most 50 MiB of raw MIME and 50 MiB of structured body text, and refuses HTML above the existing 2 MiB parsing limit. If retrieval fails, use review or make the folder available offline and retry. Incomplete, truncated, oversized, or unclassifiable content requires review. Preflight has a 15-second deadline; a late parser callback cannot resume a refused call. Caller attachment files are accessed or created only after all encryption checks pass.
+
+Additional guards apply to direct `skipReview: true` mail calls:
+
+- `sendMail` refuses zero effective recipients, counting parsed mailboxes and enabled identity automatic Cc/Bcc. Empty review windows remain allowed.
+- `sendMail`, `replyToMessage`, and `forwardMessage` refuse when the conservative encoded-size estimate exceeds a positive `mailnews.message_warning_size`. Equality is allowed. An unreadable threshold or an estimate that cannot be safely bounded also requires review; a threshold of zero or below disables this size gate. The add-on never changes the preference.
+
+The estimate includes MIME/encoding overhead, dynamic headers, prepared body/signature and caller attachments. Replies and forwards additionally budget from the complete raw original, including original forward attachments, and check the assembled quote before materializing caller attachments. Estimates deliberately err high and can require review even when the eventual MIME file would fit. Use `skipReview: false` for these refusals. Thunderbird's native large-message dialog can outlive a send timeout, which is why the add-on checks before unreviewed delivery. These guards do not change Send Later scheduling checks or cancel existing schedules.
 
 The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
 
@@ -351,7 +365,9 @@ That's it. Your AI can now access Thunderbird.
 
 ### Outgoing attachments
 
-For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
+For `sendMail`, `dryRunCompose`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
+
+For `dryRunCompose`, the extension inspects path metadata and inline base64 shape without decoding or materializing attachments. The stdio bridge still reads path attachments to inline them first; a refused path is a tool error rather than a report blocker. Disabling a tool does not prevent this pre-existing bridge path inspection. Hardening the bridge to consult tool availability before inspecting paths is outside this change.
 
 UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
 
@@ -437,7 +453,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 47 MCP tools + auth + access control
+│       ├── api.js              # All 48 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/

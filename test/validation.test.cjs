@@ -18,7 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require('./helpers/direct-send-prefs.cjs');
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser } = require('./helpers/direct-send-prefs.cjs');
 
 const apiSource = fs.readFileSync(
   path.resolve(__dirname, '../extension/mcp_server/api.js'),
@@ -35,7 +35,7 @@ function getMarkedApiSnippet(startMarker, endMarker) {
 
 const messageHeaderLimits = getMarkedApiSnippet('// BEGIN MESSAGE HEADER LIMITS', '// END MESSAGE HEADER LIMITS');
 
-function loadProductionAttachmentValidation(overrides = {}) {
+function loadProductionAttachmentValidation(overrides = {}, transform = code => code) {
   const sandbox = {
     ...clearOriginalRawFixture,
     getConfiguredGetMessagesLimit: () => 20,
@@ -46,7 +46,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     ...overrides,
   };
   vm.createContext(sandbox);
-  vm.runInContext([
+  vm.runInContext(transform([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
     getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
     getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
@@ -63,14 +63,17 @@ function loadProductionAttachmentValidation(overrides = {}) {
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
     getMarkedApiSnippet('// BEGIN ATTACHMENT EXPORT DIRECTORY', '// END ATTACHMENT EXPORT DIRECTORY'),
+    getMarkedApiSnippet('// BEGIN COMPOSE ACCOUNT KEY', '// END COMPOSE ACCOUNT KEY'),
+    getMarkedApiSnippet('// BEGIN COMPOSE SIZE GUARD', '// END COMPOSE SIZE GUARD'),
     'Object.assign(this, { composeMail, saveDraft, replyToMessage, forwardMessage, isSensitiveFilePath, ensureAttachmentDir, descsToMsgAttachments, addAttachmentsToComposeWindow });',
     'this.isValidBase64 = isValidBase64;',
     'this.buildTools = buildTools;',
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
+    'this.dryRunCompose = dryRunCompose;',
     'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
     'this.maxHeaderBatchIds = MAX_HEADER_BATCH_IDS;',
-  ].join('\n'), sandbox);
+  ].join('\n')), sandbox);
   if (sandbox.server) {
     vm.runInContext([
       getMarkedApiSnippet('// BEGIN INLINE IMAGE CONTENT HELPERS', '// END INLINE IMAGE CONTENT HELPERS'),
@@ -126,7 +129,7 @@ function loadProductionContactTools() {
   const constantsEnd = source.indexOf('const CONTACT_ADDRESS_FIELDS =', constantsStart);
   const buildToolsStart = source.indexOf('function buildTools()');
   const fieldsStart = source.indexOf('const contactFieldProperties =', buildToolsStart);
-  const fieldsEnd = source.indexOf('\n      return [', fieldsStart);
+  const fieldsEnd = source.indexOf('\n      const definitions = [', fieldsStart);
   const getContactName = source.indexOf('name: "getContact"', fieldsEnd);
   const contactToolsStart = source.lastIndexOf('      {', getContactName);
   const deleteContactName = source.indexOf('name: "deleteContact"', getContactName);
@@ -1861,7 +1864,7 @@ describe('Attachment policy parity', () => {
 // Uses the production conversion and mail entry points with in-memory XPCOM
 // substitutes. No Thunderbird profile, server, or native compose window is used.
 function makeOutboundMailRuntime(options = {}) {
-  const state = { sent: 0, drafts: 0, windows: 0, fileCalls: 0, mimeReads: 0, dirCalls: 0, created: new Set(), removed: [], openStreams: 0 };
+  const state = { writes: 0, decodes: 0, native: 0, params: 0, fields: 0, sent: 0, drafts: 0, windows: 0, fileCalls: 0, mimeReads: 0, dirCalls: 0, created: new Set(), removed: [], openStreams: 0 };
   function tempFile(filePath) {
     return {
       ...makeMockLocalFile(filePath),
@@ -1879,13 +1882,14 @@ function makeOutboundMailRuntime(options = {}) {
   }
   const runtime = loadProductionAttachmentValidation({
     console: { warn() {}, error() {} },
-    atob: data => Buffer.from(data, 'base64').toString('binary'),
+    atob: data => { state.decodes++; return Buffer.from(data, 'base64').toString('binary'); },
     createLocalFile(filePath) {
       state.fileCalls++;
       const normalizedPath = options.realTmpDir && filePath.startsWith(options.tmpDir + '/')
         ? options.realTmpDir + filePath.slice(options.tmpDir.length) : filePath;
       return options.files?.get(filePath) || makeMockLocalFile(filePath, { exists: !filePath.includes('missing'), normalizedPath });
     },
+    MailServices: { headerParser: composeHeaderParser, accounts: { accounts: [{ key: 'account', identities: [{ key: 'sender' }, { key: 'id1' }] }] } },
     Services: {
       prefs: makeDirectSendPrefs(),
       appinfo: { OS: options.os || 'Linux' },
@@ -1907,15 +1911,15 @@ function makeOutboundMailRuntime(options = {}) {
     },
     Cc: {
       '@mozilla.org/timer;1': { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
-      '@mozilla.org/messengercompose/attachment;1': { createInstance: () => new Proxy({}, {
+      '@mozilla.org/messengercompose/attachment;1': { createInstance: () => { state.native++; return new Proxy({}, {
         set(target, prop, value) {
           if (options.descriptorError && prop === 'name' && value === 'broken.pdf') throw new Error('invalid native attachment');
           target[prop] = value;
           return true;
         },
-      }) },
-      '@mozilla.org/messengercompose/composeparams;1': { createInstance: () => ({}) },
-      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => ({ addAttachment() {} }) },
+      }); } },
+      '@mozilla.org/messengercompose/composeparams;1': { createInstance: () => { state.params++; return {}; } },
+      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => { state.fields++; return { addAttachment() {}, setHeader() {} }; } },
       '@mozilla.org/messengercompose;1': { getService: () => ({ OpenComposeWindowWithParams() { state.windows++; } }) },
       '@mozilla.org/network/file-output-stream;1': { createInstance: () => ({
         init(file, flags) {
@@ -1927,7 +1931,7 @@ function makeOutboundMailRuntime(options = {}) {
       }) },
       '@mozilla.org/binaryoutputstream;1': { createInstance: () => ({
         setOutputStream() {},
-        writeByteArray() { if (options.writeError) throw new Error('write failed'); },
+        writeByteArray() { state.writes++; if (options.writeError) throw new Error('write failed'); },
         close() {},
       }) },
     },
@@ -1956,25 +1960,40 @@ function makeOutboundMailRuntime(options = {}) {
         },
       };
     } },
-  });
+  }, options.transform);
   // Both send paths must trip the existing no-send assertions.
   runtime.sendThroughCompose = runtime.sendMessageDirectly;
   runtime._tempAttachFiles.add('/prior-call.txt');
   return { runtime, state };
 }
 
+// Reuse the existing HTTP fixture below for validation + dispatch tests.
+function dispatchHttpBody(state, body) {
+  return new Promise(resolve => {
+    let output = '';
+    state.dispatch({
+      method: 'POST', body,
+      getHeader: key => key === 'Authorization' ? 'Bearer fixture-token' : String(Buffer.byteLength(body)),
+    }, {
+      processAsync() {}, setStatusLine() {}, setHeader() {},
+      write(text) { output += text; },
+      finish() { resolve(JSON.parse(output)); },
+    });
+  });
+}
+
 describe('Outbound attachment failures are atomic', () => {
   it('observes a successful compose send with the same counter used by no-send assertions', async () => {
     const { runtime, state } = makeOutboundMailRuntime();
-    const result = await runtime.composeMail('to@example.com', 'subject', 'body', null, null, false, null, [], true);
+    const result = await runtime.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: [], skipReview: true });
     assert.equal(result.success, true);
     assert.equal(state.sent, 1);
     assert.equal(state.drafts + state.windows + state.mimeReads, 0);
   });
 
   const calls = [
-    ['sendMail direct', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, true)],
-    ['sendMail review', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, false)],
+    ['sendMail direct', (r, a) => r.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: a, skipReview: true })],
+    ['sendMail review', (r, a) => r.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: a, skipReview: false })],
     ['saveDraft', (r, a) => r.saveDraft('to@example.com', 'subject', 'body', null, null, false, null, a)],
     ['replyToMessage direct', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, true)],
     ['replyToMessage review', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, false)],
@@ -1997,7 +2016,8 @@ describe('Outbound attachment failures are atomic', () => {
         assert.equal(state.windows, 0);
         assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
         assert.equal(state.created.size, 0);
-        assert.equal(state.removed.length, 1);
+        assert.equal(state.removed.length, 0);
+        assert.equal(state.writes + state.decodes + state.native, 0);
         assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
       });
     }
@@ -2210,24 +2230,14 @@ describe('Outbound attachment failures are atomic', () => {
             ]),
           } },
         });
-        const response = await new Promise(resolve => {
-          let output = '';
-          state.dispatch({
-            method: 'POST', body,
-            getHeader: key => key === 'Authorization' ? 'Bearer fixture-token' : String(Buffer.byteLength(body)),
-          }, {
-            processAsync() {}, setStatusLine() {}, setHeader() {},
-            write(text) { output += text; },
-            finish() { resolve(JSON.parse(output)); },
-          });
-        });
+        const response = await dispatchHttpBody(state, body);
         assert.equal(response.error, undefined);
         const result = JSON.parse(response.result.content[0].text);
         assert.match(result.error, /Attachments refused:.*\/home\/user\/\.env/);
-        // Reaching both path conversion and inline temp creation proves coercion
-        // succeeded before the denied entry failed the production policy check.
+        // The parsed array reaches path inspection, but refusal precedes all writes.
         assert.equal(state.fileCalls, 1);
-        assert.equal(state.removed.length, 1);
+        assert.equal(state.removed.length, 0);
+        assert.equal(state.writes + state.decodes + state.native, 0);
         assert.equal(state.created.size, 0);
         assert.equal(state.sent + state.drafts + state.windows, 0);
         assert.equal(state.mimeReads, skipReview && ['replyToMessage', 'forwardMessage'].includes(name) ? 1 : 0);
@@ -2491,5 +2501,670 @@ describe(`Validation: ${HEADER_BATCH_TOOL}`, () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /at least 1 character/);
+  });
+});
+
+describe('Validation: dryRunCompose schema', () => {
+  it('accepts minimal required fields (to, subject, body)', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello there',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts all optional scalar fields', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      cc: 'bob@example.com',
+      bcc: 'carol@example.com',
+      isHtml: true,
+      from: 'me@example.com',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects when required field is missing', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: body/);
+  });
+
+  it('rejects isHtml as string', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      isHtml: 'true',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be boolean/);
+  });
+
+  it('accepts skipReview and includeSignature like sendMail', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      skipReview: true,
+      includeSignature: false,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects unknown top-level parameter', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      bogus: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: bogus/);
+  });
+
+  it('accepts attachments as array of file-path strings', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: ['/home/user/report.pdf', '/tmp/data.csv'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts inline attachment with required name + base64', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', base64: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Same inline-attachment schema as sendMail: an entry with neither base64
+  // nor content is rejected by the validator.
+  it('rejects inline {name} with neither base64 nor content', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt' }],
+    });
+    assert.ok(errors.length > 0);
+  });
+
+  it('accepts inline attachment using the content alias for base64', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', content: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachments as a non-array', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: '/home/user/report.pdf',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+});
+
+
+describe('dryRunCompose behavior', () => {
+  function makeRuntime(options = {}) {
+    const { runtime, state } = makeOutboundMailRuntime(options);
+    runtime.isSkipReviewBlocked = () => options.skipReviewBlocked !== false;
+    runtime.setComposeIdentity = (params, from) => {
+      if (from === 'nobody@example.com') return { error: 'unknown identity: nobody@example.com -- no matching account configured in Thunderbird' };
+      params.identity = { key: 'id1', email: 'me@example.com', fullName: 'Me' };
+      return '';
+    };
+    runtime.resolveComposeFormat = (_identity, isHtml) => ({ useHtml: isHtml === true, format: 0 });
+    runtime.MailServices.headerParser = {
+      ...composeHeaderParser,
+      parseDecodedHeader(header, groups) {
+        assert.equal(groups, false);
+        return (header.match(/(?:[^,"]|"[^"]*")+/g) || []).map(email => ({ email }));
+      },
+    };
+    return { runtime, state };
+  }
+  const noSideEffects = state => {
+    assert.equal(state.sent, 0);
+    assert.equal(state.drafts, 0);
+    assert.equal(state.windows, 0);
+    assert.equal(state.mimeReads, 0);
+    assert.equal(state.created.size, 0);
+    assert.equal(state.removed.length, 0);
+    assert.equal(state.writes + state.decodes + state.native + state.params + state.fields, 0);
+  };
+
+  it('reports a clean call without writing, sending or opening anything', () => {
+    const { runtime, state } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com, b@example.com', subject: 'subj', body: 'body text', cc: 'c@example.com', isHtml: true, attachments: [
+      '/home/user/Documents/report.pdf',
+      { name: 'inline.txt', content: 'QUJDREVG' },
+    ] });
+    assert.equal(result.wouldSucceed, true);
+    assert.deepEqual(Array.from(result.blockers), []);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.recipients)), { to: 2, cc: 1, bcc: 0 });
+    assert.equal(result.inputBodyLength, 9);
+    assert.equal(result.isHtml, true);
+    assert.equal(result.mode, 'review-window');
+    assert.equal(result.resolvedIdentity.email, 'me@example.com');
+    assert.equal(result.attachments.length, 2);
+    assert.equal(result.attachments[1].size, 6);
+    noSideEffects(state);
+    assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
+  });
+
+  it('inline attachments are not decoded or written', () => {
+    const { runtime, state } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [{ name: 'x.bin', base64: 'QQ==' }] });
+    assert.equal(result.wouldSucceed, true);
+    assert.equal(result.attachments[0].size, 1);
+    noSideEffects(state);
+  });
+
+  it('reports the same attachment refusals as the real path', () => {
+    for (const invalid of ['/home/user/.env', '/home/user/missing.pdf', { name: 'invalid.bin', base64: '%%%%' }]) {
+      const { runtime, state } = makeRuntime();
+      const dry = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [invalid] });
+      const real = runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [invalid], skipReview: false });
+      assert.equal(dry.wouldSucceed, false);
+      assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
+      assert.equal(state.windows, 0);
+    }
+  });
+
+  it('reports a blocked skipReview exactly like the real path, and honors it when allowed', () => {
+    const { runtime } = makeRuntime();
+    const blocked = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true });
+    assert.equal(blocked.wouldSucceed, false);
+    assert.equal(blocked.mode, 'direct-send');
+    assert.equal(blocked.blockers[0], runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true }).error);
+    const { runtime: open } = makeRuntime({ skipReviewBlocked: false });
+    assert.equal(open.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true }).wouldSucceed, true);
+  });
+
+  it('surfaces an unresolvable from identity', () => {
+    const { runtime } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, from: 'nobody@example.com' });
+    assert.equal(result.wouldSucceed, false);
+    assert.match(result.blockers[0], /unknown identity/);
+    assert.equal(result.resolvedIdentity, null);
+    assert.equal(result.estimatedEncodedBytes, null);
+    assert.equal(result.warningThresholdBytes, null);
+  });
+
+  it('is refused through shared dependency access when sendMail is disabled and probes no paths', async () => {
+    const { loadPrivacyRuntime } = require('./helpers/privacy-access.cjs');
+    const access = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: '["sendMail"]' } });
+    const { runtime, state } = makeRuntime({ dispatch: true });
+    runtime.isToolEnabled = access.isToolEnabled;
+    const response = await dispatchHttpBody(state, JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dryRunCompose', arguments: {
+        to: 'a@example.com', subject: 's', body: 'b', attachments: ['/home/user/Documents/report.pdf'],
+      } },
+    }));
+    assert.match(response.error.message, /Tool is disabled/);
+    assert.equal(state.fileCalls, 0);
+    noSideEffects(state);
+  });
+
+  it('fails a direct send with no recipients, but not a review window', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const direct = runtime.dryRunCompose({ to: '', subject: 's', body: 'b', cc: '', isHtml: false, skipReview: true });
+    assert.equal(direct.wouldSucceed, false);
+    assert.match(direct.blockers[0], /at least one recipient/);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', bcc: 'x@example.com', isHtml: false, skipReview: true }).wouldSucceed, true);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', isHtml: false, skipReview: false }).wouldSucceed, true);
+  });
+
+  it('counts parsed recipients without echoing caller-only fields', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const review = runtime.dryRunCompose({ to: '"Doe, Jane" <j@example.com>, k@example.com', subject: 's', body: 'b', isHtml: false });
+    assert.equal(review.recipients.to, 2);
+    assert.equal(review.includeSignature, undefined);
+    assert.equal(review.subject, undefined);
+    const direct = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true, includeSignature: false });
+    assert.equal(direct.includeSignature, undefined);
+  });
+
+  it('derives inline sizes that match the real decoded size, including padding', () => {
+    for (const raw of ['A', 'AB', 'ABC', 'ABCD', 'ABCDE']) {
+      const b64 = Buffer.from(raw).toString('base64');
+      const { runtime } = makeRuntime();
+      const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [{ name: 'x.bin', base64: b64 }] });
+      assert.equal(result.attachments[0].size, Buffer.from(b64, 'base64').length, b64);
+    }
+  });
+
+  it('applies the aggregate attachment limit to inline entries like the real path', () => {
+    const { runtime } = makeRuntime();
+    const chunk = 'A'.repeat(20 * 1024 * 1024); // 15 MiB decoded each
+    const entries = [1, 2, 3, 4].map(i => ({ name: `part${i}.bin`, base64: chunk }));
+    const dry = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries });
+    const real = runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries, skipReview: false });
+    assert.equal(dry.wouldSucceed, false);
+    assert.match(dry.blockers[0], /aggregate attachment limit/);
+    assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
+  });
+
+  it('enforces the attachment count limit', () => {
+    const { runtime } = makeRuntime();
+    const many = Array.from({ length: runtime.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE + 1 }, () => '/home/user/Documents/report.pdf');
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: many });
+    assert.equal(result.wouldSucceed, false);
+    assert.match(result.blockers[0], /attachment limit/);
+  });
+});
+
+
+describe('Shared compose preparation through production dispatch', () => {
+  const { loadToolSchema } = require('./helpers/tool-schema.cjs');
+  const args = { to: 'to@example.com', subject: 'subject', body: 'body', skipReview: true };
+  const extraSchema = {
+    type: 'object', description: 'fixture argument',
+    properties: { description: { type: 'string', minLength: 2, description: 'field named description' },
+      count: { type: 'integer', minimum: 1, maximum: 4, default: 2 } },
+    required: ['description'], additionalProperties: false,
+    default: { description: 'preserve default data' },
+  };
+  const extendSchema = code => code.replace(
+    '      definitions.find(tool => tool.name === "dryRunCompose").inputSchema =',
+    `      definitions.find(tool => tool.name === "sendMail").inputSchema.properties.futureArgument = ${JSON.stringify(extraSchema)};
+      definitions.find(tool => tool.name === "dryRunCompose").inputSchema =`
+  );
+
+  it('derives all constraints and defaults recursively, preserving properties named description', () => {
+    const runtime = loadToolSchema(extendSchema);
+    const tools = runtime.buildTools();
+    const real = tools.find(tool => tool.name === 'sendMail').inputSchema;
+    const dry = tools.find(tool => tool.name === 'dryRunCompose').inputSchema;
+    // Independent expected projection: explicit mutation of descriptions known
+    // to this fixture, plus JSON replacer for the existing sendMail schema.
+    const existing = loadToolSchema().buildTools().find(tool => tool.name === 'sendMail').inputSchema;
+    const expected = JSON.parse(JSON.stringify(existing, (key, value) => key === 'description' ? undefined : value));
+    const fixture = structuredClone(extraSchema);
+    delete fixture.description;
+    delete fixture.properties.description.description;
+    expected.properties.futureArgument = fixture;
+    assert.deepEqual(JSON.parse(JSON.stringify(dry)), expected);
+    assert.equal(real.properties.futureArgument.description, 'fixture argument');
+    assert.equal(dry.properties.futureArgument.default.description, 'preserve default data');
+    assert.equal(dry.properties.dryRun, undefined);
+    assert.equal(dry.properties.sendAt, undefined);
+  });
+
+  it('validates a fixture-added argument and passes the complete object to shared validation through BOTH HTTP paths', async () => {
+    const { runtime, state } = makeOutboundMailRuntime({ dispatch: true, transform: extendSchema });
+    const seen = [];
+    const prepare = runtime.prepareCompose;
+    runtime.prepareCompose = value => {
+      seen.push(value.futureArgument);
+      const plan = prepare(value);
+      assert.equal(plan.error, undefined);
+      return { error: `fixture validation: ${value.futureArgument.description}` };
+    };
+    for (const name of ['sendMail', 'dryRunCompose']) {
+      const invoke = futureArgument => dispatchHttpBody(state, JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: { ...args, futureArgument } },
+      }));
+      const invalid = await invoke({ description: 'x' });
+      assert.match(invalid.error.message, /futureArgument.description/);
+      const response = await invoke({ description: 'checked', count: 2 });
+      const result = JSON.parse(response.result.content[0].text);
+      assert.equal(name === 'sendMail' ? result.error : result.blockers[0], 'fixture validation: checked');
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(seen)), Array(2).fill({ description: 'checked', count: 2 }));
+    assert.equal(state.writes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+  });
+
+  it('uses the same FIRST refusal for skipReview, identity encryption, ownership and attachments', async () => {
+    for (const failure of ['block', 'identity', 'encryption', 'account', 'attachment']) {
+      const { runtime, state } = makeOutboundMailRuntime({ dispatch: true });
+      runtime.isSkipReviewBlocked = () => failure === 'block';
+      if (failure === 'identity') runtime.setComposeIdentity = () => ({ error: 'unknown identity' });
+      if (failure === 'encryption') runtime.Services.prefs = makeDirectSendPrefs({ 'mail.identity.sender.encryptionpolicy': 2 });
+      if (failure === 'account') runtime.MailServices.accounts.accounts = [];
+      const results = [];
+      for (const name of ['sendMail', 'dryRunCompose']) {
+        const response = await dispatchHttpBody(state, JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+            name, arguments: { ...args, attachments: ['/home/user/.env'] },
+          },
+        }));
+        const result = JSON.parse(response.result.content[0].text);
+        results.push(name === 'sendMail' ? result.error : result.blockers[0]);
+        if (name === 'dryRunCompose') assert.equal(result.blockers.length, 1);
+      }
+      assert.equal(results[0], results[1]);
+      assert.match(results[0], { block: /blocks skipReview/, identity: /unknown identity/,
+        encryption: /requires encryption/, account: /owning account/, attachment: /Attachments refused/ }[failure]);
+      assert.equal(state.writes + state.decodes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+    }
+  });
+
+  it('runs real restricted-account fallback, owning-account resolution and identity format defaults', () => {
+    const { runtime } = makeOutboundMailRuntime();
+    const blocked = { key: 'blocked', defaultIdentity: { key: 'blocked-id', email: 'blocked@example.com' } };
+    const allowed = { key: 'allowed', defaultIdentity: { key: 'fallback', email: 'fallback@example.com', fullName: 'Fallback', composeHtml: true } };
+    for (const account of [blocked, allowed]) account.identities = [account.defaultIdentity];
+    runtime.MailServices.accounts = { accounts: [blocked, allowed], defaultAccount: blocked };
+    runtime.getAccessibleAccounts = () => [allowed];
+    runtime.isAccountAllowed = key => key === 'allowed';
+    runtime.Ci.nsIMsgCompFormat = { Default: 0, HTML: 1, PlainText: 2 };
+    vm.runInContext([
+      getMarkedApiSnippet('function findIdentityIn(', '/** Creates an nsIFile instance'),
+      getMarkedApiSnippet('// BEGIN COMPOSE IDENTITY HELPER', '// END COMPOSE IDENTITY HELPER'),
+      getMarkedApiSnippet('// BEGIN COMPOSE FORMAT HELPER', '// END COMPOSE FORMAT HELPER'),
+    ].join('\n'), runtime);
+    for (const isHtml of [undefined, null, true, false]) {
+      const result = runtime.dryRunCompose({ ...args, isHtml });
+      assert.equal(result.wouldSucceed, true);
+      assert.deepEqual(JSON.parse(JSON.stringify(result.resolvedIdentity)), { id: 'fallback', email: 'fallback@example.com', name: 'Fallback' });
+      assert.equal(result.isHtml, isHtml !== false);
+      assert.equal(runtime.prepareCompose({ ...args, isHtml }).accountKey, 'allowed');
+    }
+    assert.match(runtime.dryRunCompose({ ...args, from: blocked.defaultIdentity.email }).blockers[0], /restricted account/);
+    assert.match(runtime.dryRunCompose({ ...args, from: 'unknown' }).blockers[0], /unknown identity/);
+    assert.equal(runtime.dryRunCompose({ ...args, from: 'FALLBACK@example.com' }).wouldSucceed, true);
+  });
+});
+
+
+describe('Direct send recipient preflight', () => {
+  const base = { to: '', subject: 'subject', body: 'body', skipReview: true };
+  const group = 'Team: "Doe, Jane" <j@example.com>, k@example.com;';
+  const emptyGroup = 'Undisclosed:;';
+  const auto = 'archive@example.com';
+  const caller = 'other@example.com';
+  for (const field of ['cc', 'bcc']) {
+    it(`deduplicates caller ${field} even when its enabled automatic list is empty`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      let merges = 0;
+      runtime.setComposeIdentity = params => { params.identity = {
+        key: 'sender', doCc: field === 'cc', doBcc: field === 'bcc', doCcList: '', doBccList: '',
+      }; };
+      runtime.MailServices.headerParser = {
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(header, `${caller}, ${caller}`);
+          assert.equal(automatic, '');
+          merges++;
+          return caller;
+        },
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(header, caller);
+          assert.equal(preserveGroups, false);
+          return [{ email: caller }];
+        },
+      };
+      const request = { ...base, [field]: `${caller}, ${caller}` };
+      const dry = runtime.dryRunCompose(request);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.recipients[field], 1);
+      assert.equal(state.sent + state.writes + state.decodes + state.native + state.params, 0);
+      assert.equal((await runtime.composeMail(request)).success, true);
+      assert.equal(merges, 2);
+      assert.equal(state.sent, 1);
+    });
+  }
+  for (const config of [
+    { to: '', expected: 0 },
+    { to: '   ', expected: 0 },
+    { to: emptyGroup, expected: 0 },
+    { to: group, expected: 2 },
+    { identity: { doCc: true, doCcList: auto }, expected: 1, field: 'cc' },
+    { identity: { doBcc: true, doBccList: auto }, expected: 1, field: 'bcc' },
+    { identity: { doCc: false, doCcList: auto, doBcc: false, doBccList: auto }, expected: 0 },
+    { identity: { doCc: true, doCcList: emptyGroup }, expected: 0 },
+    { cc: auto + ', ' + caller, identity: { doCc: true, doCcList: auto }, expected: 2, field: 'cc' },
+  ]) {
+    it(`counts native flattened mailboxes and automatic fields: ${JSON.stringify(config)}`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      runtime.setComposeIdentity = params => { params.identity = { key: 'sender', ...config.identity }; };
+      const merged = auto + ', ' + caller;
+      runtime.MailServices.headerParser = {
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(preserveGroups, false);
+          const mailboxes = new Map([
+            [emptyGroup, []], [group, ['j@example.com', 'k@example.com']],
+            [auto, [auto]], [merged, [auto, caller]], ['   ', []],
+          ]).get(header);
+          assert.ok(mailboxes, `Unexpected header ${header}`);
+          return mailboxes.map(email => ({ email }));
+        },
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(automatic, config.identity.doCcList || config.identity.doBccList);
+          assert.ok(header === '' || header === merged);
+          return header ? caller : '';
+        },
+      };
+      const args = { ...base, to: config.to || '', cc: config.cc || '' };
+      const dry = runtime.dryRunCompose(args);
+      assert.equal(dry.wouldSucceed, config.expected > 0);
+      assert.equal(state.writes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+      if (config.expected) {
+        assert.equal(dry.recipients[config.field || 'to'], config.expected);
+        const real = await runtime.composeMail(args);
+        assert.equal(real.success, true);
+        assert.equal(state.sent, 1);
+      } else {
+        const real = runtime.composeMail({ ...args, attachments: ['/home/user/.env'] });
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /at least one recipient/);
+        assert.equal(state.fileCalls + state.writes + state.native + state.params + state.fields + state.sent, 0);
+        assert.equal(runtime.dryRunCompose({ ...args, skipReview: false }).wouldSucceed, true);
+      }
+    });
+  }
+});
+
+describe('Conservative compose size preflight', () => {
+  const thresholdPref = 'mailnews.message_warning_size';
+  const args = { to: 'to@example.com', subject: 'subject', body: 'Body', skipReview: true };
+  // Reuse the production signature/format loaders and instrumented filesystem.
+  function makeRuntime({ identity = {}, prefs = {} } = {}) {
+    const h = makeOutboundMailRuntime();
+    h.runtime.Services.prefs = makeDirectSendPrefs(prefs);
+    h.runtime.setComposeIdentity = params => {
+      params.identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, ...identity };
+    };
+    h.runtime.Ci.nsIMsgCompFormat = { Default: 0, HTML: 1, PlainText: 2 };
+    vm.runInContext([
+      getMarkedApiSnippet('function escapeHtml(s) {', '// BEGIN MESSAGE TEXT CONVERSION'),
+      getMarkedApiSnippet('// BEGIN COMPOSE HTML FRAGMENT', '// END COMPOSE HTML FRAGMENT'),
+      getMarkedApiSnippet('// BEGIN COMPOSE SIGNATURE HELPERS', '// END COMPOSE SIGNATURE HELPERS'),
+      getMarkedApiSnippet('// BEGIN COMPOSE FORMAT HELPER', '// END COMPOSE FORMAT HELPER'),
+    ].join('\n'), h.runtime);
+    return h;
+  }
+  const noExecution = state => {
+    assert.equal(state.writes + state.decodes + state.native + state.params + state.fields + state.sent + state.windows + state.drafts, 0);
+    assert.equal(state.removed.length, 0);
+  };
+
+  it('uses padded base64 with 72-column CRLFs, including exact multiples and the terminal blank line', () => {
+    const { runtime } = makeRuntime();
+    for (const [raw, expected] of [[0, 2], [1, 6], [2, 6], [3, 6], [4, 10], [53, 76], [54, 76], [55, 80], [108, 150]]) {
+      assert.equal(runtime.getComposeBase64Size(raw), expected, String(raw));
+    }
+    const textSize = runtime.getComposeTextSize(1000);
+    assert.ok(textSize > 3000, 'QP and soft breaks exceed the tempting base64-only bound');
+  });
+
+  it('allows equality and refuses only greater estimates, with the same dry-run blocker before materialization', async () => {
+    const attachments = [{ name: 'payload.bin', contentType: 'application/octet-stream', base64: Buffer.alloc(54).toString('base64') }];
+    const { runtime } = makeRuntime();
+    const estimate = runtime.dryRunCompose({ ...args, attachments }).estimatedEncodedBytes;
+    assert.ok(estimate > 76);
+    for (const [threshold, allowed] of [[estimate - 1, false], [estimate, true], [estimate + 1, true]]) {
+      const h = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const dry = h.runtime.dryRunCompose({ ...args, attachments });
+      assert.equal(dry.wouldSucceed, allowed);
+      assert.equal(dry.estimatedEncodedBytes, estimate);
+      assert.equal(dry.warningThresholdBytes, threshold);
+      noExecution(h.state);
+      const real = await h.runtime.composeMail({ ...args, attachments });
+      if (allowed) {
+        assert.equal(real.success, true, real.error);
+        assert.equal(h.state.sent, 1);
+        assert.equal(h.state.writes, 1);
+      } else {
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /skipReview: false/);
+        noExecution(h.state);
+      }
+    }
+  });
+
+  for (const threshold of [0, -1]) {
+    it(`does not gate sizes when the user's threshold is ${threshold}`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const result = runtime.dryRunCompose({ ...args, body: 'x'.repeat(1000000) });
+      assert.equal(result.wouldSucceed, true);
+      assert.ok(result.estimatedEncodedBytes > 3000000);
+      assert.equal(result.warningThresholdBytes, threshold);
+      noExecution(state);
+    });
+  }
+
+  for (const threshold of [undefined, 'large', 1.5, NaN]) {
+    it(`fails closed on an invalid threshold (${String(threshold)}) while review remains available`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const direct = runtime.dryRunCompose(args);
+      assert.equal(direct.wouldSucceed, false);
+      assert.match(direct.blockers[0], /threshold could not be read/);
+      const review = runtime.dryRunCompose({ ...args, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.match(review.warnings[0], /threshold could not be read/);
+      assert.equal(runtime.composeMail(args).error, direct.blockers[0]);
+      noExecution(state);
+    });
+  }
+
+  it('refuses failed preference reads without writing preferences or executing compose', () => {
+    const { runtime, state } = makeRuntime();
+    const prefs = runtime.Services.prefs;
+    runtime.Services.prefs = new Proxy(prefs, {
+      get(target, key) {
+        if (String(key).startsWith('set')) return () => assert.fail('must not change preferences');
+        if (key === 'getIntPref') return name => {
+          if (name === thresholdPref) throw new Error('unreadable');
+          return target[key](name);
+        };
+        return target[key];
+      },
+    });
+    const dry = runtime.dryRunCompose(args);
+    assert.match(dry.blockers[0], /threshold could not be read/);
+    noExecution(state);
+  });
+
+  it('bounds prepared UTF-8, HTML entities, newlines and appended signatures, with distinct input length', () => {
+    const body = 'Zażółć 😀\n<&>\r\n';
+    const identity = { htmlSigText: 'Signed 😀\nSupport', composeHtml: true };
+    const { runtime, state } = makeRuntime({ identity });
+    for (const isHtml of [false, true, null]) {
+      const request = { ...args, body, isHtml };
+      const plan = runtime.prepareCompose(request);
+      const result = runtime.dryRunCompose(request);
+      assert.equal(result.inputBodyLength, body.length);
+      assert.ok(result.estimatedEncodedBytes > Buffer.byteLength(plan.body));
+      assert.ok(plan.body.includes('Signed 😀'));
+      if (isHtml !== false) assert.ok(plan.body.startsWith('<html>'));
+      assert.ok(result.estimatedEncodedBytes > runtime.dryRunCompose({ ...request, includeSignature: false }).estimatedEncodedBytes);
+      assert.equal(result.isHtml, isHtml !== false);
+    }
+    noExecution(state);
+  });
+
+  it('blocks body-only and signature-only messages, and warns for a dry review', () => {
+    for (const config of [
+      { request: { body: 'é\n'.repeat(10000) } },
+      { identity: { htmlSigText: 'é\n'.repeat(10000) }, request: {} },
+    ]) {
+      const h = makeRuntime({ identity: config.identity, prefs: { [thresholdPref]: 100000 } });
+      const dry = h.runtime.dryRunCompose({ ...args, ...config.request });
+      assert.equal(dry.wouldSucceed, false);
+      assert.ok(dry.estimatedEncodedBytes > 100000);
+      assert.equal(h.runtime.composeMail({ ...args, ...config.request }).error, dry.blockers[0]);
+      const review = h.runtime.dryRunCompose({ ...args, ...config.request, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.equal(review.warnings.length, 1);
+      noExecution(h.state);
+    }
+  });
+
+  it('includes dynamic subjects, Bcc, filenames, custom headers, organization, Reply-To and vCards', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const long = '😀'.repeat(1000);
+    for (const config of [
+      { request: { subject: long } }, { request: { bcc: long + '@example.com' } },
+      { request: { attachments: [{ name: long, base64: 'QQ==' }] } },
+      { identity: { organization: long } }, { identity: { replyTo: long + '@example.com' } },
+      { identity: { attachVCard: true, escapedVCard: long } },
+      { prefs: { 'mail.identity.sender.headers': 'custom', 'mail.identity.sender.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'mail.identity.default.headers': 'custom', 'mail.identity.default.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'general.useragent.override': long } },
+    ]) {
+      const { runtime, state } = makeRuntime(config);
+      assert.ok(runtime.dryRunCompose({ ...args, ...config.request }).estimatedEncodedBytes > baseline + 1000);
+      noExecution(state);
+    }
+  });
+
+  it('ignores disabled automatic recipient lists when counting and bounding identity content', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const { runtime, state } = makeRuntime();
+    // Preserve getters rather than spreading this identity in the fixture.
+    const identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, doCc: false, doBcc: false };
+    for (const name of ['doCcList', 'doBccList']) Object.defineProperty(identity, name, {
+      get() { throw new Error('Disabled recipient list must not be read'); },
+    });
+    runtime.setComposeIdentity = params => { params.identity = identity; };
+    const dry = runtime.dryRunCompose(args);
+    assert.equal(dry.wouldSucceed, true);
+    assert.equal(dry.estimatedEncodedBytes, baseline);
+    assert.equal(dry.recipients.cc + dry.recipients.bcc, 0);
+    noExecution(state);
+  });
+
+  it('fails closed on unbounded identity content and raw snapshot lengths; nonpositive thresholds still disable the gate', () => {
+    for (const config of [
+      { identity: { attachVCard: true } },
+      { identity: { organization: 42 } },
+      { prefs: { 'mail.identity.sender.headers': 42 } },
+    ]) {
+      const h = makeRuntime(config);
+      const direct = h.runtime.dryRunCompose(args);
+      assert.equal(direct.estimatedEncodedBytes, null);
+      assert.match(direct.blockers[0], /could not be safely bounded/);
+      assert.equal(h.runtime.dryRunCompose({ ...args, skipReview: false }).warnings.length, 1);
+      noExecution(h.state);
+      const disabled = makeRuntime({ ...config, prefs: { ...config.prefs, [thresholdPref]: 0 } });
+      assert.equal(disabled.runtime.dryRunCompose(args).wouldSucceed, true);
+    }
+    const { runtime } = makeRuntime();
+    for (const inheritedRawBytes of [undefined, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER]) {
+      const size = runtime.assessComposeSize({ identity: { key: 'sender' }, body: '', inheritedRawBytes });
+      assert.equal(size.estimatedEncodedBytes, null);
+      assert.match(size.warning, /could not be safely bounded/);
+    }
   });
 });

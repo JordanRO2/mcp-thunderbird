@@ -16,6 +16,7 @@ function makeDirectSendPrefs(overrides = {}) {
     "mail.identity.default.openpgp_key_id": "",
     "mail.identity.default.encryption_cert_name": "",
     "mail.e2ee.auto_enable": false,
+    "mailnews.message_warning_size": 20 * 1024 * 1024,
     ...overrides,
   };
   return {
@@ -57,7 +58,7 @@ const clearOriginalRawFixture = {
 // in the lifecycle harnesses that otherwise stub their original-message quote.
 const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8");
 const dependencySource = [
-  "MESSAGE TEXT CONVERSION", "RAW MIME PARSING HELPERS",
+  "MESSAGE TEXT CONVERSION", "RAW MIME PARSING HELPERS", "INLINE IMAGE CONTENT HELPERS",
   "RAW MIME ATTACHMENT HELPERS", "ENCRYPTED MESSAGE GUARD",
 ].map(name => {
   const start = source.indexOf(`// BEGIN ${name}`);
@@ -65,7 +66,19 @@ const dependencySource = [
   assert.ok(start >= 0 && end > start, `Missing production marker: ${name}`);
   return source.slice(start, end);
 }).join("\n");
-const dependencies = vm.runInNewContext(dependencySource + "\n({ RAW_MESSAGE_MAX_BYTES, MAX_HTML_PARSE_BYTES, getMimePartContentTypes, parseRawMimeHeaderValue, truncateHtmlForParsing });");
+const dependencies = vm.runInNewContext(dependencySource + "\n({ getBase64EncodedSize, RAW_MESSAGE_MAX_BYTES, MAX_HTML_PARSE_BYTES, getMimePartContentTypes, parseRawMimeHeaderValue, truncateHtmlForParsing });");
 Object.assign(clearOriginalRawFixture, dependencies);
 
-module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture };
+// Reuse the scheduling harness's native boundary convention. This fixture
+// handles only simple harness addresses, not Thunderbird's parsing algorithm.
+const composeHeaderParser = {
+  parseDecodedHeader(header, preserveGroups) {
+    assert.equal(preserveGroups, false);
+    return header.split(",").filter(value => value.trim()).map(email => ({ email }));
+  },
+  removeDuplicateAddresses(header, other) {
+    return header.split(",").filter(value => value.trim() && !other.split(",").includes(value)).join(",");
+  },
+};
+
+module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser };

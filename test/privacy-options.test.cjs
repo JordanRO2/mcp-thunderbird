@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { loadContactRuntime } = require("./helpers/contact-runtime.cjs");
+const { loadPrivacyRuntime } = require("./helpers/privacy-access.cjs");
 
 const optionsSource = fs.readFileSync(path.resolve(__dirname, "../extension/options.js"), "utf8");
 
@@ -132,6 +133,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
       return structuredClone(state.accountConfig);
     },
     async getToolAccessConfig() {
+      if (state.accessApi) return state.accessApi.getToolAccessConfig();
       if (state.toolConfig instanceof Error) throw state.toolConfig;
       return structuredClone(state.toolConfig);
     },
@@ -156,6 +158,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
     },
     async setToolAccess(disabledTools, getMessagesLimit) {
       calls.tools.push({ disabledTools: Array.from(disabledTools), getMessagesLimit });
+      if (state.accessApi) return state.accessApi.setToolAccess(disabledTools, getMessagesLimit);
       if (state.toolResult instanceof Error) throw state.toolResult;
       if (state.toolResult.success && state.nextToolConfig) state.toolConfig = state.nextToolConfig;
       return structuredClone(state.toolResult);
@@ -170,6 +173,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
   // contact preference API; ordinary UI error tests keep their boundary mocks.
   const sandbox = { ...elements, document, browser: { mcpServer: { ...api, ...apiOverrides } } };
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../extension/tool-access.js"), "utf8"), sandbox);
   vm.runInContext([
     markedOptionsSnippet("OPTIONS ACCESS STATE"),
     markedOptionsSnippet("OPTIONS ACCOUNT ACCESS"),
@@ -503,4 +507,65 @@ describe("Options contact writes", () => {
       assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
     });
   }
+});
+
+describe("Options dependencies with the production preference API", () => {
+  for (const childDisabled of [false, true]) {
+    for (const parentDisabled of [false, true]) {
+      it(`preserves child=${!childDisabled} across unsaved parent toggles, unrelated saves and reloads, parent=${!parentDisabled}`, async () => {
+        const disabled = [childDisabled && "dryRunCompose", parentDisabled && "sendMail"].filter(Boolean);
+        const runtime = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: JSON.stringify(disabled) } });
+        const ui = loadOptions({ accessApi: runtime.options });
+        await ui.loadToolAccess();
+        const get = name => ui.document.getElementById("tool-" + name);
+        const labels = ui.toolList.children.flatMap(row => row.children);
+        assert.ok(labels.some(label => label.children.some(note => note.textContent === "requires sendMail")));
+        assert.equal(get("dryRunCompose").checked, !childDisabled && !parentDisabled);
+        assert.equal(get("dryRunCompose").disabled, parentDisabled);
+        assert.equal(get("listAccounts").checked, true);
+        assert.equal(get("listAccounts").disabled, true);
+        // The child's preference is independent even before any save.
+        get("sendMail").checked = parentDisabled;
+        await get("sendMail").fire("change");
+        assert.equal(get("dryRunCompose").disabled, !parentDisabled);
+        assert.equal(get("dryRunCompose").checked, !childDisabled && parentDisabled);
+        get("sendMail").checked = !parentDisabled;
+        await get("sendMail").fire("change");
+        assert.equal(ui.saveToolsBtn.disabled, true);
+        const limit = ui.document.getElementById("getMessagesLimit");
+        limit.value = "7";
+        await limit.fire("input");
+        await ui.saveToolsBtn.fire("click");
+        assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools).sort(), disabled.sort());
+        assert.equal(get("dryRunCompose").checked, !childDisabled && !parentDisabled);
+        assert.equal(get("dryRunCompose").disabled, parentDisabled);
+        // Save the opposite parent state, then reload the real persisted state.
+        get("sendMail").checked = parentDisabled;
+        await get("sendMail").fire("change");
+        await ui.saveToolsBtn.fire("click");
+        const config = await runtime.options.getToolAccessConfig();
+        assert.equal(config.disabledTools.includes("dryRunCompose"), childDisabled);
+        assert.equal(config.disabledTools.includes("sendMail"), !parentDisabled);
+        assert.equal(get("dryRunCompose").checked, !childDisabled && parentDisabled);
+      });
+    }
+  }
+
+  it("keeps an explicitly unchecked child off after disabling and re-enabling its parent", async () => {
+    const runtime = loadPrivacyRuntime();
+    const ui = loadOptions({ accessApi: runtime.options });
+    await ui.loadToolAccess();
+    const child = ui.document.getElementById("tool-dryRunCompose");
+    const parent = ui.document.getElementById("tool-sendMail");
+    child.checked = false;
+    await child.fire("change");
+    for (const enabled of [false, true]) {
+      parent.checked = enabled;
+      await parent.fire("change");
+      assert.equal(child.checked, false);
+    }
+    await ui.saveToolsBtn.fire("click");
+    assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools), ["dryRunCompose"]);
+    assert.equal(ui.document.getElementById("tool-dryRunCompose").checked, false);
+  });
 });

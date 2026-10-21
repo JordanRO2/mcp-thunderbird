@@ -27,6 +27,8 @@ const regenerateStableAuthTokenBtn = document.getElementById("regenerateStableAu
 const stableAuthTokenStatus = document.getElementById("stableAuthTokenStatus");
 
 // BEGIN OPTIONS ACCESS STATE
+const toolAccess = globalThis.ToolAccess;
+let toolChoices = new Map();
 let currentAccounts = [];
 let currentTools = [];
 let getMessagesLimitInput = null;
@@ -380,6 +382,7 @@ async function loadToolAccess() {
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
     currentTools = data.tools || [];
+    toolChoices = new Map(currentTools.map(tool => [tool.name, tool.configuredEnabled ?? tool.enabled]));
     const groupLabels = data.groups || {};
     currentToolError = data.mode === "error"
       ? (data.error || "Invalid tool access configuration.") + " Optional tools are blocked. Change tool access and save to replace this setting."
@@ -437,6 +440,9 @@ async function loadToolAccess() {
         checkbox.disabled = true;
       }
       checkbox.addEventListener("change", () => {
+        if (checkbox.disabled) return;
+        toolChoices.set(tool.name, checkbox.checked);
+        updateToolDependencyStates();
         if (tool.name === "getMessages" && getMessagesLimitInput) {
           getMessagesLimitInput.disabled = !checkbox.checked;
           if (checkbox.checked) {
@@ -459,6 +465,13 @@ async function loadToolAccess() {
         label.appendChild(lockSpan);
       }
 
+      const dependencies = toolAccess.dependencies[tool.name] || [];
+      if (dependencies.length) {
+        const note = document.createElement("span");
+        note.className = "account-type";
+        note.textContent = "requires " + dependencies.join(", ");
+        label.appendChild(note);
+      }
       li.appendChild(checkbox);
       li.appendChild(label);
       if (tool.name === "getMessages") {
@@ -498,6 +511,7 @@ async function loadToolAccess() {
       }
       toolList.appendChild(li);
     }
+    updateToolDependencyStates();
   } catch (e) {
     toolList.innerHTML = "";
     const li = document.createElement("li");
@@ -506,11 +520,24 @@ async function loadToolAccess() {
   }
 }
 
+// Keep own choices independent of effective availability. A parent toggle must
+// never rewrite the child's deny-list entry, including an explicitly off child.
+function getConfiguredDisabledTools() {
+  return currentTools.filter(tool => !tool.undisableable && !toolChoices.get(tool.name)).map(tool => tool.name);
+}
+
+function updateToolDependencyStates() {
+  const disabled = getConfiguredDisabledTools();
+  const required = new Set(currentTools.filter(tool => tool.undisableable).map(tool => tool.name));
+  for (const cb of toolList.querySelectorAll('input[type="checkbox"]')) {
+    cb.checked = toolAccess.isEnabled(cb.value, disabled, required);
+    cb.disabled = required.has(cb.value) || !toolAccess.isEnabled(cb.value, disabled.filter(name => name !== cb.value), required);
+  }
+}
+
 function onToolChange() {
-  const checkboxes = toolList.querySelectorAll('input[type="checkbox"]');
-  toolAccessChanged = [...checkboxes].some(cb =>
-    !cb.disabled && cb.checked !== !!currentTools.find(tool => tool.name === cb.value)?.enabled
-  );
+  toolAccessChanged = currentTools.some(tool => !tool.undisableable &&
+    toolChoices.get(tool.name) !== (tool.configuredEnabled ?? tool.enabled));
   const limitChanged = getMessagesLimitInput && getMessagesLimitInput.value !== currentGetMessagesLimit;
   toolSettingsChanged = toolAccessChanged || (!currentToolError && !!limitChanged);
   saveToolsBtn.disabled = !toolSettingsChanged;
@@ -524,13 +551,7 @@ saveToolsBtn.addEventListener("click", async () => {
   saveToolsStatus.textContent = "";
   saveToolsStatus.className = "save-status";
 
-  const checkboxes = toolList.querySelectorAll('input[type="checkbox"]');
-  const disabled = [];
-  for (const cb of checkboxes) {
-    if (!cb.checked && !cb.disabled) {
-      disabled.push(cb.value);
-    }
-  }
+  const disabled = getConfiguredDisabledTools();
   let getMessagesLimit;
   if (getMessagesLimitInput) {
     getMessagesLimit = validateGetMessagesLimitInput();

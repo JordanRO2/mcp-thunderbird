@@ -2470,6 +2470,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
+    // BEGIN TOOL ACCESS IMPORT
+    const toolAccessScope = {};
+    Services.scriptloader.loadSubScript(extensionRoot.resolve("tool-access.js"), toolAccessScope);
+    const toolAccess = toolAccessScope.ToolAccess;
+    // END TOOL ACCESS IMPORT
+
     // BEGIN UNINSTALL LISTENER REGISTRATION
     if (!this._uninstallListener) {
       try {
@@ -2523,6 +2529,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const MAX_REMINDERS = 10;
     // Four weeks; also catches seconds/milliseconds supplied as minutes.
     const MAX_REMINDER_MINUTES = 40320;
+    // Searched for schema projection helpers: none preserves arbitrary nested
+    // validation keywords. Strip descriptions while preserving every other keyword.
+    function stripSchemaDescriptions(schema) {
+      if (!schema || typeof schema !== "object") return schema;
+      if (Array.isArray(schema)) return schema.map(stripSchemaDescriptions);
+      const copy = { ...schema };
+      delete copy.description;
+      // Traverse schemas, not data in defaults/enums or names in property maps.
+      for (const key of ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"]) {
+        if (copy[key]) copy[key] = Object.fromEntries(Object.entries(copy[key])
+          .map(([name, child]) => [name, stripSchemaDescriptions(child)]));
+      }
+      for (const key of ["items", "additionalItems", "prefixItems", "contains", "additionalProperties",
+        "unevaluatedProperties", "unevaluatedItems", "propertyNames", "contentSchema", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"]) {
+        if (copy[key]) copy[key] = stripSchemaDescriptions(copy[key]);
+      }
+      return copy;
+    }
+
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
       const fullRecipientsDescription = 'If true, return complete recipients and ccList. By default, each list shows the first 3 addresses plus "(+N more)". Matching uses full headers; getMessage and the header readers always return full lists.';
@@ -2590,7 +2615,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         note: { type: "string", description: "Contact note; may contain multiple lines" },
         birthday: { type: "string", description: "Birthday as YYYY-MM-DD, or --MM-DD when the year is unknown. Some CardDAV servers drop a year-less birthday on sync, which leaves the contact with no birthday." },
       };
-      return [
+      const definitions = [
       {
         name: "listAccounts",
         group: "system", crud: "read",
@@ -2735,7 +2760,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Email body text" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "True for HTML, false for plain text; omitted/null follows the identity preference." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             includeSignature: { type: "boolean", default: true, description: "Append the identity signature when skipReview is true (default: true). Set false if the body already includes it. Compose review windows use Thunderbird's signature preferences." },
@@ -3532,7 +3557,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
+      {
+        name: "dryRunCompose",
+        group: "messages", crud: "read",
+        title: "Dry-Run Compose",
+        description: "Preflight before sendMail; same arguments. Read-only add-on checks, not SMTP/provider delivery or other Thunderbird prompts. Counts effective recipients and inspects caller attachments without decoding or writing. A refused stdio attachment path is a tool error.",
+        inputSchema: null, // Derived below from sendMail, including future arguments.
+      },
       ];
+      definitions.find(tool => tool.name === "dryRunCompose").inputSchema =
+        stripSchemaDescriptions(definitions.find(tool => tool.name === "sendMail").inputSchema);
+      return definitions;
     }
     // END TOOL SCHEMA BUILDER
 
@@ -4221,10 +4256,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
              */
             function isToolEnabled(toolName) {
-              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
-              const disabled = getDisabledTools();
-              if (disabled.includes("__all__")) return false;
-              return !disabled.includes(toolName);
+              return toolAccess.isEnabled(toolName, getDisabledTools(), UNDISABLEABLE_TOOLS);
             }
 
             /**
@@ -4583,17 +4615,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Converts attachment entries to attachment descriptors.
-             * Each entry can be:
-             *   - A string (file path) — resolved from disk
-             *   - An object { name, contentType, base64 } — decoded and written
-             *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
-             * Returns { descs: [{url, name, size, contentType?}], failed: [] }.
-             * Any refused entry throws before a send/draft/window can proceed,
-             * and removes temporary files created by this conversion.
+             * Inspect paths, inline shape, count and aggregate bytes without
+             * decoding, writing, or creating native attachments. The execution
+             * wrapper below materializes only a completely accepted inspection.
              */
             // BEGIN OUTBOUND ATTACHMENT CONVERSION
-            function filePathsToAttachDescs(filePaths) {
+            function inspectComposeAttachments(filePaths) {
               const descs = [];
               const failed = [];
               if (filePaths === undefined || filePaths === null) return { descs, failed };
@@ -4601,7 +4628,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (filePaths.length > MAX_ATTACHMENTS_PER_MESSAGE) {
                 throw new Error(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`);
               }
-              const createdTempFiles = [];
               let totalAttachmentBytes = 0;
               for (const entry of filePaths) {
                 try {
@@ -4737,7 +4763,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     descs.push(desc);
                     totalAttachmentBytes += fileSize;
                   } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
-                    // Inline base64 attachment — decode and write to temp file
+                    // Inspect base64 without decoding or allocating a file.
                     const b64Data = entry.base64 || entry.content;
                     if (!isValidBase64(b64Data)) {
                       failed.push(`${entry.name} (invalid base64 data)`);
@@ -4747,75 +4773,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
                       continue;
                     }
-                    // Decode base64 to binary bytes
-                    let bytes;
-                    try {
-                      // Use the global atob when available, otherwise fall back
-                      const raw = typeof atob === "function" ? atob(b64Data) : ChromeUtils.base64Decode(b64Data);
-                      bytes = new Uint8Array(raw.length);
-                      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-                    } catch {
-                      // Fallback: manual base64 decode (atob may not be available in XPCOM context)
-                      try {
-                        const lookup = new Uint8Array(256);
-                        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                        for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
-                        // Shape was validated above; remove only legal trailing
-                        // padding rather than stripping arbitrary invalid bytes.
-                        const clean = b64Data.replace(/=+$/, "");
-                        const len = clean.length;
-                        const outLen = (len * 3) >> 2;
-                        bytes = new Uint8Array(outLen);
-                        let p = 0;
-                        for (let i = 0; i < len; i += 4) {
-                          const a = lookup[clean.charCodeAt(i)];
-                          const b = lookup[clean.charCodeAt(i + 1)];
-                          const c = lookup[clean.charCodeAt(i + 2)];
-                          const d = lookup[clean.charCodeAt(i + 3)];
-                          bytes[p++] = (a << 2) | (b >> 4);
-                          if (i + 2 < len) bytes[p++] = ((b & 15) << 4) | (c >> 2);
-                          if (i + 3 < len) bytes[p++] = ((c & 3) << 6) | d;
-                        }
-                        bytes = bytes.subarray(0, p);
-                      } catch {
-                        failed.push(`${entry.name} (invalid base64 data)`);
-                        continue;
-                      }
-                    }
-                    if (bytes.length > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+                    const padding = b64Data.endsWith("==") ? 2 : b64Data.endsWith("=") ? 1 : 0;
+                    const decodedSize = (b64Data.length / 4) * 3 - padding;
+                    if (decodedSize > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
                       failed.push(`${entry.name} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
                       continue;
                     }
-                    const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                    tmpDir.append("thunderbird-mcp");
-                    tmpDir.append("attachments");
-                    if (!tmpDir.exists()) {
-                      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-                    }
-                    const tmpFile = tmpDir.clone();
-                    let safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
-                    if (!safeName || safeName === "." || safeName === "..") safeName = "attachment";
-                    tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
-                    // Write via XPCOM binary stream
-                    const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
-                      .createInstance(Ci.nsIFileOutputStream);
-                    // Exclusive creation ensures cleanup only removes this call's files.
-                    ostream.init(tmpFile, 0x02 | 0x08 | 0x80, 0o600, 0);
-                    createdTempFiles.push(tmpFile);
-                    _tempAttachFiles.add(tmpFile.path);
-                    let bstream;
-                    try {
-                      bstream = Cc["@mozilla.org/binaryoutputstream;1"]
-                        .createInstance(Ci.nsIBinaryOutputStream);
-                      bstream.setOutputStream(ostream);
-                      bstream.writeByteArray(bytes, bytes.length);
-                    } finally {
-                      try { if (bstream) bstream.close(); } finally { ostream.close(); }
-                    }
-                    const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
-                    if (entry.contentType) desc.contentType = entry.contentType;
-                    descs.push(desc);
-                    totalAttachmentBytes += bytes.length;
+                    descs.push({ name: entry.name, size: decodedSize, inlineBase64: b64Data,
+                      ...(entry.contentType ? { contentType: entry.contentType } : {}) });
+                    totalAttachmentBytes += decodedSize;
                   } else {
                     failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
@@ -4824,24 +4790,104 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   failed.push(`${label} (${e.message || e})`);
                 }
               }
-              // Materialize native attachments before any send/draft/window.
-              // The helper caches them on the private descriptors for later use.
-              if (!failed.length) {
-                try { descsToMsgAttachments(descs); } catch (e) { failed.push(e.message || String(e)); }
-              }
-              if (failed.length) {
+              if (failed.length) throw new Error(`Attachments refused: ${failed.join(", ")}`);
+              return { descs, failed };
+            }
+
+            // Inspection is shared by both entry paths. Only execution calls this
+            // materializer; keep the converter wrapper for draft/reply/forward.
+            function materializeAttachmentDescs(descs) {
+              const createdTempFiles = [];
+              const materialized = [];
+              try {
+                for (const entry of descs) {
+                  if (!entry.inlineBase64) {
+                    materialized.push(entry);
+                    continue;
+                  }
+                  const b64Data = entry.inlineBase64;
+                  // Decode base64 to binary bytes
+                  let bytes;
+                  try {
+                    // Use the global atob when available, otherwise fall back
+                    const raw = typeof atob === "function" ? atob(b64Data) : ChromeUtils.base64Decode(b64Data);
+                    bytes = new Uint8Array(raw.length);
+                    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+                  } catch {
+                    // Fallback: manual base64 decode (atob may not be available in XPCOM context)
+                    try {
+                      const lookup = new Uint8Array(256);
+                      const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                      for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+                      // Shape was validated above; remove only legal trailing
+                      // padding rather than stripping arbitrary invalid bytes.
+                      const clean = b64Data.replace(/=+$/, "");
+                      const len = clean.length;
+                      const outLen = (len * 3) >> 2;
+                      bytes = new Uint8Array(outLen);
+                      let p = 0;
+                      for (let i = 0; i < len; i += 4) {
+                        const a = lookup[clean.charCodeAt(i)];
+                        const b = lookup[clean.charCodeAt(i + 1)];
+                        const c = lookup[clean.charCodeAt(i + 2)];
+                        const d = lookup[clean.charCodeAt(i + 3)];
+                        bytes[p++] = (a << 2) | (b >> 4);
+                        if (i + 2 < len) bytes[p++] = ((b & 15) << 4) | (c >> 2);
+                        if (i + 3 < len) bytes[p++] = ((c & 3) << 6) | d;
+                      }
+                      bytes = bytes.subarray(0, p);
+                    } catch {
+                      throw new Error(`${entry.name} (invalid base64 data)`);
+                    }
+                  }
+                  const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                  tmpDir.append("thunderbird-mcp");
+                  tmpDir.append("attachments");
+                  if (!tmpDir.exists()) {
+                    tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                  }
+                  const tmpFile = tmpDir.clone();
+                  let safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+                  if (!safeName || safeName === "." || safeName === "..") safeName = "attachment";
+                  tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
+                  // Write via XPCOM binary stream
+                  const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                    .createInstance(Ci.nsIFileOutputStream);
+                  // Exclusive creation ensures cleanup only removes this call's files.
+                  ostream.init(tmpFile, 0x02 | 0x08 | 0x80, 0o600, 0);
+                  createdTempFiles.push(tmpFile);
+                  _tempAttachFiles.add(tmpFile.path);
+                  let bstream;
+                  try {
+                    bstream = Cc["@mozilla.org/binaryoutputstream;1"]
+                      .createInstance(Ci.nsIBinaryOutputStream);
+                    bstream.setOutputStream(ostream);
+                    bstream.writeByteArray(bytes, bytes.length);
+                  } finally {
+                    try { if (bstream) bstream.close(); } finally { ostream.close(); }
+                  }
+                  const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
+                  if (entry.contentType) desc.contentType = entry.contentType;
+                  materialized.push(desc);
+                }
+                descsToMsgAttachments(materialized);
+                return materialized;
+              } catch (error) {
                 for (const tmpFile of createdTempFiles) {
                   try {
                     tmpFile.remove(false);
                     _tempAttachFiles.delete(tmpFile.path);
                   } catch (e) {
-                    // Retain it in the shutdown cleanup set if removal failed.
                     console.warn("thunderbird-mcp: temporary attachment cleanup failed:", e);
                   }
                 }
-                throw new Error(`Attachments refused: ${failed.join(", ")}`);
+                throw new Error(`Attachments refused: ${error.message || error}`, { cause: error });
               }
-              return { descs, failed };
+            }
+
+            function filePathsToAttachDescs(filePaths, { dryRun = false } = {}) {
+              const inspected = inspectComposeAttachments(filePaths);
+              return dryRun ? inspected : { descs: materializeAttachmentDescs(inspected.descs), failed: [] };
             }
             // END OUTBOUND ATTACHMENT CONVERSION
 
@@ -5674,7 +5720,134 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Based on #229 by Kieran Hannigan.
              */
             // BEGIN COMPOSE SEND HELPER
-            function sendThroughCompose(msgComposeParams, attachDescs, useHtml) {
+            // BEGIN COMPOSE ACCOUNT KEY
+            function getComposeAccountKey(identity) {
+              const key = MailServices.accounts.accounts.find(account =>
+                account.identities.some(id => id.key === identity?.key)
+              )?.key;
+              if (typeof key !== "string" || !key.trim()) {
+                throw new Error("Cannot send: the identity's owning account key could not be resolved");
+              }
+              return key;
+            }
+            // END COMPOSE ACCOUNT KEY
+            // BEGIN COMPOSE SIZE GUARD
+            const COMPOSE_SIZE_WARNING_PREF = "mailnews.message_warning_size";
+            const COMPOSE_SIZE_REVIEW = "Use skipReview: false to review the message in Thunderbird.";
+            const COMPOSE_SIZE_FIXED_BYTES = 16 * 1024;
+            const COMPOSE_SIZE_PART_BYTES = 1024;
+            const COMPOSE_SIZE_HEADER_BYTES = 256;
+            const COMPOSE_SIZE_MARGIN = 1.25;
+            const COMPOSE_BASE64_COLUMNS = 72;
+
+            // Searched getBase64EncodedSize/truncateHtmlForParsing: reuse their
+            // base64 quantum and UTF-8 accounting. MimeEncoder on ESR128/140/153
+            // adds a CRLF even on an exact 72-column boundary (and for empty data).
+            function getComposeBase64Size(bytes) {
+              const encoded = getBase64EncodedSize(bytes);
+              return encoded + 2 * (Math.floor(encoded / COMPOSE_BASE64_COLUMNS) + 1);
+            }
+
+            function getComposeTextSize(bytes) {
+              // QP may encode every byte, with soft breaks. Base64 can instead
+              // encode text after LF -> CRLF normalization; bound both choices.
+              const qp = 3 * bytes;
+              return Math.max(qp + 3 * (Math.floor(qp / COMPOSE_BASE64_COLUMNS) + 1) + 2,
+                getComposeBase64Size(2 * bytes));
+            }
+
+            function estimateComposeSize(plan) {
+              const { identity, body, headers = [], attachments = [], useHtml = false } = plan;
+              const inheritedRawBytes = Object.hasOwn(plan, "inheritedRawBytes") ? plan.inheritedRawBytes : 0;
+              const textBytes = value => {
+                if (typeof value !== "string") throw new Error("Unbounded compose text");
+                return truncateHtmlForParsing(value, Number.MAX_SAFE_INTEGER).bytes;
+              };
+              const validSize = value => {
+                if (!Number.isSafeInteger(value) || value < 0) throw new Error("Unbounded compose size");
+                return value;
+              };
+              // Reuse S4's typed identity-pref fallback. Missing custom attributes
+              // are empty; failed reads or wrong types must not become empty data.
+              const optionalPref = name => {
+                const type = Services.prefs.getPrefType(name);
+                if (type === Ci.nsIPrefBranch.PREF_INVALID) return "";
+                if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Unreadable header preference");
+                const value = Services.prefs.getStringPref(name);
+                textBytes(value);
+                return value;
+              };
+              const identityPref = name => {
+                const pref = `mail.identity.${identity.key}.${name}`;
+                return optionalPref(Services.prefs.getPrefType(pref) === Ci.nsIPrefBranch.PREF_INVALID
+                  ? `mail.identity.default.${name}` : pref);
+              };
+              const headerValues = [...headers];
+              for (const key of ["email", "fullName", "organization", "replyTo"]) {
+                headerValues.push(identity[key] ?? "");
+              }
+              headerValues.push(identity.doCc ? identity.doCcList : "", identity.doBcc ? identity.doBccList : "");
+              headerValues.push(identityPref("FQDN"), optionalPref("general.useragent.override"));
+              for (const name of identityPref("headers").split(",")) {
+                // Thunderbird even reads header.<empty> for an empty list.
+                headerValues.push(identityPref(`header.${name}`));
+              }
+              // From/receipt/Reply-To and mailing-list headers can repeat values.
+              // RFC 2047 and RFC 2231 folding/encoding is covered by the text
+              // bound plus per-header overhead, with a growth-dependent margin.
+              const headerBytes = headerValues.reduce((sum, value) => sum + textBytes(value) + COMPOSE_SIZE_HEADER_BYTES, 0);
+              let bytes = COMPOSE_SIZE_FIXED_BYTES + 4 * getComposeTextSize(headerBytes);
+              // Reserve an HTML part and its possible generated plain alternative.
+              bytes += getComposeTextSize(textBytes(body) * (useHtml ? 3 : 1));
+              // The complete raw snapshot bounds inherited attachment bytes and
+              // headers before re-encoding. Gloda's allUserAttachments excludes
+              // attachments inside an attached message, so their bytes are not
+              // repeated. The final quote is measured in body above, including
+              // charset conversion, escaping and quote prefixes; applying those
+              // expansions to every raw attachment byte would double-count them.
+              bytes += getComposeTextSize(validSize(inheritedRawBytes));
+              for (const attachment of attachments) {
+                const size = validSize(attachment.size);
+                bytes += COMPOSE_SIZE_PART_BYTES;
+                bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? "")
+                  + textBytes(attachment.url ?? ""));
+                // Only a known binary type guarantees base64. Path/type inference
+                // and textual attachments need the QP worst case instead.
+                bytes += attachment.contentType === "application/octet-stream"
+                  ? getComposeBase64Size(size) : getComposeTextSize(size);
+              }
+              if (identity.attachVCard) {
+                // Percent-unescaping cannot exceed the escaped input's byte count.
+                bytes += COMPOSE_SIZE_PART_BYTES + getComposeTextSize(textBytes(identity.escapedVCard));
+              }
+              return validSize(Math.ceil(bytes * COMPOSE_SIZE_MARGIN));
+            }
+
+            function assessComposeSize(plan) {
+              let estimatedEncodedBytes = null;
+              let warningThresholdBytes;
+              try { estimatedEncodedBytes = estimateComposeSize(plan); } catch { /* fail closed below */ }
+              try {
+                if (Services.prefs.getPrefType(COMPOSE_SIZE_WARNING_PREF) !== Ci.nsIPrefBranch.PREF_INT) {
+                  throw new Error("Unreadable size threshold");
+                }
+                warningThresholdBytes = Services.prefs.getIntPref(COMPOSE_SIZE_WARNING_PREF);
+                if (!Number.isSafeInteger(warningThresholdBytes)) throw new Error("Invalid size threshold");
+              } catch { warningThresholdBytes = null; }
+              let warning = null;
+              if (warningThresholdBytes === null) {
+                warning = `Unreviewed sending is blocked because Thunderbird's large-message threshold could not be read. ${COMPOSE_SIZE_REVIEW}`;
+              } else if (warningThresholdBytes > 0) {
+                if (estimatedEncodedBytes === null) {
+                  warning = `Unreviewed sending is blocked because the encoded message size could not be safely bounded. ${COMPOSE_SIZE_REVIEW}`;
+                } else if (estimatedEncodedBytes > warningThresholdBytes) {
+                  warning = `Unreviewed sending is blocked because the conservative encoded size estimate (${estimatedEncodedBytes} bytes) exceeds Thunderbird's large-message threshold (${warningThresholdBytes} bytes). ${COMPOSE_SIZE_REVIEW}`;
+                }
+              }
+              return { estimatedEncodedBytes, warningThresholdBytes, warning };
+            }
+            // END COMPOSE SIZE GUARD
+            function sendThroughCompose(msgComposeParams, attachDescs, useHtml, preparedAccountKey) {
               const identity = msgComposeParams.identity;
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
@@ -5723,12 +5896,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     msgComposeParams.composeFields.addAttachment(att);
                   }
 
-                  const accountKey = MailServices.accounts.accounts.find(account =>
-                    account.identities.some(id => id.key === identity.key)
-                  )?.key;
-                  if (typeof accountKey !== "string" || !accountKey.trim()) {
-                    throw new Error("Cannot send: the identity's owning account key could not be resolved");
-                  }
+                  const accountKey = preparedAccountKey ?? getComposeAccountKey(identity);
 
                   // Initialize accepts explicit formats even for ForwardInline.
                   // Use the same decision that shaped the body, rather than
@@ -6157,7 +6325,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function getIdentitySignature(identity) {
+            // Optional review metadata records resources the direct path omits.
+            function getIdentitySignature(identity, reviewSignature) {
               if (!identity) return null;
               try {
                 if (identity.attachSignature) {
@@ -6171,6 +6340,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       ? contentType.startsWith("image/")
                       : /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|tiff?|webp)$/i.test(file.leafName);
                     if (isImage) {
+                      if (reviewSignature) {
+                        const size = file.fileSize;
+                        if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid signature image size");
+                        // Estimate only: reuse the attachment estimator's binary
+                        // base64 bound without opening or attaching this file.
+                        reviewSignature.attachments.push({ name: file.leafName, size, contentType: "application/octet-stream" });
+                        return null;
+                      }
                       console.warn("thunderbird-mcp: image signature files are omitted from direct sends and saved drafts");
                       return null;
                     }
@@ -6178,8 +6355,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (content && content.trim()) {
                       return { content, isHtmlSig: contentType ? contentType === "text/html" : /\.html?$/i.test(file.leafName) };
                     }
+                    return null;
                   }
                   // Thunderbird ignores inline signature text when a file is selected.
+                  if (reviewSignature) reviewSignature.excluded = true;
                   return null;
                 }
                 const inline = identity.htmlSigText;
@@ -6187,6 +6366,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { content: inline, isHtmlSig: identity.htmlSigFormat === true };
                 }
               } catch (error) {
+                if (reviewSignature) reviewSignature.excluded = true;
                 console.warn("thunderbird-mcp: could not read identity signature", error);
               }
               return null;
@@ -6251,9 +6431,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Returns "" when the identity has no signature.
              */
-            function buildSignatureFragment(identity, useHtml) {
-              const sig = getIdentitySignature(identity);
+            function buildSignatureFragment(identity, useHtml, reviewSignature) {
+              const sig = getIdentitySignature(identity, reviewSignature);
               if (!sig) return "";
+              // Do not follow resources in HTML signatures. Their contents (and
+              // CSS references) cannot be bounded by the signature text alone.
+              if (reviewSignature && useHtml && sig.isHtmlSig &&
+                  /<\s*(?:img|style|link|svg|object|embed|iframe|video|audio)\b|\b(?:src|srcset|style|background|poster)\s*=/i.test(sig.content)) {
+                reviewSignature.excluded = true;
+              }
 
               const asText = sig.isHtmlSig ? htmlSignatureToPlainText(sig.content) : sig.content;
               // Honor the identity's suppress_signature_separator preference.
@@ -6278,8 +6464,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * identity signature. Mirrors the plain/HTML envelope rules used by
              * the compose-window paths.
              */
-            function buildBodyWithSignature(body, identity, useHtml, isHtml, includeSignature = true) {
-              const sigFragment = includeSignature ? buildSignatureFragment(identity, useHtml) : "";
+            function buildBodyWithSignature(body, identity, useHtml, isHtml, includeSignature = true, reviewSignature) {
+              const sigFragment = includeSignature ? buildSignatureFragment(identity, useHtml, reviewSignature) : "";
 
               if (!useHtml) {
                 return (body || "") + sigFragment;
@@ -11070,7 +11256,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                           return;
                         }
-                        settle({ mime, quoted, deadline });
+                        settle({ mime, quoted, deadline, rawBytes: raw.length });
                       } catch {
                         settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                       }
@@ -11464,85 +11650,118 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
             // BEGIN OUTBOUND MAIL TOOLS
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, includeSignature = true) {
+            // BEGIN COMPOSE PREPARATION
+            const SKIP_REVIEW_BLOCK_ERROR = "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead.";
+
+            // Searched splitAddressHeader and scheduling's parseDecodedHeader:
+            // the native parser flattens groups; mirror nsMsgCompose's per-field
+            // automatic Cc/Bcc merge instead of counting comma-separated strings.
+            function getComposeRecipients({ to, cc, bcc }, identity) {
+              const headers = { to: to || "", cc: cc || "", bcc: bcc || "" };
+              for (const [field, enabled, listProperty] of [
+                ["cc", identity.doCc, "doCcList"],
+                ["bcc", identity.doBcc, "doBccList"],
+              ]) {
+                if (enabled) {
+                  const list = identity[listProperty] || "";
+                  const remaining = MailServices.headerParser.removeDuplicateAddresses(headers[field], list);
+                  headers[field] = [list, remaining].filter(Boolean).join(", ");
+                }
+              }
+              const counts = Object.fromEntries(Object.entries(headers).map(([field, header]) => [
+                field, header ? MailServices.headerParser.parseDecodedHeader(header, false)
+                  .filter(mailbox => mailbox.email?.trim()).length : 0,
+              ]));
+              return { headers, counts };
+            }
+
+            function prepareCompose(args) {
+              const { body, isHtml, from, attachments, skipReview, includeSignature = true } = args;
+              if (skipReview && isSkipReviewBlocked()) return { error: SKIP_REVIEW_BLOCK_ERROR };
+              const selected = {};
+              const identityResult = setComposeIdentity(selected, from, null);
+              if (identityResult?.error) return identityResult;
+              const identity = selected.identity;
+              if (skipReview) {
+                const error = getDirectSendIdentityError(identity);
+                if (error) return { error };
+              }
+              const accountKey = getComposeAccountKey(identity);
+              const recipients = getComposeRecipients(args, identity);
+              if (skipReview && Object.values(recipients.counts).every(count => count === 0)) {
+                return { error: "A direct send needs at least one recipient (to, cc or bcc), including enabled identity automatic Cc/Bcc. Use skipReview: false to open an empty review window." };
+              }
+              const { useHtml, format } = resolveComposeFormat(identity, isHtml, Ci.nsIMsgCompType.New);
+              const { descs } = filePathsToAttachDescs(attachments, { dryRun: true });
+              // The window inserts its own signature. The direct path must build it here.
+              const preparedBody = buildBodyWithSignature(body, identity, useHtml, isHtml,
+                skipReview ? includeSignature : false);
+              const reviewSignature = { attachments: [], excluded: false };
+              const size = assessComposeSize({ identity, useHtml, body: skipReview ? preparedBody
+                : buildBodyWithSignature(body, identity, useHtml, isHtml, true, reviewSignature),
+              headers: [...Object.values(recipients.headers), args.subject || ""], attachments: [...descs, ...reviewSignature.attachments] });
+              if (reviewSignature.excluded) {
+                size.estimatedEncodedBytes = null;
+                size.warning = "The encoded size estimate excludes the identity signature because it could not be safely bounded read-only. Check the signature and message size in Thunderbird's review window.";
+              }
+              return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody, size,
+                ...(skipReview && size.warning ? { error: size.warning } : {}) };
+            }
+            // END COMPOSE PREPARATION
+
+            function composeMail(args, { dryRun = false } = {}) {
+              const report = {
+                wouldSucceed: false, blockers: [], warnings: [],
+                mode: args.skipReview ? "direct-send" : "review-window",
+                resolvedIdentity: null, isHtml: null,
+                inputBodyLength: typeof args.body === "string" ? args.body.length : 0,
+                recipients: null, attachments: [],
+                estimatedEncodedBytes: null, warningThresholdBytes: null,
+              };
+              const refuse = error => dryRun ? { ...report, blockers: [error] } : { error };
               try {
-                if (skipReview && isSkipReviewBlocked()) {
-                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
-                }
-                const selectedIdentity = {};
-                const identityResult = setComposeIdentity(selectedIdentity, from, null);
-                if (identityResult && identityResult.error) return identityResult;
-                if (skipReview) {
-                  const error = getDirectSendIdentityError(selectedIdentity.identity);
-                  if (error) return { error };
-                }
-                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+                const plan = prepareCompose(args);
+                const { identity, accountKey, recipients, useHtml, format, descs, body, size } = plan;
+                if (identity) Object.assign(report, {
+                  resolvedIdentity: { id: identity.key, email: identity.email, name: identity.fullName || null },
+                  isHtml: useHtml, recipients: recipients.counts,
+                  attachments: descs.map(({ name, size, contentType }) => ({ name, size, ...(contentType ? { contentType } : {}) })),
+                  estimatedEncodedBytes: size.estimatedEncodedBytes, warningThresholdBytes: size.warningThresholdBytes,
+                  warnings: !args.skipReview && size.warning ? [size.warning] : [],
+                });
+                if (plan.error) return refuse(plan.error);
+                if (dryRun) return { ...report, wouldSucceed: true };
+                const fileDescs = materializeAttachmentDescs(descs);
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
-                msgComposeParams.identity = selectedIdentity.identity;
-
                 const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
                   .createInstance(Ci.nsIMsgCompFields);
-
-                composeFields.to = to || "";
-                composeFields.cc = cc || "";
-                composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
-
+                Object.assign(composeFields, {
+                  to: args.to || "", cc: args.cc || "", bcc: args.bcc || "",
+                  subject: args.subject || "", body,
+                });
+                msgComposeParams.identity = identity;
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
-
-                // Match body shape and format to caller intent / identity pref.
-                // When the resolved mode is plain, ship a plain body -- the HTML
-                // envelope would otherwise render as literal text in plain-mode
-                // editors and recipients.
-                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
                 msgComposeParams.format = format;
-                if (useHtml) {
-                  const formatted = formatBodyHtml(body, isHtml);
-                  composeFields.body = isHtml && formatted.includes('<html')
-                    ? formatted
-                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                } else {
-                  composeFields.body = body || "";
-                }
-
-                if (skipReview) {
-                  // Direct send bypasses the compose window, so the identity
-                  // signature has to be appended here. The review path below
-                  // must NOT get it -- Thunderbird adds it when the window
-                  // opens, and doing both would duplicate it.
-                  composeFields.body = buildBodyWithSignature(body, msgComposeParams.identity, useHtml, isHtml, includeSignature);
-                  return sendThroughCompose(msgComposeParams, fileDescs, useHtml).then(result => {
-                    if (result.success) {
-                      let msg = "Message sent";
-                      result.message = msg;
-                    }
+                if (args.skipReview) {
+                  return sendThroughCompose(msgComposeParams, fileDescs, useHtml, accountKey).then(result => {
+                    if (result.success) result.message = "Message sent";
                     return result;
                   });
                 }
-
-                // Attach via composeFields BEFORE opening the window so it
-                // renders with the attachments already present. This avoids the
-                // old getMostRecentWindow("msgcompose") race: that helper returns
-                // the most recently *focused* compose window, so a second
-                // sendMail call -- or the user simply clicking an older compose
-                // window while this one opens -- would steal or drop the
-                // attachments. composeFields binds them to this exact message,
-                // exactly like the direct-send path (sendThroughCompose).
-                for (const att of descsToMsgAttachments(fileDescs)) {
-                  composeFields.addAttachment(att);
-                }
-
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                let msg = "Compose window opened";
-                return { success: true, message: msg };
+                // Bind attachments to this exact window, avoiding the focused-window race.
+                for (const att of descsToMsgAttachments(fileDescs)) composeFields.addAttachment(att);
+                Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService)
+                  .OpenComposeWindowWithParams(null, msgComposeParams);
+                return { success: true, message: "Compose window opened" };
               } catch (e) {
-                return { error: e.toString() };
+                return refuse(e.message || String(e));
               }
+            }
+
+            function dryRunCompose(args) {
+              return composeMail(args, { dryRun: true });
             }
 
             // BEGIN DRAFT HELPERS
@@ -11855,7 +12074,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  if (error) return { error };
 	                }
 	                if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
-	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+	                const { descs: inspectedDescs } = filePathsToAttachDescs(attachments, { dryRun: true });
+	                let preparedAccountKey;
+	                let sizePlan;
+	                if (skipReview) {
+	                  preparedAccountKey = getComposeAccountKey(selectedIdentity.identity);
+	                  const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
+	                  sizePlan = {
+	                    identity: selectedIdentity.identity, useHtml,
+	                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+	                    headers: [to || "", cc || "", bcc || "", messageId || "",
+	                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
+	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+	                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+	                  };
+	                  const size = assessComposeSize(sizePlan);
+	                  if (size.warning) return { error: size.warning };
+	                }
+	                const fileDescs = skipReview ? inspectedDescs : materializeAttachmentDescs(inspectedDescs);
 	                return await new Promise((resolve) => {
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
 	                    .createInstance(Ci.nsIMsgComposeParams);
@@ -11950,7 +12186,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    }
 
 	                    // On success Thunderbird marks the original replied.
-	                    sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
+	                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body });
+	                    if (size.warning) {
+	                      resolve({ error: size.warning });
+	                      return;
+	                    }
+	                    sendThroughCompose(msgComposeParams, materializeAttachmentDescs(fileDescs), replyUseHtml, preparedAccountKey).then(result => {
 	                      if (result.success) {
 	                        let msg = "Reply sent";
 	                        result.message = msg;
@@ -12057,7 +12298,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (error) return { error };
                 }
                 if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
-                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+                const { descs: inspectedDescs } = filePathsToAttachDescs(attachments, { dryRun: true });
+                let preparedAccountKey;
+                let sizePlan;
+                if (skipReview) {
+                  preparedAccountKey = getComposeAccountKey(selectedIdentity.identity);
+                  const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
+                  sizePlan = {
+                    identity: selectedIdentity.identity, useHtml,
+                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+                    headers: [to || "", cc || "", bcc || "", messageId || "",
+                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
+                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+                  };
+                  const size = assessComposeSize(sizePlan);
+                  if (size.warning) return { error: size.warning };
+                }
+                const fileDescs = skipReview ? inspectedDescs : materializeAttachmentDescs(inspectedDescs);
                 return await new Promise((resolve) => {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                     .createInstance(Ci.nsIMsgComposeParams);
@@ -12156,10 +12414,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                       }
                     }
-                    const allDescs = [...origDescs, ...fileDescs];
 
+                    // Original payload bytes are already covered by the raw
+                    // snapshot. Count each emitted part's new metadata/boundary
+                    // separately, including provider URLs used as Content-Location.
+                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body,
+                      attachments: [...fileDescs, ...origDescs.map(desc => ({ ...desc, size: 0 }))] });
+                    if (size.warning) {
+                      resolve({ error: size.warning });
+                      return;
+                    }
+                    const allDescs = [...origDescs, ...materializeAttachmentDescs(fileDescs)];
                     // On success Thunderbird marks the original forwarded.
-                    sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
+                    sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml, preparedAccountKey).then(result => {
                       if (result.success) {
                         let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                         result.message = msg;
@@ -14138,7 +14405,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "updateTask":
                   return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
                 case "sendMail":
-                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.includeSignature);
+                  return await composeMail(args);
                 case "saveDraft":
                   return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature, args.sendAt);
                 case "replyToMessage":
@@ -14187,6 +14454,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return applyFilters(args.accountId, args.folderPath);
                 case "getAccountAccess":
                   return getAccountAccess();
+                case "dryRunCompose":
+                  return dryRunCompose(args);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
@@ -14596,7 +14865,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               name: t.name,
               group: t.group,
               crud: t.crud,
-              enabled: UNDISABLEABLE_TOOLS.has(t.name) || (!corrupt && !disabled.includes(t.name)),
+              enabled: toolAccess.isEnabled(t.name, corrupt ? ["__all__"] : disabled, UNDISABLEABLE_TOOLS),
+              configuredEnabled: UNDISABLEABLE_TOOLS.has(t.name) || (!corrupt && !disabled.includes(t.name)),
+              dependencies: toolAccess.dependencies[t.name] || [],
               undisableable: UNDISABLEABLE_TOOLS.has(t.name),
               ...(t.name === "getMessages" ? {
                 getMessagesLimit,

@@ -88,6 +88,7 @@ const ALL_TOOLS = [
   { name: "updateMessage", group: "messages", crud: "update" },
   { name: "deleteMessages", group: "messages", crud: "delete" },
   { name: "saveDraft", group: "messages", crud: "create" },
+  { name: "dryRunCompose", group: "messages", crud: "read" },
   { name: "createFolder", group: "folders", crud: "create" },
   { name: "createVirtualFolder", group: "folders", crud: "create" },
   { name: "listVirtualFolders", group: "folders", crud: "read" },

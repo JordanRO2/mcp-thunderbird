@@ -58,7 +58,7 @@ function loadReply(options = {}) {
         if (uri === RESTRICTED_URI) return { URI: uri, server: { accountKey: "restricted" }, getFlag: () => true };
         return destination && uri === destination.URI ? destination : null;
       } },
-      accounts: { findAccountForServer: server => ({ key: server.accountKey }) },
+      accounts: { accounts: [{ key: "allowed", identities: [identity] }], findAccountForServer: server => ({ key: server.accountKey }) },
     },
     isAccountAllowed: key => key === "allowed",
     Cc: {
@@ -77,6 +77,8 @@ function loadReply(options = {}) {
     isToolEnabled(name) { assert.equal(name, "saveDraft"); return enabled; },
     isSkipReviewBlocked: () => blocked,
     findMessage() { calls.finds++; return { msgHdr: { folder }, folder }; },
+    materializeAttachmentDescs: descs => descs,
+    buildBodyWithSignature: body => body || "",
     filePathsToAttachDescs(attachments) {
       if (attachmentError) throw new Error(attachmentError);
       return { descs: attachments || [] };
@@ -139,6 +141,7 @@ function loadReply(options = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     source.match(/^const PREF_ALLOW_ENCRYPTED_MESSAGES = .+;$/m)[0],
+    snippet("COMPOSE ACCOUNT KEY"), snippet("COMPOSE SIZE GUARD"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("PRIVACY PREFERENCE HELPERS"), snippet("MCP TEXT SANITIZATION"),
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
     snippet("RAW MIME ATTACHMENT HELPERS"),

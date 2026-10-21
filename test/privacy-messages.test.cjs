@@ -69,6 +69,9 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     isSkipReviewBlocked: () => false,
     isToolEnabled: () => true,
     filePathsToAttachDescs: attachments.convert,
+    materializeAttachmentDescs: attachments.materialize,
+    buildBodyWithSignature: body => body || "",
+    MailServices: { accounts: { accounts: [{ key: "account", identities: [{ key: "sender" }] }] } },
     descsToMsgAttachments: attachments.toNative,
     Cc: {
       "@mozilla.org/timer;1": { createInstance() {
@@ -113,6 +116,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     snippet("RAW MIME ATTACHMENT HELPERS"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
+    snippet("COMPOSE SIZE GUARD"), snippet("COMPOSE ACCOUNT KEY"),
     snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.
