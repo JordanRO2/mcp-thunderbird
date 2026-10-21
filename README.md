@@ -156,6 +156,8 @@ Updating `email` alone with a non-empty value replaces the primary address and k
 
 Reads preserve duplicate addresses already stored in Thunderbird; writes reject duplicates case-insensitively, so remove duplicates before sending a returned list as an update. The `emails` list trims address whitespace and omits empty entries, while `email` preserves Thunderbird's primary value. An empty preferred entry or surrounding whitespace can therefore make `emails[0].address` differ from `email`; reading a contact never changes its primary address to force agreement.
 
+If a stored vCard cannot be read, contact reads and searches fall back to cached fields. Updates are refused before changing or saving the card, so they cannot overwrite unrelated data lost by the failed parse.
+
 ### Calendar
 
 | Tool | Description |

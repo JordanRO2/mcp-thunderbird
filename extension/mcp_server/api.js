@@ -456,8 +456,23 @@ function getContactCardProperty(card, name) {
   }
 }
 
+function getContactVCardProperties(card) {
+  try {
+    const vCardProperties = card.vCardProperties;
+    // AddrBookCard can swallow a parse error and return only VERSION:4.0.
+    // New cards have no stored vCard and may legitimately have no entries yet.
+    if (vCardProperties && (!getContactCardProperty(card, CONTACT_VCARD_PROPERTY) ||
+        vCardProperties.entries.some(entry => entry.name !== "version"))) {
+      return vCardProperties;
+    }
+  } catch {
+    // Null collections and throwing getters are unreadable too.
+  }
+  throw new Error("Contact's stored vCard is unreadable; refusing to overwrite it.");
+}
+
 function readVCardContactFields(card) {
-  const vCardProperties = card.vCardProperties;
+  const vCardProperties = getContactVCardProperties(card);
   const emails = vCardProperties.getAllEntriesSorted("email")
     .map(entry => {
       const address = contactValueToString(entry.value).trim();
@@ -560,13 +575,6 @@ function readFlatContactFields(card) {
 function readContactFields(card) {
   if (card.supportsVCard) {
     try {
-      // AddrBookCard can swallow a parse error and return only VERSION:4.0.
-      // Saved cards normally also contain UID; preserve their cached fields
-      // when parsing lost every entry, as well as when the getter throws.
-      if (getContactCardProperty(card, CONTACT_VCARD_PROPERTY) &&
-          !card.vCardProperties.entries.some(entry => entry.name !== "version")) {
-        return readFlatContactFields(card);
-      }
       return readVCardContactFields(card);
     } catch {
       // A malformed vCard should not prevent the rest of an address book from
@@ -973,6 +981,15 @@ function applyContactFields(card, fields, VCardPropertyEntry) {
   const supportsVCard = !!card.supportsVCard;
   const flatCollectionError = getFlatContactCollectionError(card, fields);
   if (flatCollectionError) return { error: flatCollectionError };
+  if (supportsVCard) {
+    // Check before scalar setters as well as collection writes: saving any
+    // update would serialize the failed parse and discard unrelated data.
+    try {
+      getContactVCardProperties(card);
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
 
   // emails replaces every address, the primary included; validation keeps
   // email equal to its first entry, so email needs no separate write then.
