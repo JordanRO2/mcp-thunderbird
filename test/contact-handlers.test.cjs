@@ -4,9 +4,17 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
   loadContactRuntime, DIRECTORY_TYPES, FakeVCardPropertyEntry, FakeVCardProperties,
-  FakeFlatCard, FakeAddrBookCard, FakeAddressBook,
+  FakeFlatCard, FakeAddrBookCard, FakeStoredCard, FakeAddressBook,
 } = require("./helpers/contact-runtime.cjs");
 
+const VCARD_PROPERTY = "_vCard";
+const VCARD_VERSION = "4.0";
+const VCARD_LINE_ENDING = "\r\n";
+const VCARD_BOOK_TYPES = [
+  ["local", DIRECTORY_TYPES.JS_DIRECTORY_TYPE],
+  ["CardDAV", DIRECTORY_TYPES.CARDDAV_DIRECTORY_TYPE],
+];
+const NAME_FIELDS = ["displayName", "firstName", "lastName"];
 const emails = [
   { type: "work", address: "ada@work.example" },
   { type: "home", address: "ada@home.example" },
@@ -22,11 +30,79 @@ const scalarFields = {
   birthday: "--12-10",
 };
 
+describe("stored vCard fixture fidelity", () => {
+  it("serializes supported values and metadata without sharing nested data across saves and loads", () => {
+    const uid = "serialized-contact";
+    const params = {
+      type: ["WoRk", "internet"], pref: "1", group: "item7",
+      "x-label": 'Desk, west; "A"\nLevel^2', pid: ["1.1", "2.1"],
+    };
+    const structuredName = [["Love;lace", "By,ron"], ["Ada", "Augusta"], "", "", ""];
+    const properties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("uid", {}, "text", uid),
+      new FakeVCardPropertyEntry("fn", {}, "text", "Ada, Countess; C:\\notes\nNext"),
+      new FakeVCardPropertyEntry("n", {}, "text", structuredName),
+      new FakeVCardPropertyEntry("email", params, "text", '"a;b\\c"@example.net'),
+      new FakeVCardPropertyEntry("adr", { group: "item8", type: "HoMe" }, "text",
+        ["PO;1", "", ["Main, St", "Floor\\2"], "Paris", "", "", ""]),
+      new FakeVCardPropertyEntry("org", {}, "text", ["Analytical; Engines", "R&D, team"]),
+      new FakeVCardPropertyEntry("nickname", {}, "text", ["Ada, A", "Countess; C"]),
+      new FakeVCardPropertyEntry("note", {}, "text", ["line1\r\nline2", "line3\rline4"]),
+      new FakeVCardPropertyEntry("url", { group: "item7" }, "uri", "https://example.com/a;b?q=x,y"),
+      new FakeVCardPropertyEntry("bday", {}, "date", "--12-10"),
+    ]);
+    const expectedRaw = [
+      "BEGIN:VCARD", "VERSION:" + VCARD_VERSION, "UID:" + uid,
+      "FN:Ada\\, Countess\\; C:\\\\notes\\nNext",
+      "N:Love\\;lace,By\\,ron;Ada,Augusta;;;",
+      "item7.EMAIL;TYPE=WoRk,internet;PREF=1;X-LABEL=\"Desk, west; ^'A^'^nLevel^^2\";PID=1.1,2.1:\"a\\;b\\\\c\"@example.net",
+      "item8.ADR;TYPE=HoMe:PO\\;1;;Main\\, St,Floor\\\\2;Paris;;;",
+      "ORG:Analytical\\; Engines;R&D\\, team",
+      "NICKNAME:Ada\\, A,Countess\\; C",
+      "NOTE:line1\\nline2,line3\\nline4",
+      "item7.URL;VALUE=URI:https://example.com/a;b?q=x,y",
+      "BDAY;VALUE=DATE:--12-10", "END:VCARD", "",
+    ].join(VCARD_LINE_ENDING);
+    assert.equal(properties.toVCard(), expectedRaw);
+
+    const book = new FakeAddressBook();
+    const loaded = book.addCard(new FakeAddrBookCard({ UID: uid }, properties));
+    assert.equal(loaded.getProperty(VCARD_PROPERTY), expectedRaw);
+    assert.equal(loaded.firstName, "Ada Augusta");
+    assert.equal(loaded.lastName, "Love;lace By,ron");
+    assert.equal(loaded.parsed, false);
+    params.type[0] = "Unsaved source type";
+    structuredName[0][0] = "Unsaved source name";
+    loaded.vCardProperties.getFirstEntry("email").params.type[1] = "Unsaved loaded type";
+    loaded.vCardProperties.getFirstEntry("n").value[0][1] = "Unsaved loaded name";
+    const fresh = book.reloadCard(uid);
+    assert.equal(fresh.getProperty(VCARD_PROPERTY), expectedRaw);
+    assert.equal(fresh.vCardProperties.toVCard(), expectedRaw);
+    assert.equal(book.savedCards.get(uid).vCardProperties.toVCard(), expectedRaw);
+  });
+
+  it("forwards the reloaded primaryEmail setter and rebuilds its cache on save", () => {
+    const book = new FakeAddressBook();
+    const runtime = loadContactRuntime({ books: [book] });
+    const created = runtime.create({ emails });
+    assert.equal(created.success, true, created.error);
+    const loaded = book.reloadCard(created.id);
+    const replacementAddress = "updated@example.com";
+    loaded.primaryEmail = replacementAddress;
+    assert.equal(loaded.primaryEmail, replacementAddress);
+    assert.equal(loaded.stats.parses, 1);
+    assert.equal(loaded.getProperty("PrimaryEmail"), emails[0].address, "cache changes only on save");
+    book.modifyCard(loaded);
+    const fresh = book.reloadCard(created.id);
+    assert.equal(fresh.primaryEmail, replacementAddress);
+    assert.equal(fresh.parsed, false);
+    assert.equal(runtime.searchContacts(replacementAddress)[0].id, created.id);
+    assert.equal(runtime.searchContacts(emails[0].address).length, 0);
+  });
+});
+
 describe("createContact native card selection and persistence", () => {
-  for (const [name, dirType] of [
-    ["local", DIRECTORY_TYPES.JS_DIRECTORY_TYPE],
-    ["CardDAV", DIRECTORY_TYPES.CARDDAV_DIRECTORY_TYPE],
-  ]) {
+  for (const [name, dirType] of VCARD_BOOK_TYPES) {
     it(`creates and reloads three typed emails and two mobile phones in a ${name} book`, () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
@@ -46,6 +122,20 @@ describe("createContact native card selection and persistence", () => {
 
       const firstLoad = book.childCards[0];
       const saved = book.savedCards.get(result.id);
+      assert.ok(firstLoad instanceof FakeStoredCard);
+      assert.equal(firstLoad.parsed, false, "create response uses the saved scalar caches");
+      assert.equal(firstLoad.displayName, scalarFields.displayName);
+      assert.equal(firstLoad.firstName, scalarFields.firstName);
+      assert.equal(firstLoad.lastName, scalarFields.lastName);
+      assert.equal(firstLoad.primaryEmail, emails[0].address);
+      assert.equal(firstLoad.getProperty("SecondEmail"), emails[1].address);
+      const raw = firstLoad.getProperty(VCARD_PROPERTY);
+      assert.ok(raw.startsWith("BEGIN:VCARD" + VCARD_LINE_ENDING + "VERSION:" + VCARD_VERSION + VCARD_LINE_ENDING));
+      assert.ok(raw.endsWith("END:VCARD" + VCARD_LINE_ENDING));
+      assert.ok(raw.includes(`UID:${result.id}${VCARD_LINE_ENDING}`));
+      assert.ok(raw.includes("NOTE:First line\\nSecond line" + VCARD_LINE_ENDING));
+      for (const { address } of emails) assert.ok(raw.includes(address));
+      assert.equal(firstLoad.stats.parses, 0, "cached scalars and raw text do not parse");
       assert.notStrictEqual(firstLoad, constructed);
       assert.notStrictEqual(firstLoad, saved);
       assert.notStrictEqual(saved.vCardProperties, constructed.vCardProperties);
@@ -58,17 +148,34 @@ describe("createContact native card selection and persistence", () => {
 
       const reloaded = book.reloadCard(result.id);
       assert.notStrictEqual(reloaded, firstLoad);
-      assert.equal(reloaded.getProperty("DisplayName", ""), "");
+      assert.equal(reloaded.getProperty("DisplayName"), scalarFields.displayName);
+      assert.equal(reloaded.getProperty("FirstName"), scalarFields.firstName);
+      assert.equal(reloaded.getProperty("LastName"), scalarFields.lastName);
+      assert.equal(reloaded.getProperty("PrimaryEmail"), emails[0].address);
+      assert.equal(reloaded.getProperty("SecondEmail"), emails[1].address);
+      assert.equal(reloaded.getProperty(VCARD_PROPERTY), raw);
+      assert.equal(reloaded.parsed, false);
+      assert.equal(reloaded.vCardProperties.getFirstValue("version"), VCARD_VERSION);
       assert.equal(reloaded.vCardProperties.getFirstValue("fn"), scalarFields.displayName);
       assert.deepEqual(reloaded.vCardProperties.getFirstValue("n"), ["Lovelace", "Ada", "", "", ""]);
       assert.deepEqual(reloaded.emailAddresses, emails.map(email => email.address));
       assert.equal(reloaded.primaryEmail, emails[0].address);
       assert.deepEqual(reloaded.vCardProperties.getAllEntries("email").map(entry => entry.params.pref), ["1", undefined, undefined]);
       assert.deepEqual(reloaded.vCardProperties.getAllEntries("tel").map(entry => entry.params.type), ["cell", "cell"]);
-      assert.deepEqual(structuredClone(runtime.getContact(result.id)), {
+      const expectedContact = {
         id: result.id, ...scalarFields, email: emails[0].address, emails, phones, addresses,
         addressBook: book.dirName, addressBookId: book.URI,
-      });
+      };
+      assert.deepEqual(structuredClone(runtime.getContact(result.id)), expectedContact);
+      for (const query of [...NAME_FIELDS.map(field => scalarFields[field]), ...emails.map(email => email.address)]) {
+        const fresh = book.reloadCard(result.id);
+        assert.equal(fresh.parsed, false);
+        const matches = runtime.searchContacts(query);
+        assert.deepEqual(structuredClone(matches), [expectedContact], query);
+        assert.equal(fresh.stats.parses, 1);
+        assert.equal(fresh.stats.emailReads, query === emails[2].address ? 1 : 0,
+          "only the third address needs parsed matching; names and the first two use caches");
+      }
     });
   }
 
@@ -231,6 +338,77 @@ describe("contact production module imports", () => {
 });
 
 describe("contact get/update/delete handler wiring", () => {
+  for (const [name, dirType] of VCARD_BOOK_TYPES) {
+    it(`replaces stale caches and raw data when updating and clearing a reloaded ${name} card`, () => {
+      const book = new FakeAddressBook({ dirType });
+      const runtime = loadContactRuntime({ books: [book] });
+      const created = runtime.create({ ...scalarFields, emails });
+      assert.equal(created.success, true, created.error);
+      const originalSnapshot = book.savedCards.get(created.id);
+      const originalRaw = originalSnapshot.getProperty(VCARD_PROPERTY);
+      const originalQueries = [...NAME_FIELDS.map(field => scalarFields[field]), ...emails.map(email => email.address)];
+      const changedNames = { displayName: "Rear Admiral", firstName: "Grace", lastName: "Hopper" };
+      const changedEmails = [
+        { type: "work", address: "grace@navy.example" },
+        { type: "home", address: "grace@home.example" },
+        { address: "grace@research.example" },
+      ];
+      const changedQueries = [...Object.values(changedNames), ...changedEmails.map(email => email.address)];
+      const live = book.reloadCard(created.id);
+      assert.equal(live.parsed, false);
+      const changed = runtime.update(created.id, { ...changedNames, emails: changedEmails });
+      assert.equal(changed.success, true, changed.error);
+      assert.deepEqual(book.calls.modify, [live]);
+      assert.equal(originalSnapshot.getProperty(VCARD_PROPERTY), originalRaw, "previous snapshots stay independent");
+
+      const reloaded = book.reloadCard(created.id);
+      for (const [property, value] of Object.entries({
+        DisplayName: changedNames.displayName, FirstName: changedNames.firstName, LastName: changedNames.lastName,
+        PrimaryEmail: changedEmails[0].address, SecondEmail: changedEmails[1].address,
+      })) {
+        assert.equal(reloaded.getProperty(property), value);
+      }
+      const changedRaw = reloaded.getProperty(VCARD_PROPERTY);
+      assert.notEqual(changedRaw, originalRaw);
+      for (const query of changedQueries) assert.ok(changedRaw.includes(query), query);
+      for (const query of originalQueries) assert.ok(!changedRaw.includes(query), query);
+      assert.equal(reloaded.parsed, false);
+      assert.equal(changedRaw, book.savedCards.get(created.id).vCardProperties.toVCard());
+
+      for (const query of changedQueries) {
+        const fresh = book.reloadCard(created.id);
+        const matches = runtime.searchContacts(query);
+        assert.equal(matches.length, 1, query);
+        assert.equal(matches[0].id, created.id);
+        for (const field of NAME_FIELDS) assert.equal(matches[0][field], changedNames[field]);
+        assert.deepEqual(structuredClone(matches[0].emails), changedEmails);
+        assert.equal(fresh.stats.emailReads, query === changedEmails[2].address ? 1 : 0);
+      }
+      for (const query of originalQueries) {
+        book.reloadCard(created.id);
+        assert.equal(runtime.searchContacts(query).length, 0, query);
+      }
+
+      const cleared = runtime.update(created.id, { displayName: "", firstName: "", lastName: "", emails: [] });
+      assert.equal(cleared.success, true, cleared.error);
+      const empty = book.reloadCard(created.id);
+      for (const property of ["DisplayName", "FirstName", "LastName", "PrimaryEmail", "SecondEmail"]) {
+        assert.equal(empty.getProperty(property), "", property);
+      }
+      assert.equal(empty.stored.has("PrimaryEmail"), false);
+      assert.equal(empty.stored.has("SecondEmail"), false);
+      const emptyRaw = empty.getProperty(VCARD_PROPERTY);
+      assert.notEqual(emptyRaw, changedRaw);
+      assert.equal(empty.parsed, false);
+      for (const query of [...originalQueries, ...changedQueries]) {
+        assert.ok(!emptyRaw.includes(query), query);
+        book.reloadCard(created.id);
+        assert.equal(runtime.searchContacts(query).length, 0, query);
+      }
+      assert.deepEqual(structuredClone(runtime.getContact(created.id).emails), []);
+    });
+  }
+
   for (const [name, dirType] of [
     ["vCard", DIRECTORY_TYPES.JS_DIRECTORY_TYPE], ["flat", DIRECTORY_TYPES.LDAP_DIRECTORY_TYPE],
   ]) {

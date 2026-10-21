@@ -38,6 +38,14 @@ const DIRECTORY_TYPES = Object.freeze({
   ASYNC_DIRECTORY_TYPE: "fixture:os",
 });
 
+const VCARD_PROPERTY = "_vCard";
+const VCARD_VERSION = "4.0";
+const VCARD_LINE_ENDING = "\r\n";
+const VCARD_STRUCTURED_PROPERTIES = new Set(["n", "adr", "org"]);
+const VCARD_CACHED_PROPERTIES = [
+  "DisplayName", "FirstName", "LastName", "PrimaryEmail", "SecondEmail",
+];
+
 class FakeVCardPropertyEntry {
   constructor(name, params, type, value) {
     Object.assign(this, { name, params, type, value });
@@ -107,6 +115,43 @@ class FakeVCardProperties {
 
   clone() {
     return new FakeVCardProperties(this.entries.map(entry => entry.clone()));
+  }
+
+  // Search/reuse: no fixture vCard serializer exists in test/helpers or the
+  // contact tests. This only writes the scalar/list/structured data used by
+  // these fakes; reload supplies cloned entries, never a handwritten parser.
+  toVCard() {
+    const escapeText = value => String(value ?? "")
+      .replace(/\\/g, "\\\\")
+      .replace(/\r\n|\r|\n/g, "\\n")
+      .replace(/[,;]/g, "\\$&");
+    const escapeParameter = value => {
+      const escaped = String(value)
+        .replace(/\^/g, "^^")
+        .replace(/\r\n|\r|\n/g, "^n")
+        .replace(/"/g, "^'");
+      return /[,:;]/.test(escaped) ? `"${escaped}"` : escaped;
+    };
+    const lines = ["BEGIN:VCARD"];
+    if (!this.getFirstEntry("version")) lines.push(`VERSION:${VCARD_VERSION}`);
+    for (const { name, params, type, value } of this.entries) {
+      let header = `${params.group ? `${params.group}.` : ""}${name.toUpperCase()}`;
+      for (const [key, parameter] of Object.entries(params)) {
+        if (key === "group") continue;
+        const values = Array.isArray(parameter) ? parameter : [parameter];
+        header += `;${key.toUpperCase()}=${values.map(escapeParameter).join(",")}`;
+      }
+      if (type !== "text" && !Object.hasOwn(params, "value")) {
+        header += `;VALUE=${type.toUpperCase()}`;
+      }
+      const scalar = part => type === "text" ? escapeText(part) : String(part ?? "");
+      const serialized = Array.isArray(value)
+        ? value.map(part => Array.isArray(part) ? part.map(scalar).join(",") : scalar(part))
+          .join(VCARD_STRUCTURED_PROPERTIES.has(name) ? ";" : ",")
+        : scalar(value);
+      lines.push(`${header}:${serialized}`);
+    }
+    return [...lines, "END:VCARD", ""].join(VCARD_LINE_ENDING);
   }
 }
 
@@ -217,14 +262,14 @@ class FakeAddrBookCard extends FakeFlatCard {
 // are supplied by tests; this fixture intentionally does not parse vCard text.
 class FakeStoredCard extends FakeAddrBookCard {
   constructor({ properties = {}, raw = "", entries = [], parseMode = "valid" } = {}) {
-    super({ ...properties, _vCard: raw }, new FakeVCardProperties(entries));
+    super({ ...properties, [VCARD_PROPERTY]: raw }, new FakeVCardProperties(entries));
     this.parseMode = parseMode;
     this.parsed = false;
     this.stats = { parses: 0, emailReads: 0, rawReads: 0, events: [] };
   }
 
   getProperty(name, fallback = "") {
-    if (name === "_vCard") this.stats.rawReads++;
+    if (name === VCARD_PROPERTY) this.stats.rawReads++;
     this.stats.events.push(name);
     return super.getProperty(name, fallback);
   }
@@ -236,7 +281,7 @@ class FakeStoredCard extends FakeAddrBookCard {
       this.stats.events.push("parse");
       if (this.parseMode === "empty") {
         this._vCardProperties = new FakeVCardProperties([
-          new FakeVCardPropertyEntry("version", {}, "text", "4.0"),
+          new FakeVCardPropertyEntry("version", {}, "text", VCARD_VERSION),
         ]);
       } else if (this.parseMode === "null") {
         this._vCardProperties = null;
@@ -247,9 +292,13 @@ class FakeStoredCard extends FakeAddrBookCard {
   }
 
   get displayName() { return this.parsed ? super.displayName : this.getProperty("DisplayName"); }
+  set displayName(value) { super.displayName = value; }
   get firstName() { return this.parsed ? super.firstName : this.getProperty("FirstName"); }
+  set firstName(value) { super.firstName = value; }
   get lastName() { return this.parsed ? super.lastName : this.getProperty("LastName"); }
+  set lastName(value) { super.lastName = value; }
   get primaryEmail() { return this.parsed ? super.primaryEmail : this.getProperty("PrimaryEmail"); }
+  set primaryEmail(value) { super.primaryEmail = value; }
   get emailAddresses() {
     this.stats.emailReads++;
     return super.emailAddresses;
@@ -274,8 +323,8 @@ class FakeAddressBook {
   addCard(card) {
     this.calls.add.push(card);
     if (this.readOnly) throw new Error("Address book is read-only");
-    const saved = card.clone();
-    if (!saved.UID) saved.UID = `${this.UID}-contact-${++this.nextUID}`;
+    const uid = card.UID || `${this.UID}-contact-${++this.nextUID}`;
+    const saved = this.prepareToSaveCard(card, uid);
     this.savedCards.set(saved.UID, saved);
     return this.reloadCard(saved.UID);
   }
@@ -283,7 +332,7 @@ class FakeAddressBook {
   modifyCard(card) {
     this.calls.modify.push(card);
     if (this.readOnly) throw new Error("Address book is read-only");
-    this.savedCards.set(card.UID, card.clone());
+    this.savedCards.set(card.UID, this.prepareToSaveCard(card));
   }
 
   deleteCards(cards) {
@@ -295,12 +344,49 @@ class FakeAddressBook {
     }
   }
 
-  // A saved vCard collection (including params.group) is cloned again on load.
-  // Never copy scalar getters into snapshots, and never parse vCard text here.
+  // Model AddrBookDirectory.prepareToSaveCard's cache/raw rebuild for the
+  // supported vCard fields. Reuse clone/getNamePart/native email ordering;
+  // caches must come from entries, never the potentially stale property bag.
+  prepareToSaveCard(card, uid = card.UID) {
+    const saved = card.clone();
+    if (saved.UID !== uid) saved.UID = uid;
+    if (!saved.supportsVCard) return saved;
+
+    const properties = saved.vCardProperties;
+    if (!properties.getFirstEntry("version")) {
+      properties.entries.unshift(new FakeVCardPropertyEntry("version", {}, "text", VCARD_VERSION));
+    }
+    if (properties.getFirstValue("uid") !== uid) {
+      properties.clearValues("uid");
+      properties.addEntry(new FakeVCardPropertyEntry("uid", {}, "text", uid));
+    }
+    for (const name of VCARD_CACHED_PROPERTIES) saved.stored.delete(name);
+    saved.stored.set(VCARD_PROPERTY, properties.toVCard());
+    saved.stored.set("DisplayName", properties.getFirstValue("fn") || "");
+    if (Array.isArray(properties.getFirstValue("n"))) {
+      saved.stored.set("FirstName", saved.getNamePart(1));
+      saved.stored.set("LastName", saved.getNamePart(0));
+    }
+    const emails = properties.getAllValuesSorted("email");
+    if (emails[0]) saved.stored.set("PrimaryEmail", emails[0]);
+    if (emails[1]) saved.stored.set("SecondEmail", emails[1]);
+    return saved;
+  }
+
+  // Loading exposes cached scalars and serialized text before the first lazy
+  // vCard access. Both the property bag and supplied parse result are isolated
+  // from the saved snapshot. Flat providers keep their existing clone path.
   reloadCard(id) {
     const saved = this.savedCards.get(id);
     if (!saved) return null;
-    const card = saved.clone();
+    const card = saved.supportsVCard
+      ? new FakeStoredCard({
+        properties: Object.fromEntries(structuredClone(saved.stored)),
+        raw: saved.getProperty(VCARD_PROPERTY),
+        entries: saved.vCardProperties.clone().entries,
+      })
+      : saved.clone();
+    card.isMailList = saved.isMailList;
     const index = this.cards.findIndex(existing => existing.UID === id);
     if (index < 0) this.cards.push(card);
     else this.cards[index] = card;
