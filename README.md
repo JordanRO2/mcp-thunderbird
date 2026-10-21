@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/40_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/43_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-128%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 43 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
@@ -54,11 +54,18 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
+| `createVirtualFolder` | Create a saved search over accessible real folders without moving or copying mail. Existing folder names, special root names, hidden servers, and unsuitable parents are refused. |
+| `listVirtualFolders` | List saved searches with account keys, scope, and conditions. Omit the entire view if any scope is inaccessible, hidden, wildcard, unresolved, or unreadable. |
+| `deleteVirtualFolder` | Remove only a saved-search view. Refuse real folders, views with subfolders or their own message headers, and unreadable state. |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+
+A saved search is a live view in Thunderbird's folder pane. Its message counts populate after it is first opened. MCP message tools read folder storage, not saved-search results; use `searchMessages` on the source folders for retrieval. Saved searches cannot be move/copy destinations or parents for `createFolder`/`moveFolder`.
+
+`createVirtualFolder` uses the same condition vocabulary as `createFilter`. `booleanAnd: true` means AND with the previous term; `false` means OR (default true). Use the same value for all conditions when editing the view through Thunderbird's single all/any choice. Supply individual real folders, not account roots or other saved searches; duplicate folders are searched once. Address-book conditions (`isInAB`/`isntInAB`) require **Allow all address books** while account restrictions are active. A failed native creation can leave an empty folder; the tool never deletes a folder to undo a failed creation.
 
 `searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
 
@@ -136,7 +143,7 @@ Move/Copy destinations must remain accessible under the current account restrict
 
 New or replaced Move/Copy actions store the resolved folder's canonical URI, including when the supplied URI uses another accepted spelling.
 
-`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible or Outbox Move/Copy destinations, rules with address book conditions while address books are restricted, and Forward/Reply rules while the setting is off. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
+`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible, Outbox, or saved-search Move/Copy destinations, rules with address book conditions while address books are restricted, and Forward/Reply rules while the setting is off. Creation and updates also refuse saved-search destinations, including retained actions; disabling, deleting, or repairing an existing rule remains possible. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
 
 ### Contacts
 
@@ -363,7 +370,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 40 MCP tools + auth + access control
+│       ├── api.js              # All 43 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
