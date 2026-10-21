@@ -17,7 +17,7 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, hdr: headerOverrides = {} } = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
     options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
@@ -37,6 +37,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
   const hdr = {
     messageId: "message-1", subject: "protected subject", author: "sender@example.test",
     recipients: "reader@example.test", folder, date: 0,
+    ...headerOverrides,
   };
   const sandbox = {
     console: { error: (...args) => calls.logs.push(args), warn: (...args) => calls.logs.push(args) },
@@ -176,6 +177,18 @@ const protectedRawOriginals = [
 ];
 
 describe("Encrypted message privacy", () => {
+  it("getMessage keeps complete recipient and raw Cc lists for an explicit read", async () => {
+    const raw = "=?UTF-8?Q?Doe=2C_John?= <j@x>, b@x, c@x, d@x";
+    const decoded = "Doe, John <j@x>, b@x, c@x, d@x";
+    const { api } = loadMessageTools({ hdr: {
+      recipients: raw, mime2DecodedRecipients: decoded, ccList: raw,
+    } });
+    const result = await api.getMessage("message-1", "folder");
+    assert.equal(result.recipients, decoded);
+    assert.equal(result.ccList, raw);
+    assert.equal(result.body, "visible");
+  });
+
   for (const encrypted of encryptedTrees) {
     for (const rawSource of [false, true]) {
       it(`withholds ${encrypted.label}, rawSource=${rawSource}, before any content or attachment access`, async () => {

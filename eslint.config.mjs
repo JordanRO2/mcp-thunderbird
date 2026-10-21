@@ -50,6 +50,7 @@ export default [
       "dist/",
       "extension/buildinfo.json",
       "extension/httpd.sys.mjs",  // vendored Mozilla httpd, not ours
+      "test/vendor/thunderbird/", // unmodified upstream MIME parser fixtures
       ".claude/",
     ],
   },

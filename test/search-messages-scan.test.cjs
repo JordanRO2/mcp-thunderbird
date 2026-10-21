@@ -8,6 +8,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { loadRefreshRuntime } = require("./helpers/refresh-runtime.cjs");
 const { makeImapFolder, makeMailSession } = require("./helpers/imap-folder.cjs");
+const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
+const recipientRowFixtures = require("./helpers/recipient-row-fixtures.cjs");
 
 const FOLDER_FLAGS = { Virtual: 0x20, ImapNoselect: 0x01000000 };
 const SYNC_WAIT_MS = 5000;
@@ -119,6 +121,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
   for (const folder of folders.values()) folder.server = accounts.find(account => account.key === folder.account).incomingServer;
   const allowedAccounts = new Set(accounts.map(account => account.key));
   const session = makeMailSession();
+  const { headerParser, mimeConverter } = loadThunderbirdHeaderParser();
   let notifyingFolder = false;
   const fireFolderEvent = session.mailSession.fire;
   session.mailSession.fire = (...args) => {
@@ -168,7 +171,8 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
       NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
       MailServices: {
         mailSession: session.mailSession,
-        mimeConverter: { decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
+        mimeConverter,
+        headerParser,
         folderLookup: { getFolderForURL: uri => folders.get(uri) },
         accounts: { accounts, findAccountForServer: server => accounts.find(account => account.incomingServer === server) },
       },
@@ -587,6 +591,263 @@ describe("searchMessages counts and folder freshness", () => {
     assert.equal(result.folderRefresh, undefined);
     assert.equal(folder.imapUpdateCalls, 0);
     assert.equal(folder.stats.refreshes, 0);
+  });
+});
+
+describe("searchMessages rows cap address lists", () => {
+  const LONG = ["a@x.example", "\"Doe, John\" <j@x.example>", "c@x.example", "d@x.example", "e@x.example"].join(", ");
+  const SHORTENED = 'a@x.example, "Doe, John" <j@x.example>, c@x.example (+2 more)';
+  const ENCODED_THREE = "=?UTF-8?Q?Doe=2C_John?= <j@x.example>, b@x.example, c@x.example";
+  const DECODED_THREE = "Doe, John <j@x.example>, b@x.example, c@x.example";
+
+  function recipientFields(raw = LONG, display = raw) {
+    return { recipients: raw, mime2DecodedRecipients: display, ccList: raw };
+  }
+
+  function recordParserCalls(harness) {
+    const parser = harness.runtime.MailServices.headerParser;
+    const calls = { parse: [], render: [] };
+    for (const [method, values] of [["parseEncodedHeaderW", calls.parse], ["makeMimeHeader", calls.render]]) {
+      const original = parser[method];
+      parser[method] = function (value, ...args) {
+        values.push(value);
+        return original.call(this, value, ...args);
+      };
+    }
+    return calls;
+  }
+
+  for (const fullRecipients of [undefined, false, null]) {
+    it(`preserves 0/1/3-mailbox lists exactly and caps 4 when fullRecipients is ${fullRecipients}`, async () => {
+      const unchanged = ["", "  One (Sales) <one@x.example>  ", ' "Doe, Jane" <j@x.example>, second@x.example, third@x.example  ', "Undisclosed:;"];
+      const four = "one@x.example, two@x.example, three@x.example, four@x.example";
+      const folder = makeFolder("Inbox", { messages: [...unchanged, four].map(value => recipientFields(value)) });
+      const h = makeHarness({ roots: [folder] });
+      const args = { sortOrder: "asc", ...(fullRecipients === undefined ? {} : { fullRecipients }) };
+      const rows = await h.search(args);
+      assert.equal(rows.length, unchanged.length + 1);
+      for (let index = 0; index < unchanged.length; index++) {
+        assert.equal(rows[index].recipients, unchanged[index]);
+        assert.equal(rows[index].ccList, unchanged[index]);
+      }
+      assert.equal(rows.at(-1).recipients, "one@x.example, two@x.example, three@x.example (+1 more)");
+      assert.equal(rows.at(-1).ccList, rows.at(-1).recipients);
+    });
+  }
+
+  it("shows the first three addresses and how many more, keeping quoted names whole", async () => {
+    const folder = makeFolder("Inbox", { messages: [{ ...recipientFields(), ccList: "f@x.example, g@x.example" }] });
+    const [row] = await makeHarness({ roots: [folder] }).search();
+    assert.equal(row.recipients, SHORTENED);
+    assert.equal(row.ccList, "f@x.example, g@x.example", "short lists stay untouched");
+  });
+
+  it("counts the original encoded comma as a name, preserving genuine three-mailbox output byte for byte", async () => {
+    const folder = makeFolder("Inbox", { messages: [recipientFields(ENCODED_THREE, DECODED_THREE)] });
+    const h = makeHarness({ roots: [folder] });
+    // These are the actual Thunderbird parser results behind the original bug.
+    const parser = h.runtime.MailServices.headerParser;
+    assert.equal(parser.parseEncodedHeaderW(ENCODED_THREE).length, 3);
+    assert.equal(parser.parseDecodedHeader(DECODED_THREE, false).length, 4);
+    const calls = recordParserCalls(h);
+    const [row] = await h.search();
+    assert.equal(row.recipients, DECODED_THREE);
+    assert.equal(row.ccList, ENCODED_THREE, "short Cc keeps its existing raw representation");
+    assert.deepEqual(calls.parse, [ENCODED_THREE, ENCODED_THREE]);
+    assert.equal(calls.render.length, 0);
+  });
+
+  it("selects and renders encoded-comma mailboxes correctly when there are more than three", async () => {
+    const raw = `${ENCODED_THREE}, d@x.example, e@x.example`;
+    const display = `${DECODED_THREE}, d@x.example, e@x.example`;
+    const folder = makeFolder("Inbox", { messages: [recipientFields(raw, display)] });
+    const [row] = await makeHarness({ roots: [folder] }).search();
+    const expected = '"Doe, John" <j@x.example>, b@x.example, c@x.example (+2 more)';
+    assert.equal(row.recipients, expected);
+    assert.equal(row.ccList, expected);
+  });
+
+  it("handles B-encoded Unicode, escaped quotes, comments and groups with the real parser", async () => {
+    const raw = '=?UTF-8?B?Wm/Dqw==?= <z@x.example>, "A \\"Quote\\"" <q@x.example>, Team: c@x.example (third), d@x.example, e@x.example;';
+    const display = raw.replace("=?UTF-8?B?Wm/Dqw==?=", "Zoë");
+    const folder = makeFolder("Inbox", { messages: [recipientFields(raw, display)] });
+    const [row] = await makeHarness({ roots: [folder] }).search();
+    const expected = 'Zoë <z@x.example>, "A \\"Quote\\"" <q@x.example>, third <c@x.example> (+2 more)';
+    assert.equal(row.recipients, expected);
+    assert.equal(row.ccList, expected);
+  });
+
+  for (const searchBody of [false, true]) {
+    for (const fixture of recipientRowFixtures) {
+      it(`counts only real mailboxes through ${searchBody ? "Gloda" : "ordinary search"}: ${fixture.raw}`, async () => {
+        const { mimeConverter } = loadThunderbirdHeaderParser();
+        const display = mimeConverter.decodeMimeHeader(fixture.raw, null, false, true);
+        const folder = makeFolder("Inbox", { messages: [recipientFields(fixture.raw, display)] });
+        const glodaItems = [{ folderMessage: folder.headers.get(1) }];
+        const h = makeHarness({ roots: [folder], glodaItems });
+        const calls = recordParserCalls(h);
+        for (const fullRecipients of [undefined, false, null, true]) {
+          const args = { query: searchBody ? "body" : "", searchBody };
+          if (fullRecipients !== undefined) args.fullRecipients = fullRecipients;
+          const [row] = await h.search(args);
+          const summary = fullRecipients === true ? undefined : fixture.summary;
+          assert.equal(row.recipients, summary ?? display);
+          assert.equal(row.ccList, summary ?? fixture.raw);
+        }
+        assert.equal(calls.parse.length, 6, "full mode bypasses the parser");
+        assert.equal(calls.render.length, fixture.mailboxes > 3 ? 6 : 0, "short fields are never re-rendered");
+      });
+    }
+
+    it(`returns exact full lists without parser work through ${searchBody ? "Gloda completion" : "ordinary search dispatch"}`, async () => {
+      const raw = `  ${ENCODED_THREE}, d@x.example, e@x.example  `;
+      const display = `  ${DECODED_THREE}, d@x.example, e@x.example  `;
+      const folder = makeFolder("Inbox", { messages: [recipientFields(raw, display)] });
+      const glodaItems = [{ folderMessage: folder.headers.get(1) }];
+      const h = makeHarness({ roots: [folder], glodaItems });
+      const calls = recordParserCalls(h);
+      for (const offset of [undefined, 0]) {
+        const result = await h.search({ query: searchBody ? "body" : "", searchBody, offset, fullRecipients: true });
+        const [row] = Array.isArray(result) ? result : result.messages;
+        assert.equal(row.recipients, display);
+        assert.equal(row.ccList, raw);
+      }
+      assert.deepEqual(calls, { parse: [], render: [] });
+    });
+
+    it(`formats only the returned page through ${searchBody ? "Gloda" : "ordinary search"}`, async () => {
+      const folder = makeFolder("Inbox", { messages: Array.from({ length: 100 }, () => recipientFields()) });
+      const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+      const h = makeHarness({ roots: [folder], glodaItems });
+      const calls = recordParserCalls(h);
+      const args = { query: searchBody ? "body" : "", searchBody, maxResults: 1, sortOrder: "asc" };
+      const page = await h.search({ ...args, offset: 73 });
+      assert.equal(page.messages[0].id, "m-73@example.com");
+      assert.equal(page.messages[0].recipients, SHORTENED);
+      assert.equal(page.messages[0].ccList, SHORTENED);
+      assert.equal(page.totalMatches, 100);
+      assert.equal(page.hasMore, true);
+      assert.deepEqual(calls.parse, [LONG, LONG]);
+      assert.equal(calls.render.length, 2);
+      assert.ok(Object.keys(page.messages[0]).every(key => !key.startsWith("_")));
+      calls.parse.length = calls.render.length = 0;
+      assert.deepEqual((await h.search({ ...args, offset: 100 })).messages, []);
+      assert.equal((await h.search({ ...args, countOnly: true })).count, 100);
+      const full = await h.search({ ...args, offset: 73, fullRecipients: true });
+      assert.equal(full.messages[0].recipients, LONG);
+      assert.deepEqual(calls, { parse: [], render: [] });
+      if (searchBody) {
+        assert.equal(page.truncated, true);
+        assert.match(page.message, /completeness cannot be verified/);
+        assert.equal(page.folderRefresh, undefined);
+      } else {
+        assert.equal(page.truncated, undefined);
+        assert.deepEqual(page.folderRefresh, CONFIRMED_REFRESH);
+      }
+    });
+
+    for (const paged of [false, true]) {
+      it(`keeps before/failing/after rows when either field fails parsing or real emission (${searchBody ? "Gloda" : "ordinary"}, ${paged ? "page" : "array"})`, async () => {
+        for (const failure of ["parse", "render"]) {
+          for (const field of ["recipients", "ccList"]) {
+            const raw = failure === "parse" ? `${ENCODED_THREE}, d@x.example`
+              : `${"A".repeat(901)} <a@x.example>, b@x.example, c@x.example, d@x.example`;
+            const display = failure === "parse" ? `${DECODED_THREE}, d@x.example` : raw;
+            const broken = field === "recipients" ? { recipients: raw, mime2DecodedRecipients: display } : { ccList: raw };
+            const folder = makeFolder("Inbox", { messages: [recipientFields(), { ...recipientFields(), ...broken }, recipientFields()] });
+            const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+            const h = makeHarness({ roots: [folder], glodaItems });
+            const parser = h.runtime.MailServices.headerParser;
+            if (failure === "parse") {
+              const parse = parser.parseEncodedHeaderW;
+              parser.parseEncodedHeaderW = function (value) {
+                if (value === raw) throw new Error("Header parser failed");
+                return parse.call(this, value);
+              };
+            } else {
+              assert.throws(() => parser.makeMimeHeader(parser.parseEncodedHeaderW(raw).slice(0, 3)), /Cannot encode .* due to length/);
+            }
+            const result = await h.search({ query: searchBody ? "body" : "", searchBody, sortOrder: "asc", ...(paged ? { offset: 0 } : {}) });
+            const rows = paged ? result.messages : result;
+            assert.deepEqual(rows.map(row => row.id), ["m-0@example.com", "m-1@example.com", "m-2@example.com"], `${failure}: ${field}`);
+            assert.equal(rows[1][field], field === "recipients" ? display : raw);
+            const other = field === "recipients" ? "ccList" : "recipients";
+            assert.equal(rows[1][other], SHORTENED, "a failed field does not suppress the other summary");
+            for (const row of [rows[0], rows[2]]) {
+              assert.equal(row.recipients, SHORTENED);
+              assert.equal(row.ccList, SHORTENED);
+            }
+            if (paged) {
+              assert.equal(result.totalMatches, 3);
+              assert.equal(result.hasMore, false);
+              assert.equal(result.truncated, searchBody ? true : undefined);
+              if (searchBody) assert.match(result.message, /completeness cannot be verified/);
+              else assert.deepEqual(result.folderRefresh, CONFIRMED_REFRESH);
+            }
+          }
+        }
+      });
+    }
+  }
+
+  it("keeps both full fields when the parser is unavailable or returns no address array", async () => {
+    for (const parser of [{}, { parseEncodedHeaderW: () => null }]) {
+      const raw = `${ENCODED_THREE}, d@x.example`;
+      const display = `${DECODED_THREE}, d@x.example`;
+      const folder = makeFolder("Inbox", { messages: [recipientFields(raw, display)] });
+      const h = makeHarness({ roots: [folder] });
+      h.runtime.MailServices.headerParser = parser;
+      const [row] = await h.search();
+      assert.equal(row.recipients, display);
+      assert.equal(row.ccList, raw);
+    }
+  });
+
+  it("keeps a row when reading its original To header fails, and bypasses that getter in full mode", async () => {
+    for (const fullRecipients of [false, true]) {
+      const folder = makeFolder("Inbox", { messages: [recipientFields(), recipientFields(), recipientFields()] });
+      let rawReads = 0;
+      Object.defineProperty(folder.headers.get(2), "recipients", {
+        get() { rawReads++; throw new Error("Original header unavailable"); },
+      });
+      const result = await makeHarness({ roots: [folder] }).search({ offset: 0, sortOrder: "asc", fullRecipients });
+      assert.deepEqual(result.messages.map(row => row.id), ["m-0@example.com", "m-1@example.com", "m-2@example.com"]);
+      assert.equal(result.messages[1].recipients, LONG);
+      assert.equal(result.messages[1].ccList, fullRecipients ? LONG : SHORTENED);
+      assert.equal(result.totalMatches, 3);
+      assert.equal(result.truncated, undefined);
+      assert.equal(rawReads, fullRecipients ? 0 : 1);
+    }
+  });
+
+  it("matches hidden fifth To/Cc recipients with either output setting", async () => {
+    const folder = makeFolder("Inbox", { messages: [recipientFields()] });
+    const h = makeHarness({ roots: [folder] });
+    for (const query of ["to:e@x.example", "cc:e@x.example"]) {
+      for (const fullRecipients of [false, true]) {
+        const rows = await h.search({ query, fullRecipients });
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].recipients, fullRecipients ? LONG : SHORTENED);
+        assert.equal(rows[0].ccList, fullRecipients ? LONG : SHORTENED);
+      }
+      assert.equal((await h.search({ query, countOnly: true })).count, 1);
+    }
+  });
+
+  it("preserves dedup locations and account restrictions in capped and full modes", async () => {
+    const first = makeFolder("Inbox", { messages: [{ ...recipientFields(), messageId: "duplicate@example.com" }] });
+    const second = makeFolder("Archive", { messages: [{ ...recipientFields(), messageId: "duplicate@example.com" }] });
+    const privateFolder = makeFolder("Private", { account: "private", messages: [recipientFields()] });
+    for (const fullRecipients of [false, true]) {
+      const h = makeHarness({ roots: [first, second, privateFolder] });
+      h.allowedAccounts.delete("private");
+      const result = await h.search({ folderPath: undefined, offset: 0, fullRecipients });
+      assert.equal(result.totalMatches, 1);
+      assert.equal(result.messages.length, 1);
+      assert.equal(result.messages[0].recipients, fullRecipients ? LONG : SHORTENED);
+      assert.deepEqual(result.messages[0].dupLocations, [second.URI]);
+      assert.doesNotMatch(JSON.stringify(result), /imap:\/\/private/);
+    }
   });
 });
 
@@ -1123,6 +1384,25 @@ describe("searchMessages protects subjects of encrypted mail", () => {
     assert.equal(page.messages[1].encryptedContentWithheld, undefined);
     assert.doesNotMatch(JSON.stringify(page), /Secret plans/);
     assert.equal(folder.rawReads, 1);
+  });
+
+  it("preserves subject privacy while shortening or returning full recipient fields", async () => {
+    const recipients = "a@x.example, b@x.example, c@x.example, d@x.example";
+    for (const fullRecipients of [false, true]) {
+      const folder = makeProtectedFolder([{
+        ...protectedRow("Secret plans"), recipients, mime2DecodedRecipients: recipients, ccList: recipients,
+      }]);
+      const result = await makeHarness({ roots: [folder] }).search({ offset: 0, fullRecipients });
+      const [row] = result.messages;
+      assert.equal(row.recipients, fullRecipients ? recipients : "a@x.example, b@x.example, c@x.example (+1 more)");
+      assert.equal(row.ccList, row.recipients);
+      assert.equal(row.subject, "Encrypted Message");
+      assert.equal(row.preview, undefined);
+      assert.equal(row.encryptedContentWithheld, true);
+      assert.doesNotMatch(JSON.stringify(result), /Secret plans/);
+      assert.equal(folder.rawReads, 1);
+      assert.deepEqual(result.folderRefresh, CONFIRMED_REFRESH);
+    }
   });
 
   it("does not match cached subjects or previews of encrypted mail", async () => {

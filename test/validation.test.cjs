@@ -2307,6 +2307,44 @@ describe('Outbound attachment failures are atomic', () => {
   });
 });
 
+describe('recipient summary production schemas', () => {
+  const runtime = loadProductionAttachmentValidation();
+  vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'), runtime);
+
+  for (const name of ['searchMessages', 'getRecentMessages']) {
+    it(`${name} accepts the optional boolean and null without changing the default`, () => {
+      const tool = runtime.buildTools().find(item => item.name === name);
+      assert.equal(tool.inputSchema.properties.fullRecipients.type, 'boolean');
+      assert.ok(!tool.inputSchema.required.includes('fullRecipients'));
+      for (const fullRecipients of [undefined, null, false, true]) {
+        const args = { query: '', fullRecipients };
+        if (name === 'getRecentMessages') delete args.query;
+        assert.equal(runtime.validateToolArgs(name, args).length, 0);
+        assert.equal(runtime.coerceToolArgs(name, args).fullRecipients, fullRecipients);
+      }
+    });
+
+    it(`${name} applies the existing boolean coercion and rejects other types`, () => {
+      for (const text of ['true', 'false']) {
+        const args = runtime.coerceToolArgs(name, { fullRecipients: text });
+        assert.equal(args.fullRecipients, text === 'true');
+      }
+      for (const fullRecipients of [1, {}, [], 'yes']) {
+        const args = { query: '', fullRecipients };
+        if (name === 'getRecentMessages') delete args.query;
+        assert.ok(runtime.validateToolArgs(name, args).some(error => error.includes('fullRecipients')));
+      }
+    });
+  }
+
+  it('keeps full message and header reader schemas separate from row summaries', () => {
+    for (const name of ['getMessage', 'getMessages', 'getMessageHeaders', 'batchGetMessageHeaders']) {
+      const tool = runtime.buildTools().find(item => item.name === name);
+      assert.equal(Object.hasOwn(tool.inputSchema.properties, 'fullRecipients'), false);
+    }
+  });
+});
+
 describe('saveDraft dedicated scheduling schema', () => {
   const runtime = loadProductionAttachmentValidation();
   vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'), runtime);

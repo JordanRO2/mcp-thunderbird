@@ -2525,6 +2525,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const MAX_REMINDER_MINUTES = 40320;
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
+      const fullRecipientsDescription = 'If true, return complete recipients and ccList. By default, each list shows the first 3 addresses plus "(+N more)". Matching uses full headers; getMessage and the header readers always return full lists.';
       const attendeeSchema = {
         type: "object",
         properties: {
@@ -2635,6 +2636,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             countOnly: { type: "boolean", description: "If true, return a best-effort count of currently resolvable, non-expunged collected candidates, respecting dedupByMessageId and including candidates beyond the requested page. Rechecks yield without hydrating result content. If the search deadline interrupts validation, only validated rows count and truncated:true is returned; this count can be zero." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing. Gloda supplies relevance-limited candidates without a completeness indicator; object responses report truncated:true. Without offset, message results remain a plain array without completeness information. Narrow the text query; use header search when header/preview matching is sufficient." },
             dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
+            fullRecipients: { type: "boolean", description: fullRecipientsDescription },
           },
           required: ["query"],
         },
@@ -3161,6 +3163,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
+            fullRecipients: { type: "boolean", description: fullRecipientsDescription },
           },
           required: [],
         },
@@ -3738,6 +3741,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // BEGIN SEARCH RESULT HELPERS
+            const LIST_ROW_ADDRESS_LIMIT = 3;
+
+            /**
+             * Shortens an address list for a search/list result row to its
+             * first LIST_ROW_ADDRESS_LIMIT addresses plus "(+N more)". Rows
+             * serve to decide which message to read; one newsletter search
+             * answer weighed 44 KB because each row carried 60-80 recipients.
+             * getMessage keeps the full lists; fullRecipients keeps them here.
+             * Parse the original encoded header: decoding a display name can
+             * introduce commas that must not become address separators. Short
+             * lists and failures preserve the existing display value verbatim.
+             */
+            function capAddressList(encodedValue, value, fullRecipients) {
+              if (fullRecipients === true || typeof value !== "string" || !value) return value;
+              try {
+                if (typeof encodedValue !== "string" || !encodedValue) return value;
+                const addresses = MailServices.headerParser.parseEncodedHeaderW(encodedValue);
+                if (!Array.isArray(addresses)) return value;
+                // Empty groups, standalone comments and display names can
+                // produce entries without an address. They do not occupy slots
+                // in the summary, but short lists keep their original display.
+                const mailboxes = addresses.filter(address => typeof address.email === "string" && address.email.trim());
+                if (mailboxes.length <= LIST_ROW_ADDRESS_LIMIT) return value;
+                const shown = MailServices.headerParser.makeMimeHeader(mailboxes.slice(0, LIST_ROW_ADDRESS_LIMIT));
+                return typeof shown === "string" && shown
+                  ? `${shown} (+${mailboxes.length - LIST_ROW_ADDRESS_LIMIT} more)` : value;
+              } catch {
+                // A display summary must never hide a message, including when
+                // the emitter cannot render an unusually long address token.
+                return value;
+              }
+            }
+
             /**
              * Apply offset-based pagination to a sorted results array.
              * Removes the internal _dateTs property from each result.
@@ -3850,7 +3886,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ? header : null;
             }
 
-            async function finishSearchResults(results, offset, effectiveLimit, sortOrder, countOnly, dedupByMessageId, scan) {
+            async function finishSearchResults(results, offset, effectiveLimit, sortOrder, countOnly, dedupByMessageId, scan, fullRecipients) {
               searchTimeExpired(scan);
               // Recheck after cooperative yields, before dedup can expose locations
               // or a count from an account whose access was revoked during the scan.
@@ -3968,6 +4004,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       flagged: msgHdr.isFlagged,
                       tags: getUserTags(msgHdr),
                     };
+                    if (fullRecipients !== true) {
+                      try {
+                        message.recipients = capAddressList(msgHdr.recipients, message.recipients, fullRecipients);
+                      } catch { /* Optional raw-header access failed; keep the full display value. */ }
+                      message.ccList = capAddressList(message.ccList, message.ccList, fullRecipients);
+                    }
                     if (preview) message.preview = preview;
                     if (!allowEncrypted && hasRecordedEncryption(msgHdr)) withholdProtectedSubject(message, msgHdr);
                     if (row.dupLocations) message.dupLocations = row.dupLocations;
@@ -6445,7 +6487,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * searchMessages. IMAP accounts need offline sync for body
              * indexing; without it only headers are searched.
              */
-            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId) {
+            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId, fullRecipients) {
               // Gloda limits ranked candidates before excluding deleted/stale rows;
               // even a collection below that limit cannot prove completeness.
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: true, glodaLimited: true };
@@ -6484,7 +6526,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (timer) timer.cancel();
                   if (searcher) searcher.listener = null;
                   try {
-                    resolve(await finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan));
+                    resolve(await finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan, fullRecipients));
                   } catch (e) {
                     resolve({ error: e.toString() });
                   }
@@ -6565,12 +6607,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-	            async function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
+	            async function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId, fullRecipients) {
 	              // Gloda full-body search path (async)
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
 	                if (!query) return { error: "searchBody requires a non-empty query" };
-	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
+	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId, fullRecipients);
 	              }
 	              const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
 	              const results = [];
@@ -6735,7 +6777,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              return finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan);
+              return finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan, fullRecipients);
             }
             // END MESSAGE SEARCH
 
@@ -12216,7 +12258,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders, fullRecipients) {
               const results = [];
               const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
@@ -12259,6 +12301,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
+                    if (fullRecipients !== true) {
+                      try {
+                        // Retain only the original string, not another native
+                        // header handle. Formatting waits for the returned page.
+                        Object.defineProperty(result, "_rawRecipients", { value: msgHdr.recipients, configurable: true });
+                      } catch { /* Keep the full display value if the raw header is unavailable. */ }
+                    }
                     if (!allowEncrypted && hasRecordedEncryption(msgHdr)) {
                       result.subject = WITHHELD_SUBJECT;
                       result.encryptedContentWithheld = true;
@@ -12304,6 +12353,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const response = paginate(results, offset, effectiveLimit);
               for (const row of Array.isArray(response) ? response : response.messages) {
+                row.recipients = capAddressList(row._rawRecipients, row.recipients, fullRecipients);
+                row.ccList = capAddressList(row.ccList, row.ccList, fullRecipients);
+                delete row._rawRecipients;
                 if (!row._protectedHdr) continue;
                 withholdProtectedSubject(row, row._protectedHdr);
                 delete row._protectedHdr;
@@ -14046,7 +14098,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath, args.format, args.favoritesOnly);
                 case "searchMessages":
-                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId);
+                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId, args.fullRecipients);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource, args.includeInlineImages);
                 case "getMessages":
@@ -14094,7 +14146,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders, args.fullRecipients);
                 case "displayMessage":
                   return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":

@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
+const recipientRowFixtures = require("./helpers/recipient-row-fixtures.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Same marker assertions and VM loading pattern as privacy-messages.test.cjs.
@@ -49,7 +51,18 @@ function makeHeader(folder, { id, enigmail = 0, raw = CLEAR_RAW, date = 1, subje
 }
 
 function loadTools({ allowed = false, streamError = null } = {}) {
-  const stats = { streams: 0, bytesRead: 0, closed: 0, displayed: 0 };
+  const stats = { streams: 0, bytesRead: 0, closed: 0, displayed: 0, parsedHeaders: [], renders: 0 };
+  const { headerParser, mimeConverter } = loadThunderbirdHeaderParser();
+  const parseEncodedHeaderW = headerParser.parseEncodedHeaderW.bind(headerParser);
+  const makeMimeHeader = headerParser.makeMimeHeader.bind(headerParser);
+  headerParser.parseEncodedHeaderW = value => {
+    stats.parsedHeaders.push(value);
+    return parseEncodedHeaderW(value);
+  };
+  headerParser.makeMimeHeader = addresses => {
+    stats.renders++;
+    return makeMimeHeader(addresses);
+  };
   const folder = {
     URI: "imap://account/INBOX", prettyName: "INBOX", hasSubFolders: false,
     getMsgInputStream(msgHdr) {
@@ -64,9 +77,7 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     console,
     Services: { prefs: { getBoolPref: (name, fallback) => (name.endsWith(".allowEncryptedMessages") ? allowed : fallback) } },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
-    MailServices: {
-      mimeConverter: { decodeMimeHeader: (value) => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
-    },
+    MailServices: { mimeConverter, headerParser },
     ChromeUtils: { importESModule: () => ({ MailUtils: { displayMessageInFolderTab() { stats.displayed++; } } }) },
     findMessage: (messageId) => {
       const msgHdr = headers.find((header) => header.messageId === messageId);
@@ -78,6 +89,7 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     DEFAULT_MAX_RESULTS: 50,
     MAX_SEARCH_RESULTS_CAP: 200,
     SEARCH_COLLECTION_CAP: 10000,
+    buildTools: () => [{ name: "getRecentMessages", group: "messages" }],
   };
   vm.createContext(sandbox);
   vm.runInContext([
@@ -87,6 +99,8 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     snippet("// BEGIN ENCRYPTED MESSAGE GUARD", "// END ENCRYPTED MESSAGE GUARD"),
     snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
     snippet("function displayMessage(", "function isTrashOrDescendant("),
+    snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
+    snippet("// BEGIN TOOL DISPATCH", "// END TOOL DISPATCH"),
   ].join("\n"), sandbox);
   return {
     api: sandbox, stats, folder,
@@ -101,6 +115,166 @@ function loadTools({ allowed = false, streamError = null } = {}) {
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+describe("getRecentMessages rows cap address lists", () => {
+  const longList = "a@x, b@x, c@x, d@x";
+  const shortList = "a@x, b@x, c@x (+1 more)";
+
+  for (const fixture of recipientRowFixtures) {
+    it(`counts only real mailboxes in recent rows: ${fixture.raw}`, async () => {
+      const h = loadTools();
+      const display = h.api.MailServices.mimeConverter.decodeMimeHeader(fixture.raw, null, false, true);
+      Object.assign(h.add({ id: "mailboxes" }), {
+        recipients: fixture.raw, mime2DecodedRecipients: display, ccList: fixture.raw,
+      });
+      for (const fullRecipients of [undefined, false, null, true]) {
+        const args = { folderPath: h.folder.URI, daysBack: 36500 };
+        if (fullRecipients !== undefined) args.fullRecipients = fullRecipients;
+        const [row] = await h.api.callTool("getRecentMessages", args);
+        const summary = fullRecipients === true ? undefined : fixture.summary;
+        assert.equal(row.recipients, summary ?? display);
+        assert.equal(row.ccList, summary ?? fixture.raw);
+      }
+      assert.equal(h.stats.parsedHeaders.length, 6, "full mode bypasses the parser");
+      assert.equal(h.stats.renders, fixture.mailboxes > 3 ? 6 : 0, "short fields are never re-rendered");
+    });
+  }
+
+  it("preserves 0/1/3-mailbox display values exactly, including encoded punctuation", () => {
+    const h = loadTools();
+    const encoded = "a@x, =?UTF-8?Q?Doe=2C_John?= <j@x>, c@x";
+    const fixtures = ["", "  Single (comment) <one@x>  ", encoded];
+    for (const [index, raw] of fixtures.entries()) {
+      const header = h.add({ id: `boundary-${index}`, date: index + 1 });
+      header.recipients = raw;
+      header.mime2DecodedRecipients = h.api.MailServices.mimeConverter.decodeMimeHeader(raw, null, false, true);
+      header.ccList = raw;
+    }
+    const rows = h.api.getRecentMessages(h.folder.URI, 36500);
+    assert.equal(rows.length, fixtures.length);
+    for (const row of rows) {
+      const raw = fixtures[Number(row.id.split("-")[1])];
+      assert.equal(row.recipients, h.api.MailServices.mimeConverter.decodeMimeHeader(raw, null, false, true));
+      assert.equal(row.ccList, raw);
+    }
+    assert.equal(h.stats.renders, 0, "short fields are never re-rendered");
+    assert.ok(h.stats.parsedHeaders.includes(encoded), "count the original encoded header");
+  });
+
+  it("dispatches omitted/false/null/true and formats both ordinary and protected rows", async () => {
+    for (const fullRecipients of [undefined, false, null, true]) {
+      const h = loadTools();
+      for (const [id, enigmail] of [["plain", 0], ["protected", DECRYPTION_OKAY]]) {
+        const header = h.add({ id, enigmail, raw: ENCRYPTED_RAW });
+        header.recipients = longList;
+        header.mime2DecodedRecipients = longList;
+        header.ccList = longList;
+      }
+      const args = { folderPath: h.folder.URI, daysBack: 36500 };
+      if (fullRecipients !== undefined) args.fullRecipients = fullRecipients;
+      const rows = await h.api.callTool("getRecentMessages", args);
+      assert.equal(rows.length, 2);
+      for (const row of rows) {
+        assert.equal(row.recipients, fullRecipients === true ? longList : shortList);
+        assert.equal(row.ccList, fullRecipients === true ? longList : shortList);
+        assert.deepEqual(Object.getOwnPropertyNames(row).filter(name => name.startsWith("_")), []);
+      }
+      assert.equal(rows.find(row => row.id === "protected").subject, OUTER_SUBJECT);
+      if (fullRecipients === true) assert.equal(h.stats.parsedHeaders.length, 0);
+    }
+  });
+
+  it("does not normalize full-mode values with encoded names, spacing or comments", () => {
+    const h = loadTools();
+    const raw = "  =?UTF-8?Q?Doe=2C_John?= <j@x>, b@x (B), c@x, d@x  ";
+    const decoded = h.api.MailServices.mimeConverter.decodeMimeHeader(raw, null, false, true);
+    const header = h.add({ id: "full" });
+    header.recipients = raw;
+    header.mime2DecodedRecipients = decoded;
+    header.ccList = raw;
+    const [row] = h.api.getRecentMessages(h.folder.URI, 36500, undefined, undefined, false, false, true, true);
+    assert.equal(row.recipients, decoded);
+    assert.equal(row.ccList, raw);
+    assert.equal(h.stats.parsedHeaders.length, 0);
+    assert.equal(h.stats.renders, 0);
+  });
+
+  it("keeps a row and later mail when its original To header cannot be read", () => {
+    const h = loadTools();
+    const header = h.add({ id: "unreadable", date: 2 });
+    header.mime2DecodedRecipients = longList;
+    Object.defineProperty(header, "recipients", { get() { throw new Error("unreadable original To"); } });
+    h.add({ id: "later", date: 1 });
+    const rows = h.api.getRecentMessages(h.folder.URI, 36500);
+    assert.deepEqual(Array.from(rows, row => row.id), ["unreadable", "later"]);
+    assert.equal(rows[0].recipients, longList);
+    assert.deepEqual(Object.getOwnPropertyNames(rows[0]).filter(name => name.startsWith("_")), []);
+  });
+
+  for (const field of ["recipients", "ccList"]) {
+    for (const failure of ["parse", "render"]) {
+      it(`keeps before/failing/after rows and the other field when ${field} cannot ${failure}`, () => {
+        const h = loadTools();
+        const badList = `"${"A".repeat(901)}" <a@x>, b@x, c@x, d@x`;
+        const parser = h.api.MailServices.headerParser;
+        if (failure === "parse") {
+          const parse = parser.parseEncodedHeaderW.bind(parser);
+          parser.parseEncodedHeaderW = value => {
+            if (value === badList) throw new Error("header parser failed");
+            return parse(value);
+          };
+        } else {
+          const addresses = parser.parseEncodedHeaderW(badList);
+          assert.equal(addresses.length, 4);
+          assert.throws(() => parser.makeMimeHeader(addresses.slice(0, 3)), /Cannot encode .* due to length\./,
+            "the actual Thunderbird emitter must reject the 901-character display name");
+        }
+        for (const [index, id] of ["before", "bad", "after"].entries()) {
+          const header = h.add({ id, date: 3 - index });
+          header.recipients = longList;
+          header.mime2DecodedRecipients = longList;
+          header.ccList = longList;
+          if (id === "bad") {
+            header[field] = badList;
+            if (field === "recipients") header.mime2DecodedRecipients = badList;
+          }
+        }
+        const rows = plain(h.api.getRecentMessages(h.folder.URI, 36500));
+        assert.deepEqual(rows.map(row => row.id), ["before", "bad", "after"]);
+        for (const row of rows) {
+          assert.equal(row.recipients, row.id === "bad" && field === "recipients" ? badList : shortList);
+          assert.equal(row.ccList, row.id === "bad" && field === "ccList" ? badList : shortList);
+        }
+      });
+    }
+  }
+
+  it("parses only returned fields, with no work for full mode or empty pages", () => {
+    const h = loadTools();
+    for (let index = 0; index < 100; index++) {
+      const header = h.add({ id: `m-${index}`, date: index + 1 });
+      header.recipients = longList;
+      header.mime2DecodedRecipients = longList;
+      header.ccList = longList;
+    }
+    const page = h.api.getRecentMessages(h.folder.URI, 36500, 1, 50);
+    assert.equal(page.totalMatches, 100);
+    assert.equal(page.messages.length, 1);
+    assert.equal(page.messages[0].id, "m-49");
+    assert.equal(page.messages[0].recipients, shortList);
+    assert.equal(page.messages[0].ccList, shortList);
+    assert.deepEqual(Object.getOwnPropertyNames(page.messages[0]).filter(name => name.startsWith("_")), []);
+    assert.equal(h.stats.parsedHeaders.length, 2);
+    assert.equal(h.stats.renders, 2);
+    const empty = h.api.getRecentMessages(h.folder.URI, 36500, 1, 100);
+    assert.equal(empty.messages.length, 0);
+    const full = h.api.getRecentMessages(h.folder.URI, 36500, 1, 50, false, false, true, true);
+    assert.equal(full.messages[0].recipients, longList);
+    assert.equal(full.messages[0].ccList, longList);
+    assert.equal(h.stats.parsedHeaders.length, 2);
+    assert.equal(h.stats.renders, 2);
+  });
+});
 
 describe("getRecentMessages protects subjects of encrypted mail", () => {
   it("returns the transmitted subject without a preview for recorded encrypted messages", () => {
