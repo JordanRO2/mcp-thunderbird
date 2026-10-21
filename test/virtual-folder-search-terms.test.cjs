@@ -16,82 +16,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-// Subset of nsMsgSearchAttrib / nsMsgSearchOp (nsMsgSearchCore.idl) with the
-// real, non-contiguous values.
-const ATTRIB = {
-  Subject: 0, Sender: 1, Body: 2, Date: 3, Priority: 4, MsgStatus: 5,
-  To: 6, CC: 7, ToOrCC: 8, AllAddresses: 9, AgeInDays: 12, Size: 14,
-  Keywords: 16, HasAttachmentStatus: 44, JunkStatus: 45, JunkPercent: 46,
-  OtherHeader: 52,
-};
-const OPS = {
-  Contains: 0, DoesntContain: 1, Is: 2, Isnt: 3, IsEmpty: 4, IsBefore: 5,
-  IsAfter: 6, BeginsWith: 9, EndsWith: 10, IsGreaterThan: 13, IsLessThan: 14,
-  Matches: 19, DoesntMatch: 20,
-};
-const ATTACHMENT_FLAG = 0x10000000; // nsMsgMessageFlags.Attachment
-
-// Which nsIMsgSearchValue accessor is legal for which attribute; anything
-// not listed uses .str (IS_STRING_ATTRIBUTE in nsMsgSearchCore.idl).
-const LEGAL_ACCESSOR = {
-  [ATTRIB.Priority]: "priority",
-  [ATTRIB.MsgStatus]: "status",
-  [ATTRIB.Date]: "date",
-  [ATTRIB.AgeInDays]: "age",
-  [ATTRIB.Size]: "size",
-  [ATTRIB.JunkStatus]: "junkStatus",
-  [ATTRIB.JunkPercent]: "junkPercent",
-  [ATTRIB.HasAttachmentStatus]: "status",
-};
-
-// The real Ci answers named property access but reports no own keys.
-function nonEnumerable(constants) {
-  return new Proxy({}, {
-    get: (_t, name) => constants[name],
-    has: (_t, name) => name in constants,
-    ownKeys: () => [],
-    getOwnPropertyDescriptor: () => undefined,
-  });
-}
-
-// An nsIMsgSearchValue stand-in that throws, like XPCOM does, when the
-// accessor does not match the attribute's type.
-function makeSearchValue() {
-  const state = { attrib: undefined, stored: undefined };
-  const value = {
-    get attrib() { return state.attrib; },
-    set attrib(v) { state.attrib = v; },
-  };
-  const check = (accessor) => {
-    const legal = LEGAL_ACCESSOR[state.attrib] || "str";
-    if (accessor !== legal) {
-      throw new Error(`NS_ERROR_ILLEGAL_VALUE [nsIMsgSearchValue.${accessor}]`);
-    }
-  };
-  for (const accessor of ["str", "priority", "date", "status", "size", "age", "junkStatus", "junkPercent"]) {
-    Object.defineProperty(value, accessor, {
-      enumerable: true,
-      get() { check(accessor); return state.stored; },
-      set(v) { check(accessor); state.stored = v; },
-    });
-  }
-  return value;
-}
-
-function makeSearchTerm() {
-  return { attrib: undefined, op: undefined, booleanAnd: undefined, arbitraryHeader: "", value: makeSearchValue() };
-}
-
-// nsIMsgSearchSession: the createTerm/appendTerm/searchTerms trio that
-// buildTerms otherwise gets from a filter.
-function makeSearchSession() {
-  const terms = [];
-  return {
-    createTerm: makeSearchTerm,
-    appendTerm(term) { terms.push(term); },
-    get searchTerms() { return terms.slice(); },
-  };
-}
+const { ATTRIB, OPS, ATTACHMENT_FLAG, makeCi, makeSearchSession } = require("./helpers/search-terms.cjs");
 
 function loadHelpers() {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
@@ -106,15 +31,7 @@ function loadHelpers() {
 
   let sessions = 0;
   const sandbox = {
-    Ci: {
-      nsMsgSearchAttrib: nonEnumerable(ATTRIB),
-      nsMsgSearchOp: nonEnumerable(OPS),
-      nsMsgFilterAction: nonEnumerable({}),
-      nsMsgFilterType: nonEnumerable({}),
-      nsMsgMessageFlags: nonEnumerable({ Attachment: ATTACHMENT_FLAG }),
-      nsMsgPriority: nonEnumerable({}),
-      nsIMsgSearchSession: {},
-    },
+    Ci: { ...makeCi(), nsIMsgSearchSession: {} },
     Cc: {
       "@mozilla.org/messenger/searchSession;1": {
         createInstance: () => { sessions += 1; return makeSearchSession(); },

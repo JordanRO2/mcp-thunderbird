@@ -305,6 +305,8 @@ function loadServerLifecycle(overrides = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    // Saved-search initialization reuses the production folder-role constants.
+    markedSnippet("OUTBOX DESTINATION GUARD"),
     markedSnippet("CONNECTION INFO REFRESH HELPERS"),
     markedSnippet("SENSITIVE ATTACHMENT PATH HELPERS"),
     markedSnippet("THUNDERBIRD PROFILE ROOTS"),
