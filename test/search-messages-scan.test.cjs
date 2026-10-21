@@ -200,6 +200,11 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
     advance(milliseconds) { clock.elapse(milliseconds); },
     setAllowEncrypted(value) { allowEncrypted = value; },
     get yields() { return yields; },
+    async finishCount(rows, { deadline = clock.now + SEARCH_BUDGET_MS, dedupByMessageId = true } = {}) {
+      const pending = runtime.finishSearchResults(rows, 0, 0, "asc", true, dedupByMessageId, { deadline, truncated: false });
+      await clock.flush();
+      return JSON.parse(JSON.stringify(await pending));
+    },
     async search(args = {}) {
       const pending = runtime.callTool("searchMessages", { query: "", folderPath: roots[0].URI, ...args });
       await clock.advance(0);
@@ -309,7 +314,7 @@ describe("searchMessages production scan and pagination", () => {
 });
 
 describe("searchMessages counts and folder freshness", () => {
-  it("countOnly counts exactly the rows the listing returns when rows vanish after the scan", async () => {
+  it("excludes rows that vanish after collection from both counts and listings", async () => {
     // Fresh, identical fixtures per run: First's message 2 disappears while
     // the scan has moved on to Second, i.e. after it was collected.
     function run(args) {
@@ -578,7 +583,8 @@ describe("searchMessages production budget, mutations and access", () => {
       }
       assert.equal(result.truncated, true);
       assert.match(result.message, /20-second.*partial/);
-      if (mode === "count") assert.equal(result.count, 250);
+      // Collection exhausted the budget, so no candidates can be revalidated.
+      if (mode === "count") assert.equal(result.count, 0);
       else {
         assert.equal(result.hasMore, false);
         assert.equal(result.totalMatches, 250);
@@ -718,6 +724,126 @@ describe("searchMessages production budget, mutations and access", () => {
   });
 });
 
+describe("searchMessages cooperative count finalization", () => {
+  function collectedRows(folder) {
+    return Array.from(folder.headers.values(), header => ({
+      id: header.messageId, folderPath: folder.URI, _messageKey: header.messageKey, _dateTs: header.date,
+    }));
+  }
+
+  it("yields while rechecking, reacquiring each chunk's database without hydrating content", async () => {
+    const folder = makeFolder("Large", { count: 751, legacy: true });
+    const h = makeHarness({ roots: [folder] });
+    assert.deepEqual(await h.finishCount(collectedRows(folder)), { count: 751 });
+    assert.equal(h.yields, 3);
+    assert.equal(folder.stats.databaseReads, 4);
+    assert.equal(folder.stats.headerReads, 751);
+    assert.equal(folder.stats.contentReads, 0);
+    assert.equal(folder.stats.propertyReads, 0);
+    assert.equal(folder.stats.snapshots, 0, "recheck only the collected candidate keys");
+  });
+
+  it("rejects deleted, expunged, reused and unreadable keys after a validation yield", async () => {
+    const folder = makeFolder("Changing", { count: 751 });
+    const h = makeHarness({ roots: [folder], onYield() {
+      folder.headers.delete(251);
+      folder.headers.get(252).flags = 0x8;
+      folder.headers.get(253).messageId = "new-message@example.com";
+    } });
+    folder.hooks.header = key => { if (key === 254) throw new Error("Unreadable row"); };
+    const result = await h.finishCount(collectedRows(folder));
+    assert.equal(result.count, 747);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.stats.databaseReads, 4);
+  });
+
+  it("does not reopen a failing database for every candidate and continues to another folder", async () => {
+    const broken = makeFolder("Broken", { count: 300 });
+    const safe = makeFolder("Safe", { messages: [{ messageId: "safe@example.com" }] });
+    const h = makeHarness({ roots: [broken, safe] });
+    broken.hooks.database = () => { throw new Error("Database unavailable"); };
+    const result = await h.finishCount([...collectedRows(broken), ...collectedRows(safe)]);
+    assert.equal(result.count, 1);
+    assert.equal(result.truncated, true);
+    assert.equal(broken.stats.databaseReads, 2);
+    assert.equal(broken.stats.headerReads, 0);
+  });
+
+  it("stops within a validation chunk when native header reads consume the deadline", async () => {
+    const folder = makeFolder("Slow", { count: 100 });
+    const h = makeHarness({ roots: [folder] });
+    const perHeaderMs = 1000;
+    folder.hooks.header = () => h.advance(perHeaderMs);
+    const result = await h.finishCount(collectedRows(folder));
+    assert.equal(result.count, SEARCH_BUDGET_MS / perHeaderMs);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /20-second.*partial/);
+    assert.equal(h.clock.now, SEARCH_BUDGET_MS);
+    assert.equal(folder.stats.headerReads, result.count);
+  });
+
+  it("keeps only previously validated rows when the budget expires during a yield", async () => {
+    const folder = makeFolder("Large", { count: 751 });
+    const h = makeHarness({ roots: [folder], onYield(runtime) { runtime.advance(SEARCH_BUDGET_MS); } });
+    const result = await h.finishCount(collectedRows(folder));
+    assert.equal(result.count, 250);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.stats.headerReads, 250);
+    assert.equal(folder.stats.databaseReads, 1);
+  });
+
+  it("does no database work if validation starts after the deadline", async () => {
+    const h = makeHarness();
+    const result = await h.finishCount(collectedRows(h.roots[0]), { deadline: 0 });
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(h.roots[0].stats.databaseReads, 0);
+  });
+
+  it("checks the deadline again after opening a native database", async () => {
+    const h = makeHarness();
+    h.roots[0].hooks.database = () => h.advance(SEARCH_BUDGET_MS);
+    const result = await h.finishCount(collectedRows(h.roots[0]));
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(h.roots[0].stats.databaseReads, 1);
+    assert.equal(h.roots[0].stats.headerReads, 0);
+  });
+
+  it("removes earlier contributions from an account revoked during validation", async () => {
+    const privateFolder = makeFolder("Private", { account: "private", count: 300 });
+    const safe = makeFolder("Safe", { account: "safe", messages: [{ messageId: "safe@example.com" }] });
+    const h = makeHarness({ roots: [privateFolder, safe], onYield(runtime) { runtime.allowedAccounts.delete("private"); } });
+    const result = await h.finishCount([...collectedRows(privateFolder), ...collectedRows(safe)]);
+    assert.equal(result.count, 1);
+    assert.equal(result.truncated, true);
+    assert.equal(privateFolder.stats.headerReads, 250);
+    assert.equal(privateFolder.stats.databaseReads, 1, "no database is opened after revocation");
+  });
+
+  for (const dedupByMessageId of [true, false]) it(`respects dedupByMessageId=${dedupByMessageId} before validation`, async () => {
+    const first = makeFolder("First", { count: 2 });
+    const second = makeFolder("Second", { count: 2 });
+    const h = makeHarness({ roots: [first, second] });
+    const result = await h.finishCount([...collectedRows(first), ...collectedRows(second)], { dedupByMessageId });
+    assert.equal(result.count, dedupByMessageId ? 2 : 4);
+    assert.equal(result.truncated, undefined);
+    assert.equal(first.stats.headerReads + second.stats.headerReads, result.count);
+  });
+
+  it("does not hydrate content merely to reproduce a listing-only failure", async () => {
+    const folder = makeFolder("Inbox", { count: 3 });
+    folder.headers.get(2).getStringProperty = () => { throw new Error("Unreadable preview"); };
+    const h = makeHarness({ roots: [folder] });
+    assert.equal((await h.search({ countOnly: true, maxResults: 1 })).count, 3);
+    assert.equal(folder.stats.contentReads, 0);
+    const page = await h.search({ offset: 0 });
+    assert.equal(page.messages.length, 2);
+    assert.equal(page.totalMatches, 3);
+    assert.equal(page.truncated, true);
+  });
+});
+
 describe("searchMessages production Gloda collection", () => {
   for (const offset of [undefined, null]) {
     it(`keeps plain arrays without completeness fields when offset is ${offset}`, async () => {
@@ -825,7 +951,7 @@ describe("searchMessages production Gloda collection", () => {
     const h = makeHarness({ roots: [folder], glodaItems, onYield(runtime) { runtime.advance(20000); runtime.timers[0].fire(); } });
     const result = await h.search({ query: "body query", searchBody: true, countOnly: true });
     assert.equal(result.truncated, true);
-    assert.equal(result.count, 250);
+    assert.equal(result.count, 0, "the expired budget leaves no time to revalidate Gloda candidates");
     assert.equal(h.timers[0].canceled, true);
   });
 
@@ -836,6 +962,42 @@ describe("searchMessages production Gloda collection", () => {
     const result = await h.search({ query: "body query", searchBody: true, offset: 0 });
     assert.equal(result.truncated, true);
     assert.deepEqual(result.messages, []);
+  });
+
+  it("bounds asynchronous Gloda count validation and ignores late completion callbacks", async () => {
+    const folder = makeFolder("Archive", { count: 600 });
+    const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+    let lateListener;
+    const h = makeHarness({ roots: [folder], glodaItems, onYield(runtime) {
+      if (folder.stats.headerReads > 0) {
+        assert.equal(runtime.searchers[0].listener, null);
+        runtime.advance(SEARCH_BUDGET_MS);
+        runtime.timers[0].fire();
+        lateListener.onQueryCompleted({ items: glodaItems });
+      }
+    } });
+    const pending = h.search({ query: "body", searchBody: true, countOnly: true });
+    lateListener = h.searchers[0].listener;
+    const result = await pending;
+    assert.equal(result.count, 250);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.stats.headerReads, 250);
+    assert.equal(h.timers[0].canceled, true);
+  });
+
+  it("handles rejected asynchronous finalization after detaching Gloda's listener", async () => {
+    const folder = makeFolder("Archive", { count: 300 });
+    const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+    const h = makeHarness({ roots: [folder], glodaItems });
+    const dispatch = h.runtime.Services.tm.dispatchToMainThread;
+    h.runtime.Services.tm.dispatchToMainThread = callback => {
+      if (folder.stats.headerReads > 0) throw new Error("Cannot schedule validation");
+      dispatch(callback);
+    };
+    const result = await h.search({ query: "body", searchBody: true, countOnly: true });
+    assert.match(result.error, /Cannot schedule validation/);
+    assert.equal(h.searchers[0].listener, null);
+    assert.equal(h.timers[0].canceled, true);
   });
 });
 
@@ -914,5 +1076,58 @@ describe("searchMessages protects subjects of encrypted mail", () => {
       }
       assert.equal(folder.rawReads, 0);
     }
+  });
+
+  for (const countOnly of [false, true]) it(`removes protected-text matches collected before opt-out from ${countOnly ? "counts" : "pages"}`, async () => {
+    const folder = makeProtectedFolder(Array.from({ length: 300 }, () => protectedRow("Secret plans")));
+    const h = makeHarness({ roots: [folder], allowEncrypted: true, onYield(runtime) { runtime.setAllowEncrypted(false); } });
+    const result = await h.search({ query: "secret", countOnly, offset: 0 });
+    assert.equal(result.truncated, true);
+    if (countOnly) assert.equal(result.count, 0);
+    else {
+      assert.deepEqual(result.messages, []);
+      assert.equal(result.totalMatches, 0);
+    }
+    assert.equal(folder.rawReads, 0);
+  });
+
+  for (const query of ["subject:secret", "alice secret", "preview"]) it(`removes earlier validated protected-text matches after opt-out (${query})`, async () => {
+    const size = 300;
+    const folder = makeProtectedFolder(Array.from({ length: size }, () => protectedRow("Secret plans")));
+    const h = makeHarness({ roots: [folder], allowEncrypted: true, onYield(runtime) {
+      if (folder.stats.headerReads > size) runtime.setAllowEncrypted(false);
+    } });
+    const result = await h.search({ query, countOnly: true });
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.rawReads, 0);
+    assert.equal(folder.stats.headerReads, size + 250, "no more protected candidates are read after opt-out");
+  });
+
+  for (const query of ["", "alice", "from:alice"]) it(`preserves permitted metadata counts through opt-out (query ${JSON.stringify(query)})`, async () => {
+    const size = 300;
+    const folder = makeProtectedFolder(Array.from({ length: size }, () => protectedRow("Secret plans")));
+    const h = makeHarness({ roots: [folder], allowEncrypted: true, onYield(runtime) { runtime.setAllowEncrypted(false); } });
+    const result = await h.search({ query, countOnly: true });
+    assert.equal(result.count, size);
+    assert.equal(result.truncated, undefined);
+    assert.equal(folder.rawReads, 0);
+    if (!query) {
+      assert.equal(folder.stats.contentReads, 0);
+      assert.equal(folder.stats.propertyReads, 0);
+    }
+  });
+
+  for (const phase of ["collection", "validation"]) it(`rechecks encrypted-content permission during Gloda ${phase}`, async () => {
+    const folder = makeProtectedFolder(Array.from({ length: 300 }, () => protectedRow("Secret plans")));
+    const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+    const h = makeHarness({ roots: [folder], glodaItems, allowEncrypted: true, onYield(runtime) {
+      if (phase === "collection" || folder.stats.headerReads > 0) runtime.setAllowEncrypted(false);
+    } });
+    const result = await h.search({ query: "secret", searchBody: true, countOnly: true });
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.rawReads, 0);
+    assert.equal(folder.stats.contentReads, 0);
   });
 });

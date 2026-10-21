@@ -3496,12 +3496,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return getHeader.call(db, key);
             }
 
-            function finishSearchResults(results, offset, effectiveLimit, sortOrder, countOnly, dedupByMessageId, scan) {
+            function getSearchResultHeader(db, row) {
+              const header = db && getSearchHeader(db, row._messageKey);
+              return header && header.messageId === row.id && !(header.flags & Ci.nsMsgMessageFlags.Expunged)
+                ? header : null;
+            }
+
+            async function finishSearchResults(results, offset, effectiveLimit, sortOrder, countOnly, dedupByMessageId, scan) {
               searchTimeExpired(scan);
               // Recheck after cooperative yields, before dedup can expose locations
               // or a count from an account whose access was revoked during the scan.
               const folders = new Map();
-              const accessibleResults = results.filter(row => {
+              let allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
+              function isCurrentResult(row) {
                 if (!folders.has(row.folderPath)) {
                   try {
                     const resolved = getAccessibleFolder(row.folderPath);
@@ -3510,39 +3517,62 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     folders.set(row.folderPath, null);
                   }
                 }
-                if (folders.get(row.folderPath)) return true;
+                if (folders.get(row.folderPath) && (!row._requiresEncryptedAccess || allowEncrypted)) return true;
                 scan.truncated = true;
                 return false;
-              });
+              }
+              const accessibleResults = results.filter(isCurrentResult);
               const finalResults = dedupByMessageId !== false
                 ? dedupeSearchMessageResults(accessibleResults) : accessibleResults;
               let response;
               if (countOnly) {
-                // Count exactly what a listing would return: the same per-row
-                // recheck as the page hydration below, over every row.
-                let count = 0;
-                for (const row of finalResults) {
-                  try {
-                    const msgHdr = getSearchHeader(folders.get(row.folderPath).msgDatabase, row._messageKey);
-                    if (msgHdr && msgHdr.messageId === row.id && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
-                      count++;
-                      continue;
+                // Validate only within the original search budget. Keep primitive
+                // candidates across yields, never native databases or headers.
+                const validated = [];
+                for (let index = 0; index < finalResults.length;) {
+                  if (searchTimeExpired(scan)) break;
+                  folders.clear();
+                  allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
+                  {
+                    const databases = new Map();
+                    const end = Math.min(index + SEARCH_YIELD_EVERY, finalResults.length);
+                    for (; index < end; index++) {
+                      if (searchTimeExpired(scan)) break;
+                      const row = finalResults[index];
+                      if (!isCurrentResult(row)) continue;
+                      if (!databases.has(row.folderPath)) {
+                        try { databases.set(row.folderPath, folders.get(row.folderPath).msgDatabase); }
+                        catch { databases.set(row.folderPath, null); }
+                      }
+                      // Opening a native database may itself consume the budget.
+                      if (searchTimeExpired(scan)) break;
+                      try {
+                        if (getSearchResultHeader(databases.get(row.folderPath), row)) {
+                          validated.push(row);
+                          continue;
+                        }
+                      } catch { /* gone with its database: not counted */ }
+                      scan.truncated = true;
                     }
-                  } catch { /* gone with its database: not counted */ }
-                  scan.truncated = true;
+                  }
+                  if (index < finalResults.length && !searchTimeExpired(scan)) {
+                    await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+                  }
                 }
-                response = { count };
+                // Revocation during a later chunk also removes earlier counts.
+                folders.clear();
+                allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
+                response = { count: validated.filter(isCurrentResult).length };
               } else {
                 finalResults.sort((a, b) => sortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
                 response = paginate(finalResults, offset, effectiveLimit);
                 const page = Array.isArray(response) ? response : response.messages;
-                const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
                 const messages = [];
                 for (const row of page) {
                   try {
                     const folder = folders.get(row.folderPath);
-                    const msgHdr = getSearchHeader(folder.msgDatabase, row._messageKey);
-                    if (!msgHdr || msgHdr.messageId !== row.id || (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                    const msgHdr = getSearchResultHeader(folder.msgDatabase, row);
+                    if (!msgHdr) {
                       scan.truncated = true;
                       continue;
                     }
@@ -5965,7 +5995,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Gloda limits ranked candidates before excluding deleted/stale rows;
               // even a collection below that limit cannot prove completeness.
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: true, glodaLimited: true };
-              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
               const requestedLimit = Number(maxResults);
               const effectiveLimit = Math.min(
                 Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
@@ -5995,13 +6024,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let searcher = null;
                 let timer = null;
                 let finished = false;
-                function finish() {
+                async function finish() {
                   if (finished) return;
                   finished = true;
                   if (timer) timer.cancel();
                   if (searcher) searcher.listener = null;
                   try {
-                    resolve(finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan));
+                    resolve(await finishSearchResults(results, offset, effectiveLimit, normalizedSortOrder, countOnly, dedupByMessageId, scan));
                   } catch (e) {
                     resolve({ error: e.toString() });
                   }
@@ -6033,7 +6062,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           if (!msgHdr) { scan.truncated = true; continue; }
                           if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
                           // The full-text index includes cached subjects of encrypted mail.
-                          if (!allowEncrypted && hasRecordedEncryption(msgHdr)) continue;
+                          const encrypted = hasRecordedEncryption(msgHdr);
+                          if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && encrypted) continue;
 
                           // Account access control
                           const folder = msgHdr.folder;
@@ -6061,6 +6091,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             folderPath: folder.URI,
                             _messageKey: msgHdr.messageKey,
                             _dateTs: msgDateTs,
+                            _requiresEncryptedAccess: encrypted,
                           });
                         }
                       } catch {
@@ -6142,10 +6173,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!keywords.includes(tag)) return;
                 }
                 if (failedQuery) return;
+                let requiresEncryptedAccess = false;
                 if (hasQuery) {
                   // Search decoded headers, preserving field operators and AND tokens.
                   // Cached subjects and previews of encrypted mail are not matched.
-                  const protectedText = !isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasRecordedEncryption(msgHdr);
+                  const encrypted = hasRecordedEncryption(msgHdr);
+                  const protectedText = !isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && encrypted;
                   const subject = protectedText ? "" : (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                   const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                   const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
@@ -6157,9 +6190,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     : queryTokens.every(t => subject.includes(t) || author.includes(t) ||
                         recipients.includes(t) || ccList.includes(t) || preview.includes(t));
                   if (!matches) return;
+                  // Remember only whether this match depended on protected text,
+                  // so a later opt-out can remove it without retaining content.
+                  requiresEncryptedAccess = encrypted && (fieldTarget === "subject" ||
+                    (!fieldTarget && !queryTokens.every(t => author.includes(t) || recipients.includes(t) || ccList.includes(t))));
                 }
                 // Keep only sortable identifiers during the scan; hydrate one page.
-                results.push({ id: msgHdr.messageId, folderPath: folder.URI, _messageKey: key, _dateTs: msgDateTs });
+                results.push({ id: msgHdr.messageId, folderPath: folder.URI, _messageKey: key,
+                  _dateTs: msgDateTs, _requiresEncryptedAccess: requiresEncryptedAccess });
               }
 
               let visitedFolders = 0;
