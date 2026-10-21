@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
@@ -75,7 +76,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
     get msgDatabase() {
       if (databaseHook) databaseHook();
       const openedGeneration = generation;
-      const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
+      const assertLive = () => assert.equal(openedGeneration, generation, "Stale database used after a yield");
       const db = {
         listAllKeys() { assertLive(); stats.listAllKeys++; return Array.from(headers.keys()); },
         enumerateMessages() { assert.fail("A header lookup must not open a native message enumerator"); },
@@ -897,7 +898,7 @@ describe("scanFolderCooperatively", () => {
     assert.deepEqual(await run(noKeys, () => assert.fail("must not visit")), { complete: false, stopped: false, scanned: 0 });
   });
 
-  it("retains no database across yields", async () => {
+  it("does not reuse stale database handles after yields", async () => {
     // The harness fails any database call made after the generation changed,
     // and every yield bumps the generation.
     const h = makeHarness({ rows: rowsOf(800) });
@@ -905,4 +906,35 @@ describe("scanFolderCooperatively", () => {
     assert.equal(outcome.complete, true);
     assert.ok(h.stats.yields >= 3);
   });
+});
+
+describe("database and header collection during pending yields", () => {
+  // Reuse this file's production extractors without the ordinary harness's
+  // strong header maps. The child receives this same snapshot of api.js.
+  const retentionSource = [
+    ...["SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
+    snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
+    snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
+    snippet("// BEGIN PROTECTED SUBJECT HELPERS", "// END PROTECTED SUBJECT HELPERS"),
+    snippet("const INTERNAL_KEYWORDS = new Set([", "]);") + "]);",
+    snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
+    snippet("function isFolderAccessible(", "function toColumnarTable("),
+    snippet("function getUserTags(", "// BEGIN OUTBOUND ATTACHMENT CONVERSION"),
+    snippet("function openFolder(", "function findTrashFolder("),
+    snippet("// BEGIN MESSAGE HEADER READ TOOLS", "// END MESSAGE HEADER READ TOOLS"),
+  ].join("\n");
+
+  for (const scenario of ["forward", "reverse", "lookup", "lookup-without-direct"]) {
+    it(`collects all fresh handles before resuming ${scenario}`, () => {
+      const child = spawnSync(process.execPath, [
+        "--expose-gc", path.resolve(__dirname, "helpers/message-header-retention.cjs"), scenario,
+      ], { input: retentionSource, encoding: "utf8", timeout: 15000 });
+      assert.ifError(child.error);
+      assert.equal(child.signal, null, child.stderr);
+      assert.equal(child.status, 0, child.stderr);
+      // An unfinished async child can exit successfully without doing its work.
+      assert.deepEqual(JSON.parse(child.stdout), { scenario, checkedYields: 3, ok: true });
+    });
+  }
 });

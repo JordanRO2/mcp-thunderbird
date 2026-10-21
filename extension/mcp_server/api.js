@@ -10376,8 +10376,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Cooperative header scan over one folder. Policy shared with
              * searchMessages: a listAllKeys snapshot, the database reacquired for
-             * every chunk, no header or enumerator retained across a yield, a yield
-             * every SEARCH_YIELD_EVERY rows, and the time budget carried in `scan`
+             * every chunk, no database, header or enumerator retained across a
+             * yield, a yield every SEARCH_YIELD_EVERY rows, and the budget in `scan`
              * ({ deadline, ... }, see searchTimeExpired). `visit(msgHdr)` runs on
              * live, non-expunged headers and returns true to stop the scan early.
              * With newestFirst the key snapshot is walked from the end. Native
@@ -10406,9 +10406,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return outcome;
               }
               const keyAt = position => keys[newestFirst ? keys.length - 1 - position : position];
-              for (let index = 0; index < keys.length && !outcome.stopped;) {
-                if (searchTimeExpired(scan)) { outcome.complete = false; break; }
-                if (!isFolderAccessible(folder)) { outcome.complete = false; break; }
+              // Native handles must live only in a synchronous frame: block
+              // scope in the async loop can retain its last database/header at
+              // await even when neither handle is used after the yield.
+              function scanChunk(index) {
                 let scanDb;
                 try {
                   // The database can be closed, rebuilt or deleted across a yield.
@@ -10416,12 +10417,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 } catch {
                   scanDb = null;
                 }
-                if (!scanDb) { outcome.complete = false; break; }
+                if (!scanDb) { outcome.complete = false; return null; }
                 const end = Math.min(index + SEARCH_YIELD_EVERY, keys.length);
                 for (; index < end && !outcome.stopped; index++) {
                   if (searchTimeExpired(scan)) {
                     outcome.complete = false;
-                    return outcome;
+                    return null;
                   }
                   try {
                     const msgHdr = getSearchHeader(scanDb, keyAt(index));
@@ -10433,6 +10434,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     outcome.complete = false;
                   }
                 }
+                return index;
+              }
+              for (let index = 0; index < keys.length && !outcome.stopped;) {
+                if (searchTimeExpired(scan)) { outcome.complete = false; break; }
+                if (!isFolderAccessible(folder)) { outcome.complete = false; break; }
+                const next = scanChunk(index);
+                if (next === null) break;
+                index = next;
                 if (index < keys.length && !outcome.stopped) {
                   await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                 }
@@ -10450,8 +10459,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Resolves headers for message IDs in one folder. Direct lookups run
              * first (synchronous and indexed). Remaining ids share ONE cooperative
              * scan of a key snapshot, using the same primitives as searchMessages:
-             * the database is reacquired after every yield, no header or enumerator
-             * is retained across a yield, and the search time budget applies.
+             * the database is reacquired after every yield; no database, header or
+             * enumerator is retained across a yield, and the search time budget applies.
              *
              * Returns { headers: Map(id -> header object), notFound: [ids],
              * notScanned: [ids], timedOut } or { error }. notFound ids were
@@ -10459,10 +10468,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * scan hit the time budget, lost access, or met unreadable rows.
              */
             async function readMessageHeaders(messageIds, folderPath) {
-              const opened = openFolder(folderPath);
-              if (opened.error) return opened;
-              const { folder, db } = opened;
-
               // Look up by normalised id; report by the caller's original ids.
               const originalsByKey = new Map();
               for (const id of messageIds) {
@@ -10494,19 +10499,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // up would only match headers that have no Message-ID.
               const lookupKeys = [...originalsByKey.keys()].filter(Boolean);
 
-              if (typeof db.getMsgHdrForMessageID === "function") {
-                for (const key of lookupKeys) {
-                  try {
-                    const msgHdr = db.getMsgHdrForMessageID(key);
-                    // An expunged row is gone, as it is for the scan and search.
-                    if (msgHdr && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
-                      resolved.set(key, readHeader(msgHdr));
+              // Do not let openFolder's result, its database, or a direct-hit
+              // header enter the async frame that waits for the fallback scan.
+              function lookupDirectHeaders() {
+                const opened = openFolder(folderPath);
+                if (opened.error) return opened;
+                const { folder, db } = opened;
+                if (typeof db.getMsgHdrForMessageID === "function") {
+                  for (const key of lookupKeys) {
+                    try {
+                      const msgHdr = db.getMsgHdrForMessageID(key);
+                      // An expunged row is gone, as it is for the scan and search.
+                      if (msgHdr && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                        resolved.set(key, readHeader(msgHdr));
+                      }
+                    } catch {
+                      // Leave the id for the scan below.
                     }
-                  } catch {
-                    // Leave the id for the scan below.
                   }
                 }
+                return { folder };
               }
+              const opened = lookupDirectHeaders();
+              if (opened.error) return opened;
+              const { folder } = opened;
 
               const missing = new Set(lookupKeys.filter(key => !resolved.has(key)));
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
