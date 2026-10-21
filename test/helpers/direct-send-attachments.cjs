@@ -134,6 +134,7 @@ function makeDirectSendAttachments() {
     calls,
     convert: sandbox.filePathsToAttachDescs,
     toNative: sandbox.descsToMsgAttachments,
+    materialize: sandbox.materializeAttachmentDescs,
   };
 }
 

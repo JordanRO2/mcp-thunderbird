@@ -68,4 +68,16 @@ const dependencySource = [
 const dependencies = vm.runInNewContext(dependencySource + "\n({ RAW_MESSAGE_MAX_BYTES, MAX_HTML_PARSE_BYTES, getMimePartContentTypes, parseRawMimeHeaderValue, truncateHtmlForParsing });");
 Object.assign(clearOriginalRawFixture, dependencies);
 
-module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture };
+// Reuse the scheduling harness's native boundary convention. This fixture
+// handles only simple harness addresses, not Thunderbird's parsing algorithm.
+const composeHeaderParser = {
+  parseDecodedHeader(header, preserveGroups) {
+    assert.equal(preserveGroups, false);
+    return header.split(",").filter(value => value.trim()).map(email => ({ email }));
+  },
+  removeDuplicateAddresses(header, other) {
+    return header.split(",").filter(value => value.trim() && !other.split(",").includes(value)).join(",");
+  },
+};
+
+module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser };

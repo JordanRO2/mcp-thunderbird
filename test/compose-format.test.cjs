@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const formats = { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 };
@@ -45,7 +45,7 @@ function loadComposeFormat(composeHtml) {
     },
     Components: { isSuccessCode: status => status === 0 },
     Services: { prefs: makeDirectSendPrefs() },
-    MailServices: { accounts: { accounts: [{ key: "account", identities: [identity] }] } },
+    MailServices: { headerParser: composeHeaderParser, accounts: { accounts: [{ key: "account", identities: [identity] }] } },
     Cc: {
       "@mozilla.org/timer;1": { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
@@ -93,6 +93,7 @@ function loadComposeFormat(composeHtml) {
     setComposeIdentity(params) { params.identity = identity; },
     isSkipReviewBlocked: () => false,
     isToolEnabled: () => true,
+    materializeAttachmentDescs: descs => descs,
     filePathsToAttachDescs: () => ({ descs: [] }),
     descsToMsgAttachments: descs => descs,
     findMessage: () => ({ msgHdr: hdr, folder }),

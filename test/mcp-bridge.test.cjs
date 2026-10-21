@@ -18,6 +18,7 @@ const {
   readConnectionInfo,
 } = require('./helpers/bridge.cjs');
 const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
+const { loadToolSchema } = require('./helpers/tool-schema.cjs');
 const WINDOWS_TEMP_SUBDIR = path.join('AppData', 'Local', 'Temp');
 
 function makeTempRoot() {
@@ -215,9 +216,7 @@ describe('Bridge attachment tool routing', () => {
   });
 
   it('lists every production tool that accepts attachments', () => {
-    const apiSource = fs.readFileSync(path.join(__dirname, '..', 'extension', 'mcp_server', 'api.js'), 'utf8');
-    const names = new Set();
-    for (const match of apiSource.matchAll(/name: "(\w+)",\s*group:[^\n]*\n(?:(?!\n {6}\{)[\s\S])*?attachments: \{\s*type: "array"/g)) names.add(match[1]);
+    const names = new Set(loadToolSchema().buildTools().filter(tool => tool.inputSchema.properties.attachments).map(tool => tool.name));
     assert.ok(names.has('sendMail') && names.has('dryRunCompose'));
     for (const name of names) assert.ok(ATTACHMENT_TOOLS.has(name), `${name} accepts attachments but is not in ATTACHMENT_TOOLS`);
   });

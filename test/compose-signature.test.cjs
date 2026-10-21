@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const MAX_SIGNATURE_BYTES = 1024 * 1024;
@@ -103,8 +103,10 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
   const folder = { URI: DRAFTS_URI, getFlag: () => true };
   Object.assign(api, {
     Services: { prefs: makeDirectSendPrefs() },
+    MailServices: { headerParser: composeHeaderParser, accounts: { accounts: [{ key: "account", identities: [{ key: "sender" }] }] } },
     setComposeIdentity(params) { params.identity = { key: "sender", draftsFolderURI: DRAFTS_URI, ...identity }; },
     resolveComposeFormat: (_identity, isHtml) => ({ useHtml: isHtml === true, format: 0 }),
+    materializeAttachmentDescs: descs => descs,
     filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
     descsToMsgAttachments: () => [],
     getAccessibleFolder: () => ({ folder }),
@@ -128,7 +130,7 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
   });
   vm.runInContext([
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
-    snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
+    snippet("COMPOSE ACCOUNT KEY"), snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), api);
   return loaded;
 }
@@ -287,7 +289,7 @@ describe("Direct compose identity signatures", () => {
 
   it("leaves signature insertion to Thunderbird on the review path", async () => {
     const { api, calls } = loadComposeTools();
-    api.buildBodyWithSignature = () => assert.fail("review must not append a second signature");
+    api.buildSignatureFragment = () => assert.fail("review must not append a second signature");
     const result = await api.dispatchTool("sendMail", {
       to: "to@example.test", subject: "Subject", body: "Hello", isHtml: false, includeSignature: true,
     });

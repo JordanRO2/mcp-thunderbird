@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser } = require("./helpers/direct-send-prefs.cjs");
 const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
 const { SEND_LATER_NOW, SEND_LATER_READY, SEND_LATER_HEADER_PARSER, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
@@ -124,7 +124,7 @@ function loadEncryptionTools(options = {}) {
         OpenComposeWindowWithParams() { calls.reviews++; },
       }) },
     },
-    MailServices: { headerParser: SEND_LATER_HEADER_PARSER, accounts: {
+    MailServices: { headerParser: { ...composeHeaderParser, ...SEND_LATER_HEADER_PARSER }, accounts: {
       accounts: [account], defaultAccount: account,
       findAccountForServer: () => account,
     } },
@@ -136,6 +136,7 @@ function loadEncryptionTools(options = {}) {
     isToolEnabled: name => !(options.disabledTools || []).includes(name),
     findMessage: () => ({ msgHdr: hdr, folder }),
     filePathsToAttachDescs: attachments.convert,
+    materializeAttachmentDescs: attachments.materialize,
     descsToMsgAttachments: attachments.toNative,
     buildBodyWithSignature: body => body,
     getDirectQuoteContent: () => ({ body: "Original text" }),
