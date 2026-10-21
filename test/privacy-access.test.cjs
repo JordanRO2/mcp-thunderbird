@@ -134,6 +134,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     ...constants.map(getConstantDeclaration),
     getMarkedApiSnippet("// BEGIN CONTACT FIELD CONSTANTS", "// END CONTACT FIELD CONSTANTS"),
     getMarkedApiSnippet("// BEGIN OUTBOUND ATTACHMENT LIMITS", "// END OUTBOUND ATTACHMENT LIMITS"),
+    getMarkedApiSnippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
     getMarkedApiSnippet("function normalizeGetMessagesLimit(", "// BEGIN TOOL SCHEMA BUILDER"),
     getMarkedApiSnippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
     getMarkedApiSnippet("// BEGIN SERVER ACCESS HELPERS", "// END SERVER ACCESS HELPERS"),
@@ -501,6 +502,28 @@ describe("Text returned by the production dispatcher", () => {
     assert.equal(result.attachments[0].name, "file");
     assert.equal(result.attachments[0].url, "cid:x\u2060y");
   });
+
+  for (const field of ["rawSource", "body"]) {
+    it(`cleans nested object entries keyed ${field} beside a truthy bodyIsHtml object`, () => {
+      const runtime = loadPrivacyRuntime();
+      const hidden = "nest\u202Eed\u200B";
+      const cleaned = "nested";
+      const raw = `Subject: ${hidden}\r\n\r\n${hidden}`;
+      const html = `<p>${hidden}</p>`;
+      const result = runtime.sanitizeToolResultText({
+        entries: {
+          [field]: { subject: hidden, preview: hidden, rawSource: raw, body: html, bodyIsHtml: true },
+          bodyIsHtml: { subject: hidden },
+        },
+      });
+      assert.deepEqual(result, {
+        entries: {
+          [field]: { subject: cleaned, preview: cleaned, rawSource: raw, body: html, bodyIsHtml: true },
+          bodyIsHtml: { subject: cleaned },
+        },
+      });
+    });
+  }
 
   it("cleans calendar/account/folder names, category lists, and columnar names while preserving paths", async () => {
     const runtime = loadPrivacyRuntime();
