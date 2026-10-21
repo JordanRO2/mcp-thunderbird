@@ -10,7 +10,7 @@ const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_serv
 // loaders. Share the real schema builder for bridge routing and payload probes.
 function loadToolSchema(transform = text => text) {
   const code = transform(source);
-  const snippets = ["OUTBOUND ATTACHMENT LIMITS", "CONTACT FIELD CONSTANTS",
+  const snippets = ["OUTBOUND ATTACHMENT LIMITS", "CONTACT FIELD CONSTANTS", "MESSAGE HEADER LIMITS",
     "FILTER SEARCH TERM HELPERS", "BOUNDED REFRESH HELPERS", "TOOL SCHEMA BUILDER"];
   const runtime = { getConfiguredGetMessagesLimit: () => 10 };
   vm.createContext(runtime);

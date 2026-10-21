@@ -514,7 +514,9 @@ function loadContactRuntime({
   if (dispatch) {
     // Reuse privacy-access/calendar-runtime's production schema dependencies
     // and the existing HTTP installer. No handler or access gate is replaced.
+    vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../extension/tool-access.js"), "utf8"), sandbox);
     vm.runInContext([
+      "const toolAccess = globalThis.ToolAccess;",
       ...["DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "UNDISABLEABLE_TOOLS"].map(constant),
       snippet("OUTBOUND ATTACHMENT LIMITS"),
       snippet("MESSAGE HEADER LIMITS"),
