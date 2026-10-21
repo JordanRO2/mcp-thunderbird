@@ -187,6 +187,8 @@ Reads preserve duplicate addresses already stored in Thunderbird; writes reject 
 
 If a stored vCard cannot be read, contact reads and searches fall back to cached fields. Updates are refused before changing or saving the card, so they cannot overwrite unrelated data lost by the failed parse.
 
+`createContact`, `updateContact`, and `deleteContact` are refused until you enable **Allow contact writes** in the extension settings (off by default). Contact changes are saved without a review step, so a changed email address could silently redirect future messages. Reading contacts is not affected.
+
 ### Calendar
 
 | Tool | Description |
@@ -250,6 +252,8 @@ For sends, these refusals direct callers to `skipReview: false`, where Thunderbi
 For an unreviewed reply or forward, the complete stored original must pass raw MIME checks before Thunderbird's structured parser runs. Preflight retrieves uncached IMAP originals as raw bytes without MIME conversion, allows at most 50 MiB of raw MIME and 50 MiB of structured body text, and refuses HTML above the existing 2 MiB parsing limit. If retrieval fails, use review or make the folder available offline and retry. Incomplete, truncated, oversized, or unclassifiable content requires review. Preflight has a 15-second deadline; a late parser callback cannot resume a refused call. Caller attachment files are accessed or created only after all encryption checks pass.
 
 The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
+
+The "Contact Writes" section controls **Allow contact writes**, which defaults to off and gates `createContact`, `updateContact`, and `deleteContact`. Only the user can change it.
 
 ---
 
