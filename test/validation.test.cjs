@@ -978,15 +978,18 @@ describe('Production contact schemas and dispatch', () => {
     }
   });
 
-  it('passes contact arguments to handlers in production schema order', () => {
-    for (const name of ['getContact', 'createContact', 'updateContact']) {
-      const match = new RegExp(`case "${name}":\\s*return ${name}\\(([^)]*)\\);`)
-        .exec(productionContacts.source);
-      assert.ok(match, `${name} dispatch missing`);
-      const actualArgs = match[1].split(',').map(value => value.trim());
-      const expectedArgs = Object.keys(toolsByName.get(name).inputSchema.properties)
-        .map(property => `args.${property}`);
-      assert.deepEqual(actualArgs, expectedArgs);
+  it('passes contact arguments to handlers in production schema order', async () => {
+    const calls = [];
+    const names = ['getContact', 'createContact', 'updateContact'];
+    const runtime = vm.createContext(Object.fromEntries(names.map(name => [
+      name, (...args) => { calls.push({ name, args }); return name; },
+    ])));
+    vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL DISPATCH', '// END TOOL DISPATCH'), runtime);
+    for (const name of names) {
+      const fields = Object.keys(toolsByName.get(name).inputSchema.properties);
+      const args = Object.fromEntries(fields.map(field => [field, `value:${field}`]));
+      assert.equal(await runtime.dispatchTool(name, args), name);
+      assert.deepEqual(calls.pop(), { name, args: fields.map(field => args[field]) });
     }
   });
 });

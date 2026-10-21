@@ -3345,6 +3345,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const { MailServices } = ChromeUtils.importESModule(
               "resource:///modules/MailServices.sys.mjs"
             );
+            // BEGIN CONTACT MODULE IMPORTS
             let VCardPropertyEntry;
             try {
               ({ VCardPropertyEntry } = ChromeUtils.importESModule(
@@ -3355,6 +3356,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/VCardUtils.jsm"
               ));
             }
+            let AddrBookCard;
+            try {
+              ({ AddrBookCard } = ChromeUtils.importESModule(
+                "resource:///modules/AddrBookCard.sys.mjs"
+              ));
+            } catch {
+              ({ AddrBookCard } = ChromeUtils.import(
+                "resource:///modules/AddrBookCard.jsm"
+              ));
+            }
+            // END CONTACT MODULE IMPORTS
 
             let cal = null;
             let CalEvent = null;
@@ -6230,6 +6242,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END MESSAGE SEARCH
 
+            // BEGIN CONTACT SEARCH
             function searchContacts(query, maxResults) {
               const results = [];
               const lowerQuery = (query || "").toLowerCase();
@@ -6276,6 +6289,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return results;
             }
 
+            // END CONTACT SEARCH
+
+            // BEGIN CONTACT TOOL HANDLERS
             /**
              * Find a contact card by UID across all address books.
              * Returns { card, book } or { error }.
@@ -6361,8 +6377,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
 
-                const card = Cc["@mozilla.org/addressbook/cardproperty;1"]
-                  .createInstance(Ci.nsIAbCard);
+                const usesVCard = targetBook.dirType === Ci.nsIAbManager.JS_DIRECTORY_TYPE ||
+                  targetBook.dirType === Ci.nsIAbManager.CARDDAV_DIRECTORY_TYPE;
+                const card = usesVCard
+                  ? new AddrBookCard()
+                  : Cc["@mozilla.org/addressbook/cardproperty;1"].createInstance(Ci.nsIAbCard);
                 const applyError = applyContactFields(card, fields, VCardPropertyEntry);
                 if (applyError) return applyError;
                 if (shouldSynthesizePhoneDisplayName(fields) && !card.displayName) {
@@ -6456,6 +6475,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: e.toString() };
               }
             }
+
+            // END CONTACT TOOL HANDLERS
 
             // BEGIN CALENDAR TOOLS
             const ATTENDEE_REVIEW_ERROR = 'The "Block skipReview" setting in Thunderbird MCP Options makes events with attendees other than the calendar user read-only through MCP and blocks adding attendees. Updates and deletions can send invitations or cancellations without review. Disable that setting to allow these writes.';
