@@ -440,6 +440,32 @@ const sampleTools = [
     },
   },
   {
+    name: "getMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+      },
+      required: ["messageId", "folderPath"],
+    },
+  },
+  {
+    name: "batchGetMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageIds: {
+          type: "array",
+          maxItems: 200,
+          items: { type: "string", minLength: 1 },
+        },
+        folderPath: { type: "string" },
+      },
+      required: ["messageIds", "folderPath"],
+    },
+  },
+  {
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
@@ -2127,5 +2153,121 @@ describe('Outbound attachment failures are atomic', () => {
       const result = allowed.filePathsToAttachDescs([os === 'WINNT' ? original : '/home/user/Documents/report.pdf']);
       assert.equal(result.descs.length, 1);
     }
+  });
+});
+
+describe('Validation: getMessageHeaders', () => {
+  it('accepts messageId + folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing messageId', () => {
+    const errors = validate('getMessageHeaders', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: messageId/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  it('rejects messageId of the wrong type', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: 42,
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      headers: ['Subject'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: headers/);
+  });
+});
+
+describe('Validation: batchGetMessageHeaders', () => {
+  it('accepts a valid batch', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: Array.from({ length: 10 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema minItems: an empty array is valid at the dispatch layer; the
+  // handler short-circuits it to { headers: {}, total: 0, failed: 0 }.
+  it('accepts an empty messageIds array (handler returns the empty fast path)', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: [],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts exactly 200 ids and rejects 201 with a single bounds error', () => {
+    const ids = count => Array.from({ length: count }, (_, index) => `<message-${index}@example.com>`);
+    assert.deepStrictEqual(validate('batchGetMessageHeaders', {
+      messageIds: ids(200),
+      folderPath: 'imap://user@server/INBOX',
+    }), []);
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ids(201),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at most 200 item/);
+  });
+
+  it('rejects messageIds passed as a non-array', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  // The recursive validator walks the items, so a null element is rejected
+  // before the handler runs.
+  it('rejects a null array item', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>', null],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /messageIds\[1\]/);
+  });
+
+  it('rejects an empty-string id', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: [''],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 character/);
   });
 });
