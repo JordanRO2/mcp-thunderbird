@@ -2,266 +2,346 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
+const { loadCalendarRuntime, plain, assertNoWrites } = require("./helpers/calendar-runtime.cjs");
 
-// Event `reminders` (whole minutes before the start, one display alarm each):
-// set on createEvent, replaced on updateEvent, read back by listEvents. The
-// helpers (normalizeReminders, buildReminderAlarm, normalizeReminderUpdate,
-// applyReminderChanges, reminderMinutesOf) run from production api.js under
-// node:vm with Thunderbird classes stubbed, so these tests cannot drift from the
-// real code; the tool schemas and the createEvent/updateEvent/listEvents wiring
-// are checked as source contracts.
-const api = fs.readFileSync(
-  path.resolve(__dirname, "../extension/mcp_server/api.js"),
-  "utf8"
-);
+const createArgs = { title: "Reminder test", startDate: "2026-09-28T10:00:00Z", calendarId: "calendar-1" };
+const updateArgs = { eventId: "event-1", calendarId: "calendar-1" };
+const range = { calendarId: "calendar-1", startDate: "2026-09-28", endDate: "2026-10-06" };
+const recurrenceId = "2026-09-28T10:00:00.000Z";
 
-function extract(startMarker, endMarker) {
-  const start = api.indexOf(startMarker);
-  const end = api.indexOf(endMarker, start + startMarker.length);
-  assert.ok(start >= 0, `api.js marker missing: ${startMarker}`);
-  assert.ok(end > start, `api.js marker missing: ${endMarker}`);
-  return api.slice(start, end);
+// Full provider records, deliberately outside the subset exposed by reminders.
+function unmanagedAlarms(runtime) {
+  const related = runtime.Ci.calIAlarm;
+  return [
+    runtime.makeAlarm({ related: related.ALARM_RELATED_END, seconds: -600 }),
+    runtime.makeAlarm({ related: related.ALARM_RELATED_END, seconds: 300 }),
+    runtime.makeAlarm({ related: related.ALARM_RELATED_ABSOLUTE, alarmDate: runtime.date("2026-09-28T09:00:00Z") }),
+    runtime.makeAlarm({ seconds: 300 }),
+    runtime.makeAlarm({ action: "EMAIL", seconds: -1800 }),
+    runtime.makeAlarm({ action: "AUDIO", seconds: -1800 }),
+    runtime.makeAlarm({ action: "X-PROVIDER-ACTION", seconds: -1800 }),
+  ].map((alarm, index) => {
+    alarm.description = `Provider description ${index}`;
+    alarm.summary = `Provider summary ${index}`;
+    alarm.setProperty("X-PROVIDER-DATA", `opaque-${index}`);
+    alarm.setProperty("X-DEFAULT-ALARM", "TRUE");
+    return alarm;
+  });
 }
 
-function loadNormalizeReminders() {
-  const source = extract("const MAX_REMINDERS =", "function buildReminderAlarm(");
-  const sandbox = {};
-  vm.runInNewContext(`${source}\nthis.normalizeReminders = normalizeReminders;`, sandbox);
-  // Results are built in the VM realm; copy them into this realm so strict
-  // deep-equality does not fail on differing Array/Object prototypes.
-  return (input) => JSON.parse(JSON.stringify(sandbox.normalizeReminders(input)));
-}
+describe("Production createEvent reminders", () => {
+  for (const skipReview of [false, true]) {
+    for (const [label, reminders, expected] of [
+      ["omitted", undefined, []], ["null", null, []], ["empty", [], []],
+      ["normalized", [0, 40320, 60, 60], [40320, 60, 0]],
+    ]) {
+      it(`creates ${label} reminders through ${skipReview ? "direct write" : "review and save"}`, async () => {
+        const runtime = loadCalendarRuntime(skipReview ? { blockSkipReview: false } : {});
+        const result = await runtime.invoke("createEvent", {
+          ...createArgs, skipReview, ...(reminders !== undefined ? { reminders } : {}),
+        });
+        assert.equal(result.success, true, result.error);
+        assert.equal(runtime.calls.adds.length, skipReview ? 1 : 0);
+        assert.equal(runtime.calls.dialogs.length, skipReview ? 0 : 1);
+        const item = skipReview ? runtime.calls.adds[0] : runtime.calls.dialogs[0].calendarEvent;
+        assert.equal(item.calendar, runtime.calendar);
+        assert.deepEqual(item.getAlarms().map(alarm => alarm.offset.inSeconds), expected.map(minutes => minutes ? -minutes * 60 : 0));
+        for (const alarm of item.getAlarms()) {
+          assert.ok(alarm instanceof runtime.CalAlarm);
+          assert.equal(alarm.action, "DISPLAY");
+          assert.equal(alarm.related, runtime.Ci.calIAlarm.ALARM_RELATED_START);
+          assert.equal(alarm.description, null, "Thunderbird supplies DISPLAY descriptions when serializing");
+          assert.equal(alarm.offset.constructor, runtime.cal.createDuration().constructor);
+        }
+        if (!skipReview) {
+          await runtime.calls.dialogs[0].onOk(item, runtime.calendar);
+          assert.equal(runtime.calls.adds[0], item);
+        }
+        // Writes record calls; explicitly expose the persisted item for readback.
+        runtime.items.set(item.id, item);
+        const listed = await runtime.invoke("listEvents", range);
+        assert.ok(Array.isArray(listed), listed.error);
+        assert.deepEqual(plain(listed.map(event => event.reminders)), [expected]);
+      });
+    }
+  }
 
-describe("normalizeReminders", () => {
-  const normalizeReminders = loadNormalizeReminders();
-
-  it("treats omitted or null as no reminders", () => {
-    assert.deepEqual(normalizeReminders(undefined), { minutes: [] });
-    assert.deepEqual(normalizeReminders(null), { minutes: [] });
-    assert.deepEqual(normalizeReminders([]), { minutes: [] });
-  });
-
-  it("accepts minutes before start, including 0 (at event time)", () => {
-    assert.deepEqual(normalizeReminders([0, 1440]).minutes, [1440, 0]);
-  });
-
-  it("de-duplicates and orders largest first", () => {
-    assert.deepEqual(normalizeReminders([0, 4320, 1440, 1440, 0]).minutes, [4320, 1440, 0]);
-  });
-
-  it("rejects a non-array", () => {
-    assert.match(normalizeReminders("1440").error, /array/);
-    assert.match(normalizeReminders(1440).error, /array/);
-  });
-
-  it("rejects non-integer, negative, string and NaN entries, naming the index", () => {
-    assert.match(normalizeReminders([30, 1.5]).error, /reminders\[1\]/);
-    assert.match(normalizeReminders([-1]).error, /reminders\[0\]/);
-    assert.match(normalizeReminders(["30"]).error, /reminders\[0\]/);
-    assert.match(normalizeReminders([NaN]).error, /reminders\[0\]/);
-  });
-
-  it("caps the count and the lead time", () => {
-    assert.match(normalizeReminders(Array.from({ length: 11 }, (_, i) => i)).error, /at most 10/);
-    assert.match(normalizeReminders([40321]).error, /40320/);
-    assert.deepEqual(normalizeReminders([40320]).minutes, [40320]);
+  it("still refuses direct creation with reminders while Block skipReview is on", async () => {
+    const runtime = loadCalendarRuntime();
+    const result = await runtime.invoke("createEvent", { ...createArgs, reminders: [60], skipReview: true });
+    assert.match(result.error, /skipReview/);
+    assertNoWrites(runtime);
   });
 });
 
-describe("createEvent reminders wiring (source contract)", () => {
-  const createEventSource = extract("async function createEvent(", "function normalizeEventStatus(");
+describe("Production reminder validation", () => {
+  for (const [label, name, args] of [
+    ["review create", "createEvent", createArgs],
+    ["direct create", "createEvent", { ...createArgs, skipReview: true }],
+    ["series update", "updateEvent", updateArgs],
+    ["occurrence update", "updateEvent", { ...updateArgs, recurrenceId }],
+  ]) {
+    it(`rejects invalid reminder inputs before lookup or writes on ${label}`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false });
+      runtime.seedSeries();
+      for (const reminders of [
+        "1440", 1440, {}, [30, 1.5], [-1], ["30"], [NaN], [Infinity], [null],
+        [40321], Array.from({ length: 11 }, (_, index) => index), Array(11).fill(60),
+      ]) {
+        const result = await runtime.invoke(name, { ...args, reminders });
+        assert.match(result.error, /reminders/, JSON.stringify(reminders));
+        assertNoWrites(runtime);
+        assert.deepEqual(runtime.calls.reads, [], "validation must precede calendar and item lookup");
+      }
+    });
 
-  it("declares the reminders tool parameter as an array of integers", () => {
-    const i = api.indexOf('name: "createEvent"');
-    const j = api.indexOf('name: "listEvents"', i);
-    assert.match(api.slice(i, j), /reminders:\s*\{\s*type:\s*"array",\s*items:\s*\{\s*type:\s*"integer"/);
-  });
+    it(`accepts ten entries and the four-week boundary on ${label}`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false });
+      runtime.seedSeries();
+      const reminders = [40320, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+      const result = await runtime.invoke(name, { ...args, reminders });
+      assert.equal(result.success, true, result.error);
+      const written = runtime.calls.modifies[0]?.item || runtime.calls.adds[0] || runtime.calls.dialogs[0].calendarEvent;
+      assert.deepEqual(written.getAlarms().map(alarm => alarm.offset.inSeconds), reminders.map(minutes => minutes ? -minutes * 60 : 0));
+    });
+  }
 
-  it("passes args.reminders from the dispatcher into createEvent", () => {
-    assert.match(api, /return await createEvent\([^)]*args\.reminders\)/);
-  });
-
-  it("validates reminders and adds one alarm per entry", () => {
-    assert.match(createEventSource, /normalizeReminders\(reminders\)/);
-    assert.match(createEventSource, /event\.addAlarm\(/);
-  });
-
-});
-
-describe("buildReminderAlarm (production code, Thunderbird classes stubbed)", () => {
-  const START = 0;
-  class StubAlarm {}
-  const sandbox = {
-    CalAlarm: StubAlarm,
-    Ci: { calIAlarm: { ALARM_RELATED_START: START } },
-    cal: { createDuration: () => ({ inSeconds: 0 }) },
-  };
-  vm.runInNewContext(
-    `${extract("function buildReminderAlarm(", "function normalizeEventStatus(")}\nthis.buildReminderAlarm = buildReminderAlarm;`,
-    sandbox
-  );
-
-  it("builds a DISPLAY alarm titled after the event, relative to the start", () => {
-    const alarm = sandbox.buildReminderAlarm("Team standup", 1440);
-    assert.ok(alarm instanceof StubAlarm);
-    assert.equal(alarm.action, "DISPLAY");
-    assert.equal(alarm.description, "Team standup");
-    assert.equal(alarm.related, START);
-  });
-
-  it("offsets the trigger before the start by the requested minutes", () => {
-    assert.equal(sandbox.buildReminderAlarm("x", 1440).offset.inSeconds, -86400);
-    assert.equal(sandbox.buildReminderAlarm("x", 30).offset.inSeconds, -1800);
-  });
-
-  it("fires at the start for 0 minutes", () => {
-    assert.equal(sandbox.buildReminderAlarm("x", 0).offset.inSeconds, 0);
+  it("uses the existing array-string coercion through the dispatcher", async () => {
+    const runtime = loadCalendarRuntime();
+    runtime.seedEvent();
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, reminders: "[60, 15, 60]" });
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(runtime.calls.modifies[0].item.getAlarms().map(alarm => alarm.offset.inSeconds), [-3600, -900]);
   });
 });
 
-// calIAlarm.ALARM_RELATED_* values, as Thunderbird defines them.
-const RELATED = { ABSOLUTE: 0, START: 1, END: 2 };
+describe("Production managed reminder replacement", () => {
+  for (const occurrence of [false, true]) {
+    const label = occurrence ? "occurrence" : "series";
+    for (const reminders of [[], [0, 1440, 30, 30]]) {
+      it(`${reminders.length ? "replaces" : "clears"} only managed ${label} alarms, retaining full provider records`, async () => {
+        const runtime = loadCalendarRuntime();
+        const retained = unmanagedAlarms(runtime);
+        const managed = runtime.makeAlarm();
+        managed.setProperty("X-DEFAULT-ALARM", "TRUE");
+        const { master, occurrences } = runtime.seedSeries({ alarms: [managed, ...retained] });
+        const original = occurrence ? occurrences[0] : master;
+        original.alarmLastAck = runtime.date("2026-09-27T09:00:00Z");
+        original.setProperty("X-MOZ-SNOOZE-TIME", "20260928T090000Z");
+        original.setProperty("X-MOZ-SNOOZE-TIME-123", "20260928T100000Z");
+        const result = await runtime.invoke("updateEvent", {
+          ...updateArgs, reminders, ...(occurrence ? { recurrenceId } : {}),
+        });
+        assert.equal(result.success, true, result.error);
+        assert.deepEqual(plain(result.updated), ["reminders"]);
+        const { item, previous } = runtime.calls.modifies[0];
+        assert.equal(previous, original, "modifyItem requires the original occurrence, not its master");
+        assert.notEqual(item, original);
+        if (occurrence) {
+          assert.equal(result.mode, "occurrence");
+          assert.equal(item.parentItem, master);
+          assert.equal(item.recurrenceId.compare(original.recurrenceId), 0);
+          assert.equal(original.alarms, null, "the stored occurrence still inherits");
+        }
+        const alarms = item.getAlarms();
+        assert.deepEqual(alarms.slice(0, retained.length), retained);
+        const requested = alarms.slice(retained.length);
+        assert.deepEqual(requested.map(alarm => alarm.offset.inSeconds), reminders.length ? [-86400, -1800, 0] : []);
+        assert.ok(requested.every(alarm => alarm.action === "DISPLAY" && alarm.description === null));
+        assert.deepEqual(original.getAlarms(), [managed, ...retained]);
+        assert.deepEqual(master.getAlarms(), [managed, ...retained]);
+        assert.deepEqual(item.alarmLastAck, original.alarmLastAck);
+        assert.equal(item.getProperty("X-MOZ-SNOOZE-TIME"), "20260928T090000Z");
+        assert.equal(item.getProperty("X-MOZ-SNOOZE-TIME-123"), "20260928T100000Z");
+        assert.notEqual(alarms[0], retained[0]);
+        assert.notEqual(alarms[0].offset, retained[0].offset);
+        alarms[0].setProperty("X-PROVIDER-DATA", "clone-only");
+        alarms[0].offset.inSeconds = -123;
+        assert.equal(retained[0].getProperty("X-PROVIDER-DATA"), "opaque-0");
+        assert.equal(retained[0].offset.inSeconds, -600);
+      });
+    }
 
-function loadReminderHelpers() {
-  class StubAlarm {}
-  const sandbox = {
-    CalAlarm: StubAlarm,
-    Ci: { calIAlarm: { ALARM_RELATED_ABSOLUTE: RELATED.ABSOLUTE, ALARM_RELATED_START: RELATED.START, ALARM_RELATED_END: RELATED.END } },
-    cal: { createDuration: () => ({ inSeconds: 0 }) },
-  };
-  vm.runInNewContext(
-    `${extract("const MAX_REMINDERS =", "function normalizeEventStatus(")}
-     this.normalizeReminderUpdate = normalizeReminderUpdate;
-     this.applyReminderChanges = applyReminderChanges;
-     this.reminderMinutesOf = reminderMinutesOf;`,
-    sandbox
-  );
-  return sandbox;
-}
+    for (const reminders of [undefined, null]) {
+      it(`preserves ${label} second offsets and all metadata with reminders ${String(reminders)}`, async () => {
+        const runtime = loadCalendarRuntime();
+        const managed = runtime.makeAlarm({ seconds: -90, description: "Existing description" });
+        managed.setProperty("X-DEFAULT-ALARM", "TRUE");
+        const alarms = [managed, ...unmanagedAlarms(runtime)];
+        const { master, occurrences } = runtime.seedSeries({ alarms });
+        const original = occurrence ? occurrences[0] : master;
+        original.clearAlarms = () => assert.fail("unrelated edits must not rewrite alarms");
+        original.addAlarm = () => assert.fail("unrelated edits must not re-add alarms");
+        const listed = await runtime.invoke("listEvents", range);
+        assert.ok(Array.isArray(listed), listed.error);
+        assert.deepEqual(plain(listed.map(event => event.reminders)), [[2], [2]]);
+        const result = await runtime.invoke("updateEvent", {
+          ...updateArgs, title: "Renamed", ...(reminders !== undefined ? { reminders } : {}),
+          ...(occurrence ? { recurrenceId } : {}),
+        });
+        assert.equal(result.success, true, result.error);
+        assert.deepEqual(plain(result.updated), ["title"]);
+        const { item, previous } = runtime.calls.modifies[0];
+        assert.equal(previous, original);
+        assert.deepEqual(item.getAlarms(), alarms);
+        assert.equal(item.getAlarms()[0].offset.inSeconds, -90);
+        assert.deepEqual(original.getAlarms(), alarms);
+        assert.deepEqual(master.getAlarms(), alarms);
+      });
+    }
 
-// A stand-in event item that records the alarm calls made on it.
-function stubItem(title, alarms = []) {
-  return {
-    title,
-    alarms: [...alarms],
-    clearCalls: 0,
-    clearAlarms() { this.clearCalls += 1; this.alarms = []; },
-    addAlarm(alarm) { this.alarms.push(alarm); },
-    getAlarms() { return [...this.alarms]; },
-  };
-}
+    it(`does not count omitted/null reminders as a ${label} change`, async () => {
+      const runtime = loadCalendarRuntime();
+      runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+      for (const reminders of [undefined, null]) {
+        const result = await runtime.invoke("updateEvent", {
+          ...updateArgs, reminders, ...(occurrence ? { recurrenceId } : {}),
+        });
+        assert.match(result.error, /No changes/);
+        assertNoWrites(runtime);
+      }
+    });
 
-describe("normalizeReminderUpdate (updateEvent: omitted/null keeps, array replaces, [] clears)", () => {
-  const { normalizeReminderUpdate } = loadReminderHelpers();
-  const run = (input) => JSON.parse(JSON.stringify(normalizeReminderUpdate(input)));
+    it(`allows reminders-only meeting ${label} changes when Block skipReview is disabled`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false });
+      runtime.seedSeries({ attendees: [{ id: "mailto:other@example.com" }] });
+      const result = await runtime.invoke("updateEvent", {
+        ...updateArgs, reminders: [60], ...(occurrence ? { recurrenceId } : {}),
+      });
+      assert.equal(result.success, true, result.error);
+      assert.equal(runtime.calls.modifies.length, 1);
+    });
+  }
 
-  it("leaves existing reminders alone when omitted or null", () => {
-    assert.deepEqual(run(undefined), { minutes: null });
-    assert.deepEqual(run(null), { minutes: null });
-  });
-
-  it("treats an empty array as an explicit request to remove every reminder", () => {
-    assert.deepEqual(run([]), { minutes: [] });
-  });
-
-  it("uses the same rules as createEvent for a non-empty list", () => {
-    assert.deepEqual(run([30, 1440, 30]), { minutes: [1440, 30] });
-    assert.match(run("1440").error, /array/);
-    assert.match(run([40321]).error, /40320/);
-    assert.match(run([1.5]).error, /reminders\[0\]/);
-  });
-});
-
-describe("applyReminderChanges (production code, item stubbed)", () => {
-  const { applyReminderChanges } = loadReminderHelpers();
-
-  it("does nothing when reminders were not supplied", () => {
-    const item = stubItem("Review", ["existing"]);
-    const changes = ["title"];
-    applyReminderChanges(item, null, changes);
-    assert.equal(item.clearCalls, 0);
-    assert.deepEqual(item.alarms, ["existing"]);
-    assert.deepEqual([...changes], ["title"]);
-  });
-
-  it("replaces every existing alarm with the requested ones, titled after the event", () => {
-    const item = stubItem("Review", ["old-1", "old-2"]);
-    const changes = ["title"];
-    applyReminderChanges(item, [1440, 0], changes);
-    assert.equal(item.clearCalls, 1);
-    assert.equal(item.alarms.length, 2);
-    assert.deepEqual(item.alarms.map((a) => a.offset.inSeconds), [-86400, 0]);
-    assert.deepEqual(item.alarms.map((a) => a.description), ["Review", "Review"]);
-    assert.deepEqual([...changes], ["title", "reminders"]);
-  });
-
-  it("removes every alarm for an empty list", () => {
-    const item = stubItem("Review", ["old-1"]);
-    const changes = [];
-    applyReminderChanges(item, [], changes);
-    assert.equal(item.clearCalls, 1);
+  it("clears inherited occurrence alarms without inheriting them again", async () => {
+    const runtime = loadCalendarRuntime();
+    const alarm = runtime.makeAlarm();
+    const { master, occurrences } = runtime.seedSeries({ alarms: [alarm] });
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, recurrenceId, reminders: [] });
+    assert.equal(result.success, true, result.error);
+    const { item, previous } = runtime.calls.modifies[0];
+    assert.equal(previous, occurrences[0]);
+    assert.deepEqual(item.getAlarms(), []);
     assert.deepEqual(item.alarms, []);
-    assert.deepEqual([...changes], ["reminders"]);
+    assert.deepEqual(master.getAlarms(), [alarm]);
+    assert.deepEqual(occurrences[0].getAlarms(), [alarm]);
+  });
+
+  it("distinguishes an explicit empty occurrence from inherited alarms", async () => {
+    const runtime = loadCalendarRuntime();
+    const { master, occurrences } = runtime.seedSeries({ alarms: unmanagedAlarms(runtime) });
+    occurrences[0].clearAlarms();
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, recurrenceId, reminders: [15] });
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(runtime.calls.modifies[0].item.getAlarms().map(alarm => alarm.offset.inSeconds), [-900]);
+    assert.deepEqual(occurrences[0].getAlarms(), []);
+    assert.equal(master.getAlarms().length, 7);
+  });
+
+  it("keeps modified exceptions and their own alarms when changing the series", async () => {
+    const runtime = loadCalendarRuntime();
+    const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+    const exception = occurrences[1];
+    exception.title = "Modified occurrence";
+    exception.alarms = [runtime.makeAlarm({ seconds: -300 }), ...unmanagedAlarms(runtime)];
+    master.recurrenceInfo.exceptions.push(exception);
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, reminders: [90] });
+    assert.equal(result.success, true, result.error);
+    const written = runtime.calls.modifies[0].item;
+    const keptException = written.recurrenceInfo.getExceptionFor(exception.recurrenceId);
+    assert.deepEqual(keptException.getAlarms(), exception.getAlarms());
+    assert.notEqual(keptException, exception);
+    assert.equal(keptException.title, exception.title);
+    assert.equal(master.getAlarms()[0].offset.inSeconds, -3600);
+    assert.equal(exception.getAlarms()[0].offset.inSeconds, -300);
+    runtime.items.set(master.id, written);
+    const listed = await runtime.invoke("listEvents", range);
+    assert.ok(Array.isArray(listed), listed.error);
+    assert.deepEqual(plain(listed.map(event => event.reminders)), [[90], [5]]);
+  });
+
+  it("round-trips listed reminders without deleting unseen alarms", async () => {
+    const runtime = loadCalendarRuntime();
+    const retained = unmanagedAlarms(runtime);
+    const source = runtime.seedEvent({ alarms: [runtime.makeAlarm(), ...retained] });
+    const before = await runtime.invoke("listEvents", range);
+    assert.deepEqual(plain(before[0].reminders), [60]);
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, reminders: [...before[0].reminders, 10] });
+    assert.equal(result.success, true, result.error);
+    const written = runtime.calls.modifies[0].item;
+    assert.deepEqual(written.getAlarms().slice(0, retained.length), retained);
+    assert.equal(source.getAlarms().length, retained.length + 1);
+    runtime.items.set(source.id, written);
+    const after = await runtime.invoke("listEvents", range);
+    assert.deepEqual(plain(after[0].reminders), [60, 10]);
   });
 });
 
-describe("reminderMinutesOf (what listEvents reports; production code, alarms stubbed)", () => {
-  const { reminderMinutesOf } = loadReminderHelpers();
-  const startAlarm = (seconds) => ({ related: RELATED.START, offset: { inSeconds: seconds } });
-
-  it("reports start-relative alarms as minutes before the start, largest first", () => {
-    const item = stubItem("x", [startAlarm(0), startAlarm(-86400), startAlarm(-1800)]);
-    assert.deepEqual([...reminderMinutesOf(item)], [1440, 30, 0]);
+describe("Production reminder listing and read failures", () => {
+  it("lists only managed stored alarms, rounding seconds without applying write caps", async () => {
+    const runtime = loadCalendarRuntime();
+    const alarms = [0, -0, -29, -30, -89, -90, -3600, -3600, -40321 * 60].map(seconds => runtime.makeAlarm({ seconds }));
+    alarms[0].setProperty("X-DEFAULT-ALARM", "TRUE");
+    runtime.seedEvent({ alarms: [...alarms, ...unmanagedAlarms(runtime)] });
+    runtime.seedEvent({ id: "no-alarms" });
+    const listed = await runtime.invoke("listEvents", range);
+    assert.ok(Array.isArray(listed), listed.error);
+    assert.deepEqual(plain(listed.find(event => event.id === "event-1").reminders), [40321, 60, 2, 1, 0]);
+    assert.ok(Object.is(listed.find(event => event.id === "event-1").reminders.at(-1), 0));
+    assert.deepEqual(plain(listed.find(event => event.id === "no-alarms").reminders), []);
+    assert.equal(alarms[5].offset.inSeconds, -90);
   });
 
-  it("reports nothing for an event with no alarms of its own", () => {
-    assert.deepEqual([...reminderMinutesOf(stubItem("x"))], []);
+  it("contains an alarm-read failure to one listing row", async () => {
+    const runtime = loadCalendarRuntime();
+    const broken = runtime.seedEvent({ id: "broken" });
+    broken.getAlarms = () => { throw new Error("provider getAlarms failure"); };
+    runtime.seedEvent({ id: "healthy", alarms: [runtime.makeAlarm()] });
+    const listed = await runtime.invoke("listEvents", range);
+    assert.ok(Array.isArray(listed), listed.error);
+    assert.equal(listed.length, 2);
+    assert.deepEqual(plain(listed.find(event => event.id === "broken").reminders), []);
+    assert.deepEqual(plain(listed.find(event => event.id === "healthy").reminders), [60]);
   });
 
-  it("drops duplicates and returns a plain 0, never -0", () => {
-    const minutes = [...reminderMinutesOf(stubItem("x", [startAlarm(0), startAlarm(-0), startAlarm(-3600), startAlarm(-3600)]))];
-    assert.deepEqual(minutes, [60, 0]);
-    assert.ok(Object.is(minutes[1], 0));
-  });
+  for (const occurrence of [false, true]) {
+    for (const failOnClone of [false, true]) {
+      it(`fails closed reading ${occurrence ? "occurrence" : "series"} alarms on the ${failOnClone ? "clone" : "original"}`, async () => {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false });
+        const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+        const original = occurrence ? occurrences[0] : master;
+        if (failOnClone) {
+          const clone = original.clone.bind(original);
+          original.clone = () => {
+            const item = clone();
+            item.getAlarms = () => { throw new Error("provider getAlarms failure"); };
+            item.clearAlarms = () => assert.fail("must read before replacing alarms");
+            return item;
+          };
+        } else {
+          original.getAlarms = () => { throw new Error("provider getAlarms failure"); };
+        }
+        for (const reminders of [[], [60]]) {
+          const result = await runtime.invoke("updateEvent", {
+            ...updateArgs, reminders, attendees: [{ email: "invitee@example.com" }],
+            ...(occurrence ? { recurrenceId } : {}),
+          });
+          assert.match(result.error, /provider getAlarms failure/);
+          assertNoWrites(runtime);
+        }
+      });
+    }
 
-  it("skips alarms that cannot be expressed as minutes before the start", () => {
-    const item = stubItem("x", [
-      { related: RELATED.END, offset: { inSeconds: -600 } },
-      { related: RELATED.ABSOLUTE, offset: null },
-      startAlarm(300),
-      startAlarm(-600),
-    ]);
-    assert.deepEqual([...reminderMinutesOf(item)], [10]);
-  });
-});
-
-describe("updateEvent / listEvents reminders wiring (source contract)", () => {
-  const updateEventSource = extract("async function updateEvent(", "async function deleteEvent(");
-
-  it("declares reminders on the updateEvent tool as a replace-the-list array", () => {
-    const i = api.indexOf('name: "updateEvent"');
-    const j = api.indexOf('name: "deleteEvent"', i);
-    const schema = api.slice(i, j);
-    assert.match(schema, /reminders:\s*\{\s*type:\s*"array",\s*items:\s*\{\s*type:\s*"integer"/);
-    assert.match(schema, /Replace the full list[^"]*\[\] removes all[^"]*omitted\/null (preserves|leaves)/);
-  });
-
-  it("passes args.reminders from the dispatcher into updateEvent", () => {
-    assert.match(api, /return await updateEvent\([^)]*args\.reminders\)/);
-  });
-
-  it("validates before touching anything and applies on both the series and the occurrence path", () => {
-    assert.match(updateEventSource, /normalizeReminderUpdate\(reminders\)/);
-    assert.equal(updateEventSource.split("applyReminderChanges(").length - 1, 2);
-  });
-
-  it("returns reminders from listEvents and says so in the tool description", () => {
-    assert.match(api, /reminders:\s*reminderMinutesOf\(item\)/);
-    const i = api.indexOf('name: "listEvents"');
-    const j = api.indexOf('name: "updateEvent"', i);
-    assert.match(api.slice(i, j), /reminders/);
-  });
+    it(`runs Send Safety before reading ${occurrence ? "occurrence" : "series"} alarms`, async () => {
+      const runtime = loadCalendarRuntime();
+      const { master, occurrences } = runtime.seedSeries({ attendees: [{ id: "mailto:other@example.com" }] });
+      const original = occurrence ? occurrences[0] : master;
+      original.getAlarms = () => assert.fail("guard must run before alarm inspection");
+      const result = await runtime.invoke("updateEvent", {
+        ...updateArgs, reminders: [60], ...(occurrence ? { recurrenceId } : {}),
+      });
+      assert.match(result.error, /Block skipReview/);
+      assertNoWrites(runtime);
+    });
+  }
 });

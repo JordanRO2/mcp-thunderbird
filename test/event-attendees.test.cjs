@@ -2,21 +2,13 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { loadCalendarRuntime, plain } = require("./helpers/calendar-runtime.cjs");
+const { loadCalendarRuntime, plain, assertNoWrites } = require("./helpers/calendar-runtime.cjs");
 
 const createArgs = { title: "Meeting", startDate: "2026-09-28T10:00:00Z", calendarId: "calendar-1" };
 const updateArgs = { eventId: "event-1", calendarId: "calendar-1" };
 const attendee = { email: "alice@example.com", name: "Alice", role: "optional" };
 const existingAttendee = { id: "mailto:old@example.com", participationStatus: "ACCEPTED", role: "REQ-PARTICIPANT" };
 const recurrenceId = "2026-09-28T10:00:00.000Z";
-
-function assertNoWrites(runtime) {
-  assert.equal(runtime.calls.adds.length, 0);
-  assert.equal(runtime.calls.modifies.length, 0);
-  assert.equal(runtime.calls.deletes.length, 0);
-  assert.equal(runtime.calls.dialogs.length, 0);
-  assert.equal(runtime.calls.calendarProperties.length, 0);
-}
 
 describe("Attendee writes use the production Block skipReview preference", () => {
   for (const [label, options] of [
@@ -129,6 +121,7 @@ describe("Meetings are read-only while the production Block skipReview guard is 
         runtime.seedSeries({ attendees: [existingAttendee] });
         const changes = [
           { title: "New title" }, { description: "New description" },
+          { reminders: [60] }, { reminders: [] },
           { startDate: "2026-09-28T12:00:00Z", endDate: "2026-09-28T13:00:00Z" },
           ...(!occurrence ? [{ recurrence: "FREQ=DAILY;COUNT=3" }, { recurrence: null }] : []),
         ];
