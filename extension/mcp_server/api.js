@@ -5214,10 +5214,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const COMPOSE_SIZE_HEADER_BYTES = 256;
             const COMPOSE_SIZE_MARGIN = 1.25;
             const COMPOSE_BASE64_COLUMNS = 72;
-            // Quote prefixes, HTML escaping, charset decoding, inherited headers
-            // and re-encoded original attachments can all expand a raw snapshot.
-            // Also measure the final prepared quote before sending (see below).
-            const COMPOSE_ORIGINAL_EXPANSION = 32;
 
             // Searched getBase64EncodedSize/truncateHtmlForParsing: reuse their
             // base64 quantum and UTF-8 accounting. MimeEncoder on ESR128/140/153
@@ -5278,11 +5274,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               let bytes = COMPOSE_SIZE_FIXED_BYTES + 4 * getComposeTextSize(headerBytes);
               // Reserve an HTML part and its possible generated plain alternative.
               bytes += getComposeTextSize(textBytes(body) * (useHtml ? 3 : 1));
-              bytes += getComposeTextSize(validSize(inheritedRawBytes) * COMPOSE_ORIGINAL_EXPANSION);
+              // The complete raw snapshot bounds inherited attachment bytes and
+              // headers before re-encoding. Gloda's allUserAttachments excludes
+              // attachments inside an attached message, so their bytes are not
+              // repeated. The final quote is measured in body above, including
+              // charset conversion, escaping and quote prefixes; applying those
+              // expansions to every raw attachment byte would double-count them.
+              bytes += getComposeTextSize(validSize(inheritedRawBytes));
               for (const attachment of attachments) {
                 const size = validSize(attachment.size);
                 bytes += COMPOSE_SIZE_PART_BYTES;
-                bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? ""));
+                bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? "")
+                  + textBytes(attachment.url ?? ""));
                 // Only a known binary type guarantees base64. Path/type inference
                 // and textual attachments need the QP worst case instead.
                 bytes += attachment.contentType === "application/octet-stream"
@@ -11509,13 +11512,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    // On success Thunderbird marks the original forwarded.
-                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body });
+                    // Original payload bytes are already covered by the raw
+                    // snapshot. Count each emitted part's new metadata/boundary
+                    // separately, including provider URLs used as Content-Location.
+                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body,
+                      attachments: [...fileDescs, ...origDescs.map(desc => ({ ...desc, size: 0 }))] });
                     if (size.warning) {
                       resolve({ error: size.warning });
                       return;
                     }
                     const allDescs = [...origDescs, ...materializeAttachmentDescs(fileDescs)];
+                    // On success Thunderbird marks the original forwarded.
                     sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml, preparedAccountKey).then(result => {
                       if (result.success) {
                         let msg = `Forward sent with ${allDescs.length} attachment(s)`;
