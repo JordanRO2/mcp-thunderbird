@@ -2491,9 +2491,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
+    // Register before loading shared code: ESR 153+ rejects direct jar:/file:
+    // subscripts. resource: is trusted on every supported Thunderbird version.
+    resProto.setSubstitutionWithFlags(
+      resourceName,
+      extensionRoot,
+      resProto.ALLOW_CONTENT_ACCESS
+    );
+
     // BEGIN TOOL ACCESS IMPORT
     const toolAccessScope = {};
-    Services.scriptloader.loadSubScript(extensionRoot.resolve("tool-access.js"), toolAccessScope);
+    Services.scriptloader.loadSubScript("resource://thunderbird-mcp/tool-access.js", toolAccessScope);
     const toolAccess = toolAccessScope.ToolAccess;
     // END TOOL ACCESS IMPORT
 
@@ -2521,12 +2529,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       }
     }
     // END UNINSTALL LISTENER REGISTRATION
-
-    resProto.setSubstitutionWithFlags(
-      resourceName,
-      extensionRoot,
-      resProto.ALLOW_CONTENT_ACCESS
-    );
 
     function normalizeGetMessagesLimit(value) {
       const limit = Number(value);

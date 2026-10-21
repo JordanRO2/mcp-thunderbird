@@ -2902,14 +2902,21 @@ ServerHandler.prototype = {
         this._setState(path, "__LOCATION__", file.path);
 
         try {
-          // Alas, the line number in errors dumped to console when calling the
-          // request handler is simply an offset from where we load the SJS file.
-          // Work around this in a reasonably non-fragile way by dynamically
-          // getting the line number where we evaluate the SJS file.  Don't
-          // separate these two lines!
-          var line = new Error().lineNumber;
-          let uri = Services.io.newFileURI(file);
-          Services.scriptloader.loadSubScript(uri.spec, s);
+          // ESR 153+ rejects file: subscripts. Give this registered SJS file a
+          // temporary, privileged-only resource mapping; never enable unsafe
+          // loads or expose its directory to extension/content pages.
+          const resources = Services.io.getProtocolHandler("resource")
+            .QueryInterface(Ci.nsISubstitutingProtocolHandler);
+          const resourceName = "thunderbird-mcp-sjs-" + Services.uuid.generateUUID().toString().slice(1, -1);
+          try {
+            resources.setSubstitution(resourceName, Services.io.newFileURI(file.parent));
+            const uri = `resource://${resourceName}/${encodeURIComponent(file.leafName)}`;
+            // Keep the load next to this line-number capture for SJS errors.
+            var line = new Error().lineNumber;
+            Services.scriptloader.loadSubScript(uri, s);
+          } finally {
+            resources.setSubstitution(resourceName, null);
+          }
         } catch (e) {
           dumpn("*** syntax error in SJS at " + file.path + ": " + e);
           throw HTTP_500;

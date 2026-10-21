@@ -123,12 +123,8 @@ function loadPrivacyRuntime({
     server: { registerPathHandler(_path, handler) { httpHandler = handler; } },
     authToken: "fixture-token", timingSafeEqual: (a, b) => a === b,
     MAX_REQUEST_BODY: 1024 * 1024, readRequestBody: request => request.body,
-    extensionRoot: { resolve(name) {
-      assert.equal(name, "tool-access.js");
-      return "resource://fixture/" + name;
-    } },
     Services: { prefs, uuid: { generateUUID: randomUUID }, scriptloader: { loadSubScript(url, scope) {
-      assert.equal(url, "resource://fixture/tool-access.js");
+      assert.equal(url, "resource://thunderbird-mcp/tool-access.js");
       vm.runInNewContext(policyTransform(fs.readFileSync(path.resolve(__dirname, "../../extension/tool-access.js"), "utf8")), scope);
     } } },
     Ci: { nsIPrefBranch: prefTypes },
