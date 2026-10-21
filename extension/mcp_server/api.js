@@ -1532,7 +1532,9 @@ function refreshTimer(ms, callback) {
 // it neither formats a tool result nor cancels Thunderbird's underlying work.
 async function waitForRefresh(inFlight, key, timeoutMs, start, request = {}) {
   const started = Date.now();
-  const waiter = { request, deadline: started + timeoutMs };
+  let resolveCompletion;
+  const completion = new Promise(resolve => { resolveCompletion = resolve; });
+  const waiter = { request, deadline: started + timeoutMs, resolve: resolveCompletion };
   let entry = inFlight.get(key);
   if (entry && started - entry.startedAt >= REFRESH_MAX_TIMEOUT_MS) {
     entry.settle(entry.unconfirmed());
@@ -1540,30 +1542,37 @@ async function waitForRefresh(inFlight, key, timeoutMs, start, request = {}) {
   }
   const joinedInFlight = !!entry;
   if (!entry) {
-    let resolveCompletion;
     let settled = false;
     let lastError = null;
     const cleanups = [];
     entry = {
       startedAt: started,
       waiters: new Set([waiter]),
-      completion: new Promise(resolve => { resolveCompletion = resolve; }),
       unconfirmed: () => lastError
         ? { status: "error", error: lastError }
         : { status: "timeout", error: "Refresh completion was not confirmed; Thunderbird may still be working." },
-      settle(outcome) {
+      // A predicate completes only matching current callers, leaving the
+      // operation alive for callers waiting for a later provider completion.
+      settle(outcome, matchesWaiter) {
         if (settled) return;
-        settled = true;
-        for (const cleanup of cleanups) {
-          try { cleanup(); } catch { /* The other resources still need cleanup. */ }
+        if (!matchesWaiter) {
+          settled = true;
+          for (const cleanup of cleanups) {
+            try { cleanup(); } catch { /* The other resources still need cleanup. */ }
+          }
+          cleanups.length = 0;
+          // A late callback must never remove a replacement for this operation.
+          if (inFlight.get(key) === entry) inFlight.delete(key);
         }
-        cleanups.length = 0;
-        // A late callback must never remove a replacement for this operation.
-        if (inFlight.get(key) === entry) inFlight.delete(key);
         if (lastError && outcome.status === "loaded") {
           outcome = { ...outcome, warning: outcome.warning ? `${outcome.warning}; ${lastError}` : lastError };
         }
-        resolveCompletion(outcome);
+        for (const current of entry.waiters) {
+          if (!matchesWaiter || matchesWaiter(current.request)) {
+            current.resolve(outcome);
+            entry.waiters.delete(current);
+          }
+        }
       },
     };
     inFlight.set(key, entry);
@@ -1602,7 +1611,7 @@ async function waitForRefresh(inFlight, key, timeoutMs, start, request = {}) {
       const remaining = Math.max(0, timeoutMs - (Date.now() - started));
       waitTimer = refreshTimer(remaining, () => resolve(entry.unconfirmed()));
     });
-    return { ...await Promise.race([entry.completion, timedOut]), joinedInFlight };
+    return { ...await Promise.race([completion, timedOut]), joinedInFlight };
   } finally {
     waitTimer?.cancel();
     entry.waiters.delete(waiter);
@@ -13648,6 +13657,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   cleanupAttempt();
                   if (!retried && outcome.status === "loaded" && outcome.updateConfirmed !== true &&
                       hasActiveWaiter(request => request.requireFreshUpdate)) {
+                    settle(outcome, request => !request.requireFreshUpdate);
                     retried = true;
                     if (Services.io.offline) settle({ status: "error", error: REFRESH_OFFLINE_ERROR });
                     else startAttempt();
@@ -13721,7 +13731,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // loaded means a load was reported; updateConfirmed additionally
             // requires a successful folder-update URL exit code.
             // requireFreshUpdate permits ONE trailing attempt after an
-            // unconfirmed load, shared by callers within their original budgets.
+            // unconfirmed load, shared by opted-in callers within their original
+            // budgets. Default callers settle on their first observed completion.
             function waitForFolderRefresh(folder, timeoutMs, { requireFreshUpdate = false } = {}) {
               if (Services.io.offline) {
                 return Promise.resolve({ status: "error", error: REFRESH_OFFLINE_ERROR, joinedInFlight: false });

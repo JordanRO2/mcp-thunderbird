@@ -7,6 +7,7 @@ const { makeImapFolder } = require("./helpers/imap-folder.cjs");
 
 const WAIT_MS = 1000;
 const UPDATE_MS = 50;
+const MIXED_CALLER_WAIT_MS = 75;
 const BUSY_UPDATE_MS = 300;
 const BUSY_START_DELAY_MS = 10;
 const STORE_MS = 40;
@@ -325,16 +326,70 @@ describe("refreshFolder trailing freshness update", () => {
     assert.equal(h.listeners.size, 0);
   });
 
-  it("lets a fresh caller upgrade an existing single-attempt wait", async () => {
+  for (const freshFirst of [false, true]) {
+    it(`preserves the default caller's first completion when it arrives ${freshFirst ? "after" : "before"} a fresh caller`, async () => {
+      const h = loadRefresh();
+      h.folder.updateFolder();
+      let legacyResult;
+      let legacyCompletedAt;
+      let freshResult;
+      let freshCompletedAt;
+      const pending = [];
+      for (const fresh of [freshFirst, !freshFirst]) {
+        pending.push(h.runtime.waitForFolderRefresh(h.folder, fresh ? WAIT_MS : MIXED_CALLER_WAIT_MS,
+          fresh ? FRESH_UPDATE : undefined).then(result => {
+          if (fresh) {
+            freshResult = result;
+            freshCompletedAt = h.clock.now;
+          } else {
+            legacyResult = result;
+            legacyCompletedAt = h.clock.now;
+          }
+          return result;
+        }));
+        if (fresh === freshFirst) await h.clock.advance(BUSY_START_DELAY_MS);
+      }
+      await h.clock.advance(UPDATE_MS - BUSY_START_DELAY_MS);
+      assert.equal(legacyResult?.status, "loaded", "default caller settles on the first completion");
+      assert.equal(legacyResult.updateConfirmed, false);
+      assert.equal(legacyResult.joinedInFlight, freshFirst);
+      assert.match(legacyResult.warning, /could not be confirmed/);
+      assert.equal(legacyCompletedAt, UPDATE_MS);
+      assert.equal(freshResult, undefined, "fresh caller is still waiting for the trailing update");
+      assert.equal(h.folder.imapUpdateCalls, 3);
+      assert.equal(h.listeners.size, 1);
+      await h.clock.advance(UPDATE_MS);
+      await Promise.all(pending);
+      assert.equal(legacyResult.status, "loaded", "the default deadline cannot replace its completed result");
+      assert.equal(legacyResult.updateConfirmed, false);
+      assert.equal(freshResult.status, "loaded");
+      assert.equal(freshResult.updateConfirmed, true);
+      assert.equal(freshResult.joinedInFlight, !freshFirst);
+      assert.equal(freshCompletedAt, 2 * UPDATE_MS);
+      assert.equal(h.folder.imapUpdateCalls, 3);
+      assert.equal(h.listeners.size, 0);
+      assert.equal(h.clock.activeTimers.length, 0);
+    });
+  }
+
+  it("lets a default caller joining the trailing attempt wait for that attempt's completion", async () => {
     const h = loadRefresh();
     h.folder.updateFolder();
-    const first = h.runtime.waitForFolderRefresh(h.folder, WAIT_MS);
-    const second = h.refresh();
-    await h.clock.advance(2 * UPDATE_MS);
-    assert.equal((await first).updateConfirmed, true);
-    assert.equal((await second).updateConfirmed, true);
-    assert.equal((await second).joinedInFlight, true);
+    const fresh = h.refresh();
+    await h.clock.advance(UPDATE_MS);
+    let legacyResult;
+    const legacy = h.runtime.waitForFolderRefresh(h.folder, MIXED_CALLER_WAIT_MS)
+      .then(result => { legacyResult = result; return result; });
+    await h.clock.flush();
+    assert.equal(legacyResult, undefined, "the earlier load predates this caller");
+    await h.clock.advance(UPDATE_MS);
+    assert.equal((await legacy).status, "loaded");
+    assert.equal(legacyResult.updateConfirmed, true);
+    assert.equal(legacyResult.joinedInFlight, true);
+    assert.equal((await fresh).updateConfirmed, true);
     assert.equal(h.folder.imapUpdateCalls, 3);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.clock.activeTimers.length, 0);
   });
 
   it("does not reset an earlier caller's budget for the trailing update", async () => {
