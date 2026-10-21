@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const { loadFolderTools } = require("./helpers/folder-tools.cjs");
 
 const OUTBOX_FLAG = 0x800; // nsMsgFolderFlags.Queue
+const VIRTUAL_FLAG = 0x20; // nsMsgFolderFlags.Virtual
+const VIRTUAL_ERROR = /saved[ -]search|virtual/i;
 
 function makeHarness({ crossAccount = false, denied = [], copyError = false } = {}) {
   const mutations = [];
@@ -32,11 +34,12 @@ function makeHarness({ crossAccount = false, denied = [], copyError = false } = 
     server, URI: "mailbox://one/Unsent%20Messages/Nested", hasSubFolders: false,
     isSpecialFolder: (flag, ancestors) => ancestors === true && flag === OUTBOX_FLAG,
   };
+  const savedSearch = { server, URI: "imap://one/Saved", flags: VIRTUAL_FLAG, hasSubFolders: false };
   const root = { server, URI: "imap://one", isServer: true, hasSubFolders: true, subFolders: [folder, trash, outbox] };
   server.rootFolder = root;
   const accounts = [{ key: "one", incomingServer: server }, { key: "two", incomingServer: otherServer }];
   const runtime = loadFolderTools({
-    accounts, folders: [root, folder, target, trash, outbox, nestedOutbox], isAccountAllowed: key => !denied.includes(key),
+    accounts, folders: [root, folder, target, trash, outbox, nestedOutbox, savedSearch], isAccountAllowed: key => !denied.includes(key),
     copyMessages(...args) {
       if (copyError) throw new Error("Copy refused");
       copies.push(args);
@@ -46,7 +49,7 @@ function makeHarness({ crossAccount = false, denied = [], copyError = false } = 
   async function update(args) {
     return runtime.callTool("updateMessage", { messageId: "one", folderPath: folder.URI, ...args });
   }
-  return { runtime, update, mutations, copies, folderMoves, root, folder, target, trash, outbox, nestedOutbox, headers };
+  return { runtime, update, mutations, copies, folderMoves, root, folder, target, trash, outbox, nestedOutbox, savedSearch, headers };
 }
 
 describe("production updateMessage tag keys", () => {
@@ -223,6 +226,38 @@ describe("the Outbox is never a destination", () => {
     const h = makeHarness();
     assert.equal(h.runtime.moveFolder(h.target.URI, h.folder.URI).success, true);
     assert.equal(h.folderMoves.length, 1);
+  });
+});
+
+describe("saved searches cannot receive messages or folders", () => {
+  for (const action of ["moveTo", "copyTo"]) {
+    it(`refuses a saved-search ${action} destination before read, flags, or tags change`, async () => {
+      const h = makeHarness();
+      const result = await h.update({
+        [action]: h.savedSearch.URI, read: true, flagged: true,
+        addTags: ["valid"], removeTags: ["old"],
+      });
+      assert.match(result.error, VIRTUAL_ERROR);
+      assert.equal(result.success, undefined);
+      assert.deepEqual(h.mutations, []);
+      assert.deepEqual(h.copies, []);
+    });
+  }
+
+  it("refuses a saved-search parent before creating a folder", () => {
+    const h = makeHarness();
+    let created = 0;
+    h.savedSearch.createSubfolder = () => { created++; };
+    const result = h.runtime.createFolder(h.savedSearch.URI, "Real mail");
+    assert.match(result.error, VIRTUAL_ERROR);
+    assert.equal(created, 0);
+  });
+
+  it("refuses a saved-search parent before moving a real folder", () => {
+    const h = makeHarness();
+    const result = h.runtime.moveFolder(h.target.URI, h.savedSearch.URI);
+    assert.match(result.error, VIRTUAL_ERROR);
+    assert.deepEqual(h.folderMoves, []);
   });
 });
 

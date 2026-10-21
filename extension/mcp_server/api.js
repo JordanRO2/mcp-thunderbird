@@ -1627,6 +1627,16 @@ const OUTBOX_MOVE_PARENT_ERROR = "Cannot move a folder into the Outbox (Unsent M
 // names (compared case-insensitively).
 const OUTBOX_FOLDER_NAMES = ["unsent messages", "outbox"];
 const OUTBOX_FOLDER_NAME_ERROR = 'A top-level folder named "Unsent Messages" or "Outbox" would become the Outbox; choose another name or location';
+const VIRTUAL_FOLDER_FLAG = 0x00000020;
+const VIRTUAL_DESTINATION_ERROR = "Saved-search (virtual) folders cannot be used as move or copy destinations";
+const VIRTUAL_PARENT_ERROR = "Saved-search (virtual) folders cannot contain subfolders";
+const VIRTUAL_DESTINATION_REASON = "virtual-destination";
+
+function isVirtualFolder(folder) {
+  // Let unreadable native flags throw: callers must refuse, not assume a real
+  // folder. Keep this separate from access checks; views may still be listed.
+  return Boolean(folder.flags & VIRTUAL_FOLDER_FLAG);
+}
 
 function isOutboxFolder(folder) {
   if (!folder) return false;
@@ -2197,6 +2207,7 @@ function buildActions(filter, actions, { checkTargetFolder } = {}) {
           throw new Error(`Filter target folder not accessible: ${parsed}`);
         }
         if (isOutboxFolder(targetCheck.folder)) throw new Error(OUTBOX_DESTINATION_ERROR);
+        if (isVirtualFolder(targetCheck.folder)) throw new Error(VIRTUAL_DESTINATION_ERROR);
         // Folder lookup accepts spellings the native action setter rejects.
         parsed = canonicalURI;
       }
@@ -2308,6 +2319,7 @@ function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed
   let sending = false;
   let inaccessibleDestination = false;
   let outboxDestination = false;
+  let virtualDestination = false;
   for (let i = 0; i < filter.actionCount; i++) {
     const action = filter.getActionAt(i);
     const type = action.type;
@@ -2320,6 +2332,7 @@ function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed
         const targetCheck = checkTargetFolder(action[spec.member]);
         if (!targetCheck?.folder || targetCheck.error) inaccessibleDestination = true;
         else if (isOutboxFolder(targetCheck.folder)) outboxDestination = true;
+        else if (isVirtualFolder(targetCheck.folder)) virtualDestination = true;
       } catch {
         inaccessibleDestination = true;
       }
@@ -2327,6 +2340,7 @@ function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed
   }
   if (inaccessibleDestination) return "inaccessible-destination";
   if (outboxDestination) return "outbox-destination";
+  if (virtualDestination) return VIRTUAL_DESTINATION_REASON;
   return sending && !allowSending ? "sending" : null;
 }
 
@@ -2372,6 +2386,7 @@ function validateFilterForWrite(filter, { onlyDisable = false, checkTargetFolder
     throw new Error("Filter target folder not accessible: a Move/Copy destination is missing or restricted");
   }
   if (restriction === "outbox-destination") throw new Error(OUTBOX_DESTINATION_ERROR);
+  if (restriction === VIRTUAL_DESTINATION_REASON) throw new Error(VIRTUAL_DESTINATION_ERROR);
   if (restriction === "sending" && !onlyDisable) {
     throw new Error(`Forward/Reply filter actions are disabled. Enable ${FILTER_SEND_OPTION} to allow them.`);
   }
@@ -3208,6 +3223,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             name: { type: "string", description: "Name for the new subfolder" },
           },
           required: ["parentFolderPath", "name"],
+        },
+      },
+      {
+        name: "createVirtualFolder",
+        group: "folders", crud: "create",
+        title: "Create Saved Search",
+        description: "Create a virtual folder (saved search) that shows messages matching search conditions across one or more folders. Nothing is moved or copied -- the saved search is a live view, so it always reflects the current mail. Use this instead of moving mail when the goal is retrieval rather than filing.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Name for the saved search. Cannot contain '~' followed by a digit (a possible Windows short-name alias), on any platform." },
+            parentFolderPath: { type: "string", description: "URI of the folder to create it under (from listFolders) -- typically an account root" },
+            searchFolderPaths: { type: "array", minItems: 1, items: { type: "string" }, description: "Individual real folder URIs to search across (from listFolders), not account roots or saved searches. Duplicate folders are searched once." },
+            conditions: {
+              type: "array",
+              minItems: 1,
+              description: "Search conditions. Same attrib/op/value vocabulary as createFilter.",
+              items: {
+                type: "object",
+                properties: {
+                  attrib: { type: "string", description: FILTER_ATTRIB_DESCRIPTION },
+                  op: { type: "string", description: FILTER_OP_DESCRIPTION },
+                  value: { type: "string", description: FILTER_VALUE_DESCRIPTION },
+                  booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true). Use one value for all conditions when editing through Thunderbird's single all/any choice." },
+                  header: { type: "string", description: FILTER_HEADER_DESCRIPTION },
+                },
+                required: ["attrib", "op"],
+                additionalProperties: false,
+              },
+            },
+            searchOnline: { type: "boolean", description: "Search on the server rather than locally (IMAP only, slower). Default false." },
+          },
+          required: ["name", "parentFolderPath", "searchFolderPaths", "conditions"],
+        },
+      },
+      {
+        name: "listVirtualFolders",
+        group: "folders", crud: "read",
+        title: "List Saved Searches",
+        description: "List virtual folders (saved searches) with account keys, searched folders and conditions. Views with hidden, inaccessible, wildcard or unreadable scope are omitted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to one account" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "deleteVirtualFolder",
+        group: "folders", crud: "delete",
+        title: "Delete Saved Search",
+        description: "Delete a virtual folder (saved search). Only the view is removed -- no messages are deleted. Refuses real folders, views with subfolders, stored message headers or nonempty backing storage, and unreadable or unexpected storage; use deleteFolder for real folders.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the saved search to delete (from listVirtualFolders)" },
+          },
+          required: ["folderPath"],
         },
       },
       {
@@ -4175,7 +4249,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               function walkFolder(folder, accountKey, depth) {
                 try {
                   // Skip virtual/search folders to avoid duplicates
-                  if (folder.flags & 0x00000020) return;
+                  if (isVirtualFolder(folder)) return;
 
                   const prettyName = folder.prettyName;
                   results.push({
@@ -12285,6 +12359,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (targetResult.error) return targetResult;
                   targetFolder = targetResult.folder;
                   if (isOutboxFolder(targetFolder)) return { error: OUTBOX_DESTINATION_ERROR };
+                  if (isVirtualFolder(targetFolder)) return { error: VIRTUAL_DESTINATION_ERROR };
                 }
 
                 const foundHdrs = [];
@@ -12375,6 +12450,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (parentResult.error) return parentResult;
                 const parent = parentResult.folder;
                 if (isOutboxFolder(parent)) return { error: OUTBOX_CREATE_PARENT_ERROR };
+                if (isVirtualFolder(parent)) return { error: VIRTUAL_PARENT_ERROR };
                 if (wouldBecomeOutbox(parent, name)) return { error: OUTBOX_FOLDER_NAME_ERROR };
 
                 parent.createSubfolder(name, null);
@@ -12407,6 +12483,468 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: msg };
               }
             }
+
+            // BEGIN VIRTUAL FOLDER (SAVED SEARCH) HELPERS
+            const SAVED_SEARCH_ACCESS_ERROR = "Saved searches cannot use hidden or inaccessible folders";
+            const SAVED_SEARCH_ROOT_NAMES = new Set([
+              ...OUTBOX_FOLDER_NAMES, "inbox", "trash", "drafts", "sent", "templates", "archives",
+            ]);
+            const SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX = ".sbd";
+            const SAVED_SEARCH_SUMMARY_SUFFIX = ".msf";
+            const SAVED_SEARCH_DATABASE_SERVICE = "@mozilla.org/msgDatabase/msgDBService;1";
+            const SAVED_SEARCH_CREATE_STORAGE_ERROR = "Existing or unexpected folder storage; saved search not configured";
+            const SAVED_SEARCH_STORAGE_ERROR = "Cannot delete a saved search with nonempty, unreadable or unexpected storage";
+            const SAVED_SEARCH_MBOX_STORE = "mbox";
+            const SAVED_SEARCH_MAILDIR_STORE = "maildir";
+            // nsMsgMaildirStore uses cur and tmp; Thunderbird does not use new.
+            const SAVED_SEARCH_MAILDIR_DIRECTORIES = new Set(["cur", "tmp"]);
+
+            // Applies to the view, its parent and every scope folder. Do not
+            // broaden the global account-access helper's policy for other tools.
+            function isVisibleFolder(folder) {
+              return !!folder && Number.isInteger(folder.flags) &&
+                typeof folder.URI === "string" && folder.URI.length > 0 &&
+                folder.server?.hidden === false && isFolderAccessible(folder);
+            }
+
+            function getVirtualFolderCandidateURIs(parent, name) {
+              const netUtil = Cc["@mozilla.org/network/io-service;1"].getService(Ci.nsINetUtil);
+              // nsINetUtil accepts ACString bytes, not a Unicode JS string.
+              const bytes = Array.from(new TextEncoder().encode(name), byte => String.fromCharCode(byte)).join("");
+              const path = netUtil.escapeString(bytes, Ci.nsINetUtil.ESCAPE_URL_PATH);
+              // 128/140 and IMAP use the path form; 153/158's folder lookup also
+              // escapes path separators. Check both, including cached aliases.
+              const component = netUtil.escapeURL(path,
+                Ci.nsINetUtil.ESCAPE_URL_FILE_BASENAME | Ci.nsINetUtil.ESCAPE_URL_FILE_EXTENSION);
+              return [...new Set([path, component].map(part => `${parent.URI}/${part}`))];
+            }
+
+            function snapshotVirtualFolderStorage(parent) {
+              // nsMsgDBFolder::CreateDirectoryForFolder (TB 128/140/153/158):
+              // roots store children in filePath, other folders beside it in
+              // filePath + .sbd. Do not create that directory here.
+              const directory = parent.filePath.clone();
+              if (!parent.isServer) directory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+              const names = new Set();
+              const files = [];
+              if (directory.exists()) {
+                if (!directory.isDirectory()) throw new Error("Cannot inspect parent folder storage");
+                const entries = directory.directoryEntries;
+                try {
+                  for (const entry of entries) {
+                    if (typeof entry.leafName !== "string" || !entry.leafName) {
+                      throw new Error("Cannot inspect existing folder storage");
+                    }
+                    // Cover canonically equivalent filenames on macOS too.
+                    names.add(entry.leafName.normalize().toLowerCase());
+                    // Keep native identities as well: Windows short names can
+                    // address existing storage despite different leaf names.
+                    files.push(entry.clone());
+                  }
+                } finally {
+                  entries.close();
+                }
+              }
+              return { directory, names, files };
+            }
+
+            function assertReadableSavedSearchStorage(file) {
+              if (file.isReadable() !== true || file.isSymlink() !== false) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              // As in attachment validation, Windows isSymlink misses junctions.
+              // Resolve each existing component before comparing its target.
+              if (Services.appinfo?.OS === "WINNT") {
+                for (let component = file.clone(); component; component = component.parent) {
+                  if (component.isReadable() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  const target = component.target;
+                  if (!target || target.replace(/\\/g, "/").toLowerCase() !==
+                      component.path.replace(/\\/g, "/").toLowerCase()) {
+                    throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  }
+                }
+              }
+            }
+
+            function visitSavedSearchStorageDirectory(directory, visit) {
+              assertReadableSavedSearchStorage(directory);
+              if (directory.isDirectory() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const entries = directory.directoryEntries;
+              try {
+                for (const entry of entries) visit(entry);
+              } finally {
+                entries.close();
+              }
+            }
+
+            function assertEmptySavedSearchStorage(folder) {
+              const storeType = folder.msgStore.storeType;
+              if (storeType !== SAVED_SEARCH_MBOX_STORE && storeType !== SAVED_SEARCH_MAILDIR_STORE) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              const file = folder.filePath;
+              if (!file || typeof file.leafName !== "string" || !file.leafName) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              const childDirectory = file.clone();
+              childDirectory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+              const paths = [file, childDirectory];
+              const found = [null, null];
+              // exists() can report false on access errors. Establish absence
+              // through a successful parent-directory scan, not a false exists.
+              visitSavedSearchStorageDirectory(file.parent, entry => {
+                for (let i = 0; i < paths.length; i++) {
+                  if (paths[i].equals(entry) || paths[i].leafName.normalize().toLowerCase() ===
+                      entry.leafName.normalize().toLowerCase()) {
+                    if (found[i]) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                    found[i] = entry;
+                  }
+                }
+              });
+              const refuseEntry = () => { throw new Error(SAVED_SEARCH_STORAGE_ERROR); };
+              const [backing, children] = found;
+              if (backing) {
+                assertReadableSavedSearchStorage(backing);
+                if (storeType === SAVED_SEARCH_MBOX_STORE) {
+                  if (backing.isFile() !== true || backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                } else {
+                  visitSavedSearchStorageDirectory(backing, entry => {
+                    if (!SAVED_SEARCH_MAILDIR_DIRECTORIES.has(entry.leafName)) {
+                      throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                    }
+                    visitSavedSearchStorageDirectory(entry, refuseEntry);
+                  });
+                }
+              }
+              if (children) visitSavedSearchStorageDirectory(children, refuseEntry);
+            }
+
+            function getVirtualFolderHelper() {
+              return ChromeUtils.importESModule(
+                "resource:///modules/VirtualFolderWrapper.sys.mjs"
+              ).VirtualFolderHelper;
+            }
+
+            // Build nsIMsgSearchTerm objects outside of a filter. A saved search has
+            // no nsIMsgFilter to mint terms from, so a throwaway search session
+            // stands in: it exposes the same createTerm/appendTerm pair, which lets
+            // buildTerms apply its allow-lists, header handling and typed search
+            // values unchanged.
+            function buildSearchTerms(conditions) {
+              const session = Cc["@mozilla.org/messenger/searchSession;1"]
+                .createInstance(Ci.nsIMsgSearchSession);
+              buildTerms(session, conditions);
+              return session.searchTerms;
+            }
+
+            function createVirtualFolder(name, parentFolderPath, searchFolderPaths, conditions, searchOnline) {
+              let collisionError;
+              let previousDatabases;
+              try {
+                if (typeof name !== "string" || !name) {
+                  return { error: "name must be a non-empty string" };
+                }
+                collisionError = `A folder named "${name}" already exists under this parent`;
+                if (typeof parentFolderPath !== "string" || !parentFolderPath) {
+                  return { error: "parentFolderPath must be a non-empty string" };
+                }
+                if (!Array.isArray(searchFolderPaths) || searchFolderPaths.length === 0) {
+                  return { error: "searchFolderPaths must be a non-empty array of folder URIs" };
+                }
+                if (!Array.isArray(conditions) || conditions.length === 0) {
+                  return { error: "conditions must be a non-empty array" };
+                }
+                validateFilterText(name, "Saved-search name");
+                // Thunderbird's New Saved Search dialog (virtualFolderProperties.js).
+                if (/^\.|[.~ ]$|[;#]/.test(name)) {
+                  return { error: "Invalid saved-search name: cannot start with '.', end with '.', '~' or a space, or contain ';' or '#'" };
+                }
+                // Refuse possible Windows 8.3 aliases on every platform, even
+                // when no open database or matching folder URI exposes them.
+                if (/~[0-9]/.test(name)) {
+                  return { error: "Saved-search names cannot contain '~' followed by a digit (Windows short-name alias)" };
+                }
+                if (searchOnline !== undefined && typeof searchOnline !== "boolean") {
+                  return { error: "searchOnline must be a boolean" };
+                }
+
+                const parentResult = getAccessibleFolder(parentFolderPath);
+                if (parentResult.error) return parentResult;
+                const parent = parentResult.folder;
+                if (!isVisibleFolder(parent)) return { error: SAVED_SEARCH_ACCESS_ERROR };
+                if (isOutboxFolder(parent)) return { error: OUTBOX_CREATE_PARENT_ERROR };
+                if (isVirtualFolder(parent)) return { error: VIRTUAL_PARENT_ERROR };
+                if (parent.canCreateSubfolders !== true || typeof parent.isServer !== "boolean") {
+                  return { error: "Parent folder cannot create subfolders" };
+                }
+                if (wouldBecomeOutbox(parent, name)) return { error: OUTBOX_FOLDER_NAME_ERROR };
+                if (parent.isServer && SAVED_SEARCH_ROOT_NAMES.has(name.trim().toLowerCase())) {
+                  return { error: "A saved search cannot use a reserved special-folder name at an account root" };
+                }
+
+                // Every searched folder goes through the same access check as the
+                // parent -- otherwise a saved search would be a way to read mail
+                // from an account the user excluded in settings.
+                const searchFolders = [];
+                const searchURIs = new Set();
+                for (const p of searchFolderPaths) {
+                  if (typeof p !== "string" || !p) return { error: "searchFolderPaths must contain non-empty folder URIs" };
+                  const r = getAccessibleFolder(p);
+                  if (r.error) return { error: `searchFolderPaths: ${p}: ${r.error}` };
+                  if (!isVisibleFolder(r.folder)) return { error: SAVED_SEARCH_ACCESS_ERROR };
+                  if (r.folder.isServer !== false || isVirtualFolder(r.folder)) {
+                    return { error: "Search scope must contain real folders, not account roots or saved searches" };
+                  }
+                  validateFilterText(r.folder.URI, "Search folder URI");
+                  if (r.folder.URI.includes("|")) return { error: "Invalid search folder URI" };
+                  if (!searchURIs.has(r.folder.URI)) {
+                    searchURIs.add(r.folder.URI);
+                    searchFolders.push(r.folder);
+                  }
+                }
+
+                const terms = buildSearchTerms(conditions);
+                if (getFilterConditionRestriction({ searchTerms: terms }, {
+                  addressBooksRestricted: isAddressBookAccessRestricted(),
+                })) throw new Error(ADDRESS_BOOK_CONDITION_ERROR);
+
+                // Initialize and snapshot native children even if containsChildNamed
+                // returns false: its implementation can swallow enumeration errors.
+                const previous = new Set([...parent.subFolders]);
+                const previousURIs = new Set();
+                for (const child of previous) {
+                  if (typeof child.URI !== "string" || !child.URI) throw new Error("Cannot inspect existing child folders");
+                  previousURIs.add(child.URI.toLowerCase());
+                }
+                const containsName = parent.containsChildNamed(name);
+                if (containsName !== false) throw new Error(collisionError);
+                const candidates = getVirtualFolderCandidateURIs(parent, name);
+                for (const uri of candidates) {
+                  if (previousURIs.has(uri.toLowerCase()) || parent.getChildWithURI(uri, false, true) ||
+                      MailServices.folderLookup.getFolderForURL(uri)) throw new Error(collisionError);
+                }
+                const storage = snapshotVirtualFolderStorage(parent);
+                const dbService = Cc[SAVED_SEARCH_DATABASE_SERVICE].getService(Ci.nsIMsgDBService);
+                previousDatabases = new Set([...dbService.openDBs]);
+                const helper = getVirtualFolderHelper();
+                if (typeof helper.wrapVirtualFolder !== "function") throw new Error("Saved-search wrapper unavailable");
+
+                const folder = parent.addSubfolder(name);
+                // Never call createNewVirtualFolder here: on 153/158 it can set
+                // Virtual on an existing folder before the caller can inspect it.
+                // Check the returned native object BEFORE any flag/name/DB writes.
+                if (!folder || previous.has(folder) || previousURIs.has(folder.URI?.toLowerCase())) {
+                  throw new Error(collisionError);
+                }
+                // Native lookup hides cached orphan folders, but addSubfolder
+                // can reuse them. Its Mail flag write can also create a new .msf,
+                // so compare storage against the snapshot from BEFORE allocation.
+                const file = folder.filePath;
+                const summary = folder.summaryFile;
+                if (!file || !summary || typeof file.leafName !== "string" || !file.leafName ||
+                    !file.parent?.equals(storage.directory) || !summary.parent?.equals(storage.directory) ||
+                    summary.leafName !== file.leafName + SAVED_SEARCH_SUMMARY_SUFFIX ||
+                    [file.leafName, summary.leafName, file.leafName + SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX]
+                      .some(leaf => storage.names.has(leaf.normalize().toLowerCase()))) {
+                  throw new Error(SAVED_SEARCH_CREATE_STORAGE_ERROR);
+                }
+                const childDirectory = file.clone();
+                childDirectory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+                const storagePaths = [file, summary, childDirectory];
+                if (storagePaths.some(candidate => storage.files.some(existing => candidate.equals(existing)))) {
+                  throw new Error(SAVED_SEARCH_CREATE_STORAGE_ERROR);
+                }
+                // A cached orphan may have an in-memory DB even with no files.
+                // Both service APIs are read-only; never close a borrowed DB.
+                if (previousDatabases.has(dbService.cachedDBForFolder(folder))) {
+                  throw new Error("Existing folder database; saved search not configured");
+                }
+                const children = [...parent.subFolders];
+                const specialFlags = Ci.nsMsgFolderFlags.SpecialUse;
+                const allMailFlag = Ci.nsMsgFolderFlags.AllMail;
+                if (!isVisibleFolder(folder) || folder.isServer !== false || isVirtualFolder(folder) ||
+                    !Number.isInteger(specialFlags) || (folder.flags & specialFlags) !== 0 ||
+                    (Number.isInteger(allMailFlag) && (folder.flags & allMailFlag) !== 0) ||
+                    folder.parent !== parent || folder.server !== parent.server ||
+                    !candidates.includes(folder.URI) || children.length !== previous.size + 1 ||
+                    !children.includes(folder) || children.some(child => child !== folder && !previous.has(child)) ||
+                    folder.hasSubFolders !== false || [...folder.subFolders].length !== 0) {
+                  throw new Error("Unexpected folder returned by Thunderbird; saved search not configured");
+                }
+
+                // Replicate VirtualFolderHelper.createNewVirtualFolder, with the
+                // allocation/identity guard above. Version-pinned native sources:
+                // https://hg.mozilla.org/releases/comm-esr128/file/THUNDERBIRD_128_0esr_RELEASE/mailnews/base/src/VirtualFolderWrapper.sys.mjs
+                // https://hg.mozilla.org/releases/comm-esr140/file/THUNDERBIRD_140_17_0esr_RELEASE/mailnews/base/src/VirtualFolderWrapper.sys.mjs
+                // https://hg.mozilla.org/releases/comm-esr153/file/THUNDERBIRD_153_5_1esr_RELEASE/mailnews/base/src/VirtualFolderWrapper.sys.mjs
+                // https://hg.mozilla.org/releases/comm-release/file/THUNDERBIRD_158_0_1_RELEASE/mailnews/base/src/VirtualFolderWrapper.sys.mjs
+                // 128/140 set prettyName; that property is absent in 153/158.
+                // No destructive rollback, including after partial native failure.
+                let wrapper;
+                try {
+                  if ("prettyName" in folder) folder.prettyName = name;
+                  folder.setFlag(VIRTUAL_FOLDER_FLAG);
+                  wrapper = helper.wrapVirtualFolder(folder);
+                  if (wrapper.virtualFolder !== folder) throw new Error("Unexpected saved-search wrapper");
+                  wrapper.searchTerms = terms;
+                  wrapper.searchFolders = searchFolders;
+                  wrapper.onlineSearch = searchOnline === true;
+                  const db = folder.msgDatabase;
+                  if (!db) throw new Error("Could not access saved-search database");
+                  db.summaryValid = true;
+                  db.close(true);
+                  parent.notifyFolderAdded(folder);
+                  MailServices.accounts.saveVirtualFolders();
+                } finally {
+                  // Notifications may reopen the DB. Release it on failure too;
+                  // never clean up a wrapper that unexpectedly names another folder.
+                  try {
+                    if (wrapper?.virtualFolder === folder) wrapper.cleanUpMessageDatabase();
+                  } finally {
+                    folder.msgDatabase = null;
+                  }
+                }
+
+                return {
+                  success: true,
+                  message: `Saved search "${name}" created`,
+                  path: folder.URI,
+                  searchFolders: searchFolders.map((f) => f.URI),
+                };
+              } catch (e) {
+                const msg = e.toString();
+                if (msg.includes("NS_MSG_FOLDER_EXISTS")) {
+                  return { error: collisionError };
+                }
+                return { error: msg };
+              } finally {
+                previousDatabases?.clear();
+              }
+            }
+
+            function listVirtualFolders(accountId) {
+              try {
+                if (accountId !== undefined) {
+                  if (typeof accountId !== "string" || !accountId) return { error: "accountId must be a non-empty account key from listAccounts" };
+                  if (!isAccountAllowed(accountId)) return { error: `Account not accessible: "${accountId}". Call listAccounts to see available accounts.` };
+                  const account = Array.from(MailServices.accounts.accounts).find(item => item.key === accountId);
+                  if (!account || account.incomingServer?.hidden !== false) {
+                    return { error: `Account not found: "${accountId}". Use an account key from listAccounts.` };
+                  }
+                }
+                const helper = getVirtualFolderHelper();
+                const out = [];
+                for (const folder of MailServices.accounts.allFolders) {
+                  let wrapper;
+                  let entry;
+                  try {
+                    if (!isVisibleFolder(folder) || !isVirtualFolder(folder)) continue;
+                    const key = MailServices.accounts.findAccountForServer(folder.server)?.key;
+                    if (typeof key !== "string" || !key || (accountId !== undefined && key !== accountId)) continue;
+                    const candidate = helper.wrapVirtualFolder(folder);
+                    if (candidate.virtualFolder !== folder) continue;
+                    wrapper = candidate;
+                    // searchFolders uses getOrCreateFolderForURL and drops bad
+                    // URIs. Inspect the complete raw scope with read-only lookup.
+                    const raw = wrapper.searchFolderURIs;
+                    if (typeof raw !== "string" || !raw.trim()) continue;
+                    const scope = raw.split("|").map(uri => uri.trim());
+                    const searchFolders = new Set();
+                    let accessible = true;
+                    for (const uri of scope) {
+                      if (!uri || uri === "*") { accessible = false; break; }
+                      const source = MailServices.folderLookup.getFolderForURL(uri);
+                      if (!isVisibleFolder(source) || source.isServer !== false || isVirtualFolder(source)) {
+                        accessible = false;
+                        break;
+                      }
+                      searchFolders.add(source.URI);
+                    }
+                    if (!accessible) continue;
+                    // Do not reveal even the view's name/conditions if its scope
+                    // is unsafe: these can themselves describe restricted mail.
+                    entry = {
+                      name: folder.prettyName || folder.name,
+                      path: folder.URI,
+                      accountId: key,
+                      searchFolders: [...searchFolders],
+                      onlineSearch: !!wrapper.onlineSearch,
+                      terms: Array.from(wrapper.searchTerms, serializeSearchTerm),
+                    };
+                  } catch {
+                    // Exceptions can contain restricted URIs. Omit this entire view.
+                    entry = null;
+                  } finally {
+                    if (wrapper) {
+                      try { wrapper.cleanUpMessageDatabase(); } catch { entry = null; }
+                      finally { folder.msgDatabase = null; }
+                    }
+                  }
+                  if (entry) out.push(entry);
+                }
+                return out;
+              } catch {
+                return { error: "Could not list saved searches" };
+              }
+            }
+
+            function deleteVirtualFolder(folderPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                const r = getAccessibleFolder(folderPath);
+                if (r.error) return r;
+                const folder = r.folder;
+                if (!isVisibleFolder(folder)) return { error: SAVED_SEARCH_ACCESS_ERROR };
+
+                // Guard: deleting a real folder here would destroy mail, whereas
+                // deleting a saved search only removes a view.
+                if (!isVirtualFolder(folder)) {
+                  return { error: "Not a saved search (virtual folder). Use deleteFolder for real folders." };
+                }
+                const parent = folder.parent;
+                if (!parent) return { error: "Saved search has no parent folder" };
+                if (!isVisibleFolder(parent) || parent.server !== folder.server || ![...parent.subFolders].includes(folder)) {
+                  return { error: "Could not verify saved-search parent" };
+                }
+                if (folder.hasSubFolders !== false || [...folder.subFolders].length !== 0) {
+                  return { error: "Cannot delete a saved search with subfolders or unreadable child state" };
+                }
+
+                // Counts describe search hits, not the folder's own storage. A
+                // genuine view may have positive counts but must have no headers.
+                let db;
+                try {
+                  // The folder getter may rebuild a missing/unreadable summary,
+                  // concealing stored mail behind a new empty DB. Open the existing
+                  // summary without recovery (leaveInvalidDB=true) instead.
+                  // nsIMsgDatabase.idl: nsIMsgDBService.openFolderDB, TB 128+.
+                  db = Cc[SAVED_SEARCH_DATABASE_SERVICE]
+                    .getService(Ci.nsIMsgDBService).openFolderDB(folder, true);
+                  if (!db || db.summaryValid !== true) throw new Error("Could not inspect a valid saved-search database");
+                  for (const _header of db.enumerateMessages()) {
+                    throw new Error("Cannot delete a saved search containing message headers of its own");
+                  }
+                } finally {
+                  try { if (db) db.close(true); }
+                  finally { folder.msgDatabase = null; }
+                }
+
+                const label = folder.prettyName || folder.name;
+                // nsMailDatabase::GetSummaryValid bypasses store validation for
+                // Virtual folders. An empty DB alone cannot prove storage empty:
+                // native deletion also removes the backing store and .sbd tree.
+                assertEmptySavedSearchStorage(folder);
+                // Two arguments on every supported version. Never retry a delete
+                // after an exception: native work may already be partly complete.
+                parent.propagateDelete(folder, true);
+                return { success: true, message: `Saved search "${label}" deleted` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+            // END VIRTUAL FOLDER (SAVED SEARCH) HELPERS
 
             function renameFolder(folderPath, newName) {
               try {
@@ -12616,6 +13154,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (destResult.error) return destResult;
                 const newParent = destResult.folder;
                 if (isOutboxFolder(newParent)) return { error: OUTBOX_MOVE_PARENT_ERROR };
+                if (isVirtualFolder(newParent)) return { error: VIRTUAL_PARENT_ERROR };
                 if ([folder.name, folder.prettyName].some(name => wouldBecomeOutbox(newParent, name))) {
                   return { error: OUTBOX_FOLDER_NAME_ERROR };
                 }
@@ -13448,6 +13987,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
+                case "createVirtualFolder":
+                  return createVirtualFolder(args.name, args.parentFolderPath, args.searchFolderPaths, args.conditions, args.searchOnline);
+                case "listVirtualFolders":
+                  return listVirtualFolders(args.accountId);
+                case "deleteVirtualFolder":
+                  return deleteVirtualFolder(args.folderPath);
                 case "renameFolder":
                   return renameFolder(args.folderPath, args.newName);
                 case "deleteFolder":

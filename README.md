@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/42_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/47_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-128%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 42 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 47 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. The same block refuses `saveDraft` with `sendAt` for scheduled delivery through Send Later; plain drafts remain available. Re-enabling the block does not cancel already scheduled drafts. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
@@ -57,6 +57,9 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
+| `createVirtualFolder` | Create a saved search over accessible real folders without moving or copying mail. Existing folder names or storage aliases, Windows short-name patterns, special root names, hidden servers, and unsuitable parents are refused. |
+| `listVirtualFolders` | List saved searches with account keys, scope, and conditions. Omit the entire view if any scope is inaccessible, hidden, wildcard, unresolved, or unreadable. |
+| `deleteVirtualFolder` | Remove only a saved-search view. Refuse real folders, views with subfolders, their own message headers or nonempty backing storage, and unreadable or unexpected storage. |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
 | `moveFolder` | Move a folder to a new parent within the same account |
@@ -68,6 +71,12 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 `getMessageHeaders` and `batchGetMessageHeaders` accept the `id` returned by `getMessage` or `searchMessages`, with optional surrounding angle brackets. Returned `id` values preserve Thunderbird's stored spelling and case, normally without brackets; batch map keys preserve the caller's input. `inReplyTo` is the last parsed reference without brackets, or an empty string when there is no parent. Thunderbird stores In-Reply-To in its references field when a References header is absent. To pass a non-empty parent ID to `saveDraft`, wrap it in angle brackets; References must be space-separated bracketed IDs within `saveDraft`'s limits. To draft a reply to the fetched message itself, use `<id>` as `inReplyTo` and append `<id>` to its returned references chain. The raw references string is preserved, so malformed or oversized chains may need correction before `saveDraft` accepts them.
 
 Header lookups first use the folder's Message-ID index. Misses share one cooperative fallback scan with a best-effort 20-second budget, including when an index entry is missing for a surviving duplicate. A completed scan can establish "not found in this folder"; an incomplete scan reports `notScanned`, and batch results also include `truncated: true` and a message. Verify `folderPath` before retrying: an ID may belong to another folder, and requesting fewer IDs does not generally reduce the work for an absent ID. Batch `total` counts requested IDs including duplicates, while `failed` counts distinct error keys. Account access is rechecked after yields; disabling encrypted-message access during the scan also withholds previously collected protected subjects. These tools do not parse message bodies, but may read up to 16 KiB of stored outer headers per protected subject. Native database/index operations and key snapshots are synchronous, so the budget cannot interrupt them.
+
+A saved search is a live view in Thunderbird's folder pane. Its message counts populate after it is first opened. MCP message tools read folder storage, not saved-search results; use `searchMessages` on the source folders for retrieval. Saved searches cannot be move/copy destinations or parents for `createFolder`/`moveFolder`.
+
+`deleteVirtualFolder` checks both the database and raw storage. An mbox must be absent or empty; a maildir may contain only empty `cur`/`tmp` directories; the folder's `.sbd` directory must be absent or empty. Unreadable paths, links, unexpected contents, and unsupported storage types are refused.
+
+`createVirtualFolder` uses the same condition vocabulary as `createFilter`. `booleanAnd: true` means AND with the previous term; `false` means OR (default true). Use the same value for all conditions when editing the view through Thunderbird's single all/any choice. Supply individual real folders, not account roots or other saved searches; duplicate folders are searched once. Names containing `~` followed by a digit are refused on every platform because they can address existing folders through Windows short-name aliases. Storage identities are also checked before configuring the view. Address-book conditions (`isInAB`/`isntInAB`) require **Allow all address books** while account restrictions are active. A failed native creation can leave an empty folder; the tool never deletes a folder to undo a failed creation.
 
 `searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
 
@@ -165,7 +174,7 @@ Move/Copy destinations must remain accessible under the current account restrict
 
 New or replaced Move/Copy actions store the resolved folder's canonical URI, including when the supplied URI uses another accepted spelling.
 
-`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible or Outbox Move/Copy destinations, rules with address book conditions while address books are restricted, and Forward/Reply rules while the setting is off. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
+`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible, Outbox, or saved-search Move/Copy destinations, rules with address book conditions while address books are restricted, and Forward/Reply rules while the setting is off. Creation and updates also refuse saved-search destinations, including retained actions; disabling, deleting, or repairing an existing rule remains possible. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
 
 ### Contacts
 
@@ -415,7 +424,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 42 MCP tools + auth + access control
+│       ├── api.js              # All 47 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
