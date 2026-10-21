@@ -66,6 +66,10 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       mimeConverter: { decodeMimeHeader: (value) => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
+      headerParser: {
+        parseDecodedHeader: (value) => value.split(/,\s*/),
+        makeMimeHeader: (addresses) => addresses.join(", "),
+      },
     },
     ChromeUtils: { importESModule: () => ({ MailUtils: { displayMessageInFolderTab() { stats.displayed++; } } }) },
     findMessage: (messageId) => {
@@ -101,6 +105,17 @@ function loadTools({ allowed = false, streamError = null } = {}) {
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+describe("getRecentMessages rows cap address lists", () => {
+  it("shows the first three recipients plus a count, and all of them with fullRecipients", () => {
+    const h = loadTools();
+    const header = h.add({ id: "list" });
+    header.recipients = "a@x, b@x, c@x, d@x";
+    header.mime2DecodedRecipients = header.recipients;
+    assert.equal(plain(h.api.getRecentMessages(h.folder.URI, 36500))[0].recipients, "a@x, b@x, c@x (+1 more)");
+    assert.equal(plain(h.api.getRecentMessages(h.folder.URI, 36500, undefined, undefined, false, false, true, true))[0].recipients, "a@x, b@x, c@x, d@x");
+  });
+});
 
 describe("getRecentMessages protects subjects of encrypted mail", () => {
   it("returns the transmitted subject without a preview for recorded encrypted messages", () => {

@@ -169,6 +169,11 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
       MailServices: {
         mailSession: session.mailSession,
         mimeConverter: { decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
+        // Splits on commas outside double quotes, like the address parser does.
+        headerParser: {
+          parseDecodedHeader: value => (value.match(/(?:"[^"]*"|[^,])+/g) || []).map(part => part.trim()).filter(Boolean),
+          makeMimeHeader: addresses => addresses.join(", "),
+        },
         folderLookup: { getFolderForURL: uri => folders.get(uri) },
         accounts: { accounts, findAccountForServer: server => accounts.find(account => account.incomingServer === server) },
       },
@@ -587,6 +592,31 @@ describe("searchMessages counts and folder freshness", () => {
     assert.equal(result.folderRefresh, undefined);
     assert.equal(folder.imapUpdateCalls, 0);
     assert.equal(folder.stats.refreshes, 0);
+  });
+});
+
+describe("searchMessages rows cap address lists", () => {
+  const LONG = ["a@x.example", "\"Doe, John\" <j@x.example>", "c@x.example", "d@x.example", "e@x.example"].join(", ");
+
+  it("shows the first three addresses and how many more, keeping quoted names whole", async () => {
+    const folder = makeFolder("Inbox", { messages: [{ mime2DecodedRecipients: LONG, ccList: "f@x.example, g@x.example" }] });
+    const [row] = await makeHarness({ roots: [folder] }).search();
+    assert.equal(row.recipients, 'a@x.example, "Doe, John" <j@x.example>, c@x.example (+2 more)');
+    assert.equal(row.ccList, "f@x.example, g@x.example", "short lists stay untouched");
+  });
+
+  it("returns the full lists with fullRecipients", async () => {
+    const folder = makeFolder("Inbox", { messages: [{ mime2DecodedRecipients: LONG, ccList: LONG }] });
+    const [row] = await makeHarness({ roots: [folder] }).search({ fullRecipients: true });
+    assert.equal(row.recipients, LONG);
+    assert.equal(row.ccList, LONG);
+  });
+
+  it("still matches a to: query against addresses beyond the cap", async () => {
+    const folder = makeFolder("Inbox", { messages: [{ mime2DecodedRecipients: LONG }] });
+    const rows = await makeHarness({ roots: [folder] }).search({ query: "to:e@x.example" });
+    assert.equal(rows.length, 1);
+    assert.match(rows[0].recipients, /\(\+2 more\)$/);
   });
 });
 
