@@ -14,7 +14,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
-const { SEND_LATER_NOW, SEND_LATER_READY, makeSendLaterClock } = require("./helpers/send-later.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, SEND_LATER_HEADER_PARSER, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 
@@ -55,6 +55,7 @@ function loadSaveDraft(options = {}) {
   const sandbox = {
     Ci,
     Services: { prefs: makeDirectSendPrefs(options.prefs) },
+    MailServices: { headerParser: options.headerParser || SEND_LATER_HEADER_PARSER },
     Date: clock.Date,
     isSkipReviewBlocked: () => options.blocked === true,
     isToolEnabled: name => !(options.disabledTools || []).includes(name),
@@ -263,6 +264,7 @@ describe("saveDraft scheduling permissions and identity policy", () => {
   const future = () => new Date(SEND_LATER_NOW + 3600000).toISOString();
   const identityPrefix = "mail.identity.default.";
   const autoEnable = "mail.e2ee.auto_enable";
+  const unavailableParser = { parseDecodedHeader() { throw new Error("Address parser unavailable"); } };
   const refusals = [
     ["Block skipReview", { blocked: true }, {}, /blocks skipReview/],
     ["disabled sendMail", { disabledTools: ["sendMail"] }, {}, /requires the sendMail tool/],
@@ -275,6 +277,7 @@ describe("saveDraft scheduling permissions and identity policy", () => {
     ["past date", {}, { sendAt: "2026-12-31T23:00:00Z" }, /in the past/],
     ["distant date", {}, { sendAt: "2028-02-01T00:00:00Z" }, /366 days/],
     ["missing recipients", {}, { to: "", cc: " \t", bcc: "" }, /at least one recipient/],
+    ["unreadable recipients", { headerParser: unavailableParser }, {}, /Address parser unavailable/],
     ["restricted identity", { identityError: "identity belongs to a restricted account" }, {}, /restricted account/],
     ["invalid threading", {}, { inReplyTo: "bad" }, /inReplyTo/],
     ["malformed date", {}, { sendAt: "tomorrow" }, /ISO 8601/],
@@ -283,6 +286,29 @@ describe("saveDraft scheduling permissions and identity policy", () => {
     it(`refuses ${label} before saving, signatures or attachments`, async () => {
       const h = loadSaveDraft(options);
       assert.match((await h.save({ sendAt: future(), ...args })).error, error);
+      assert.equal(h.sent.length, 0);
+      assert.deepEqual(h.calls, { attachments: 0, signatures: 0 });
+    });
+  }
+
+  for (const [recipient, value, parsed] of [
+    ["to", "undisclosed-recipients:;", []],
+    ["cc", ",", []],
+    ["bcc", "Nobody <>", [{ name: "Nobody", email: "" }]],
+  ]) {
+    it(`refuses a nonempty ${recipient} header with no parsed mailbox before preparing a draft`, async () => {
+      let parses = 0;
+      const h = loadSaveDraft({ headerParser: {
+        parseDecodedHeader(header, preserveGroups) {
+          parses++;
+          assert.equal(header, value);
+          assert.equal(preserveGroups, false);
+          return parsed;
+        },
+      } });
+      const result = await h.save({ to: "", [recipient]: value, sendAt: future() });
+      assert.match(result.error, /at least one recipient/);
+      assert.equal(parses, 1);
       assert.equal(h.sent.length, 0);
       assert.deepEqual(h.calls, { attachments: 0, signatures: 0 });
     });
@@ -338,7 +364,7 @@ describe("saveDraft scheduling permissions and identity policy", () => {
   for (const sendAt of [undefined, null]) {
     it(`keeps a plain draft unchanged with sendAt=${sendAt}`, async () => {
       const h = loadSaveDraft({ blocked: true, disabledTools: ["sendMail"], info: null,
-        prefs: { [`${identityPrefix}encryptionpolicy`]: undefined } });
+        prefs: { [`${identityPrefix}encryptionpolicy`]: undefined }, headerParser: unavailableParser });
       const result = await h.save({ to: "", sendAt });
       assert.equal(result.success, true, result.error);
       assert.equal(result.sendAt, undefined);

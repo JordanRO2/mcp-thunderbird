@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
-const { SEND_LATER_NOW, SEND_LATER_READY, makeSendLaterClock } = require("./helpers/send-later.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, SEND_LATER_HEADER_PARSER, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const DRAFTS_URI = "imap://user@example.test/Drafts";
@@ -52,7 +52,10 @@ function loadDraftTools(options = {}) {
     __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : SEND_LATER_READY,
     Components: { isSuccessCode: status => status === 0 },
     ChromeUtils: { generateQI: () => () => {} },
-    MailServices: { accounts: { accounts: [{ key: "account-1", identities: [identity] }] } },
+    MailServices: {
+      accounts: { accounts: [{ key: "account-1", identities: [identity] }] },
+      headerParser: options.headerParser || SEND_LATER_HEADER_PARSER,
+    },
     console,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
@@ -339,6 +342,7 @@ describe("replacing scheduled drafts", () => {
     ["wrong Drafts folder", { destination: { URI: OTHER_DRAFTS_URI } }, {}],
     ["invalid date", {}, { sendAt: "2027-02-30T12:00:00Z" }],
     ["missing recipients", {}, { to: "" }],
+    ["empty address group", { headerParser: { parseDecodedHeader: () => [] } }, { to: "undisclosed-recipients:;" }],
   ];
   for (const [label, options, args] of refusals) {
     it(`leaves the existing scheduled draft untouched on ${label}`, async () => {

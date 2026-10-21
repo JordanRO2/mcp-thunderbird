@@ -2425,7 +2425,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             includeSignature: { type: "boolean", description: "Append the identity signature. Defaults to true for a new draft and false when replacing a draft, whose body may already include it. Set false for a body with its own signature, or true to append one explicitly." },
             inReplyTo: { type: "string", minLength: 5, maxLength: 998, description: "One bracketed Message-ID, e.g. <id@example.com>, at most 998 characters, without whitespace or control characters. Invalid input is rejected, never repaired. Sets In-Reply-To and defaults References to this ID. Subject and quoted text remain the caller's responsibility." },
             references: { type: "string", minLength: 5, maxLength: 16384, description: "Up to 100 bracketed Message-IDs separated by single ASCII spaces, oldest first; at most 998 characters per ID and 16384 total. No whitespace within IDs or control characters. Invalid input is rejected. Defaults to inReplyTo when omitted; may also be supplied independently." },
-            sendAt: { type: "string", minLength: 10, maxLength: 64, description: "Schedule delivery through the Send Later add-on: ISO 8601 date-time (e.g. 2026-10-17T10:00, local time when no offset is given, or with Z / +02:00). The draft gets X-Send-Later-At and X-Send-Later-Uuid headers and Send Later sends it on time, without review. Requires sendMail enabled, at least one To/Cc/Bcc recipient, an identity allowed by the unreviewed-send encryption policy, Send Later installed with draft sending enabled, and the skipReview safety block disabled; Thunderbird must be running at that time. Must be in the future and within 366 days. Replacing a scheduled draft without sendAt unschedules it." },
+            sendAt: { type: "string", minLength: 10, maxLength: 64, description: "Schedule unreviewed delivery through Send Later: ISO 8601 date-time (local time without an offset; Z or +02:00 accepted). Requires sendMail enabled, Block skipReview off, a To/Cc/Bcc recipient, an identity permitted by the unreviewed-send encryption checks, and recent Send Later readiness with draft and unsent-message sending enabled. Thunderbird and Send Later must be running for delivery. Calendar-invalid dates are refused; at most 366 days ahead, with a one-minute past-time tolerance. The returned UTC time matches the saved header's second precision. Replacing a scheduled draft without sendAt unschedules it. Re-enabling Block skipReview does not cancel existing schedules." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -3600,6 +3600,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Check if the user has disabled the skipReview shortcut.
              * When true, send/reply/forward/createEvent/createTask tools must open
              * the review window/dialog even if the caller passed skipReview: true.
+             * Scheduled saveDraft delivery (sendAt) is also blocked.
              * Adding calendar attendees is blocked, and meetings with other
              * attendees are read-only: any write can send without review.
              *
@@ -10469,7 +10470,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (sendAt !== undefined && sendAt !== null) {
                   scheduled = resolveSendLaterSchedule(sendAt);
                   if (scheduled.error) return { error: scheduled.error };
-                  if (![to, cc, bcc].some(value => typeof value === "string" && value.trim())) {
+                  // splitAddressHeader/extractAddressEmail do not flatten empty
+                  // groups. Reuse Thunderbird's parser without changing headers.
+                  if (![to, cc, bcc].some(value => typeof value === "string" && value.trim() &&
+                      MailServices.headerParser.parseDecodedHeader(value, false)
+                        .some(address => typeof address.email === "string" && address.email.trim()))) {
                     return { error: "sendAt requires at least one recipient in To, Cc or Bcc. Omit sendAt to save a plain draft." };
                   }
                 }

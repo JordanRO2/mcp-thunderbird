@@ -7,7 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
-const { SEND_LATER_NOW, SEND_LATER_READY, makeSendLaterClock } = require("./helpers/send-later.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, SEND_LATER_HEADER_PARSER, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const tools = ["sendMail", "replyToMessage", "forwardMessage"];
@@ -124,7 +124,7 @@ function loadEncryptionTools(options = {}) {
         OpenComposeWindowWithParams() { calls.reviews++; },
       }) },
     },
-    MailServices: { accounts: {
+    MailServices: { headerParser: SEND_LATER_HEADER_PARSER, accounts: {
       accounts: [account], defaultAccount: account,
       findAccountForServer: () => account,
     } },
