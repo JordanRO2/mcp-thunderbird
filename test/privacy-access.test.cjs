@@ -115,7 +115,8 @@ describe("Access preferences use the same production parser in options and serve
     assert.ok((await runtime.options.setToolAccess([false])).error);
     assert.equal(runtime.writes.length, 0);
     assert.equal((await runtime.options.setAccountAccess(["account1"])).success, true);
-    assert.equal((await runtime.options.setToolAccess(["getMessage"])).success, true);
+    const { revision } = await runtime.options.getToolAccessConfig();
+    assert.equal((await runtime.options.setToolAccess(["getMessage"], undefined, revision)).success, true);
     assert.equal((await runtime.options.getAccountAccessConfig()).mode, "restricted");
     assert.equal((await runtime.options.getToolAccessConfig()).mode, "restricted");
     assert.equal(runtime.isAccountAllowed("account2"), false);
@@ -431,7 +432,7 @@ describe("production tool dependency access", () => {
       assert.equal(child.enabled, enabled);
       assert.equal(child.configuredEnabled, !disabled.includes("dryRunCompose"));
       assert.deepEqual(Array.from(child.dependencies), ["sendMail"]);
-      await runtime.options.setToolAccess(disabled, 7);
+      assert.equal((await runtime.options.setToolAccess(disabled, 7, config.revision)).success, true);
       assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools), disabled);
     });
   }

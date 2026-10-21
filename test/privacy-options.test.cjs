@@ -34,6 +34,7 @@ const corruptAccounts = {
 };
 const restrictedTools = {
   mode: "restricted",
+  revision: "fixture-revision",
   groups: { system: "System", messages: "Messages" },
   getMessagesLimit: 10,
   tools: [
@@ -156,9 +157,9 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
       if (state.accountResult.success && state.nextAccountConfig) state.accountConfig = state.nextAccountConfig;
       return structuredClone(state.accountResult);
     },
-    async setToolAccess(disabledTools, getMessagesLimit) {
+    async setToolAccess(disabledTools, getMessagesLimit, revision) {
       calls.tools.push({ disabledTools: Array.from(disabledTools), getMessagesLimit });
-      if (state.accessApi) return state.accessApi.setToolAccess(disabledTools, getMessagesLimit);
+      if (state.accessApi) return state.accessApi.setToolAccess(disabledTools, getMessagesLimit, revision);
       if (state.toolResult instanceof Error) throw state.toolResult;
       if (state.toolResult.success && state.nextToolConfig) state.toolConfig = state.nextToolConfig;
       return structuredClone(state.toolResult);
@@ -566,6 +567,180 @@ describe("Options dependencies with the production preference API", () => {
     }
     await ui.saveToolsBtn.fire("click");
     assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools), ["dryRunCompose"]);
+    assert.equal(ui.document.getElementById("tool-dryRunCompose").checked, false);
+  });
+});
+
+describe("Options Tool Access upgrades with the production preference API", () => {
+  for (const exposeLocks of [true, false]) {
+    it(`shows a policy note without disabling existing allowed tools, lock API=${exposeLocks}`, async () => {
+      const pref = "extensions.thunderbird-mcp.disabledTools";
+      const runtime = loadPrivacyRuntime({ legacy: true, exposeLocks,
+        defaults: new Map([[pref, '["getMessage"]']]), locked: new Set([pref]),
+      });
+      const ui = loadOptions({ accessApi: runtime.options });
+      await ui.loadToolAccess();
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy.*new tools stay disabled/i);
+      assert.equal(ui.saveToolsStatus.className, "save-status");
+      assert.equal(ui.document.getElementById("tool-getMessage").checked, false);
+      assert.equal(ui.document.getElementById("tool-getMessages").checked, true);
+      for (const name of Object.keys(runtime.policy.introducedIn)) {
+        assert.equal(ui.document.getElementById("tool-" + name).checked, false, name);
+      }
+      const newTool = ui.document.getElementById("tool-refreshFolder");
+      newTool.checked = true;
+      await newTool.fire("change");
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy/i);
+      await ui.saveToolsBtn.fire("click");
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy/i);
+      assert.equal(ui.saveToolsStatus.className, "save-status error");
+      const observed = JSON.parse(runtime.values.get(runtime.prefNames.PREF_TOOL_ACCESS_STATE));
+      assert.equal(observed.customized, true);
+      assert.equal(observed.consideredRelease, "0.9.3");
+      assert.equal(runtime.isToolEnabled("refreshFolder"), false);
+      runtime.locked.clear();
+      await ui.saveToolsBtn.fire("click");
+      assert.match(ui.saveToolsStatus.textContent, /Reload/);
+      await ui.loadToolAccess();
+      assert.equal(ui.saveToolsStatus.textContent, "");
+      assert.equal(ui.document.getElementById("tool-refreshFolder").checked, false);
+      const enabled = ui.document.getElementById("tool-refreshFolder");
+      enabled.checked = true;
+      await enabled.fire("change");
+      await ui.saveToolsBtn.fire("click");
+      assert.equal(ui.saveToolsStatus.className, "save-status");
+      assert.equal(runtime.isToolEnabled("refreshFolder"), true);
+    });
+  }
+
+  it("shows migrated tools unchecked and keeps an explicit enable across Options and runtime reloads", async () => {
+    const runtime = loadPrivacyRuntime({ legacy: true, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' } });
+    const ui = loadOptions({ accessApi: runtime.options });
+    await ui.loadToolAccess();
+    for (const name of [
+      "dryRunCompose", "refreshFolder", "refreshCalendar", "getMessageHeaders", "batchGetMessageHeaders",
+      "createVirtualFolder", "listVirtualFolders", "deleteVirtualFolder",
+    ]) {
+      assert.equal(ui.document.getElementById("tool-" + name).checked, false, name);
+    }
+    assert.equal(ui.document.getElementById("tool-getMessage").checked, false);
+    assert.equal(ui.document.getElementById("tool-sendMail").checked, true);
+    assert.equal(ui.saveToolsBtn.disabled, true);
+
+    const checkbox = ui.document.getElementById("tool-refreshFolder");
+    checkbox.checked = true;
+    await checkbox.fire("change");
+    await ui.saveToolsBtn.fire("click");
+    assert.equal(ui.saveToolsStatus.className, "save-status");
+    const restarted = loadPrivacyRuntime({ legacy: true, values: runtime.values });
+    const reopened = loadOptions({ accessApi: restarted.options });
+    await reopened.loadToolAccess();
+    assert.equal(reopened.document.getElementById("tool-refreshFolder").checked, true);
+    assert.equal(reopened.document.getElementById("tool-refreshCalendar").checked, false);
+    assert.equal(reopened.document.getElementById("tool-getMessage").checked, false);
+  });
+
+  it("preserves restrictions for tools absent from the page's catalog", async () => {
+    const runtime = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: '["futureTool","getMessage"]' } });
+    const ui = loadOptions({ accessApi: runtime.options });
+    await ui.loadToolAccess();
+    assert.equal(ui.document.getElementById("tool-futureTool"), null);
+    const limit = ui.document.getElementById("getMessagesLimit");
+    limit.value = "7";
+    await limit.fire("input");
+    await ui.saveToolsBtn.fire("click");
+    assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools).sort(), ["futureTool", "getMessage"]);
+
+    const checkbox = ui.document.getElementById("tool-getMessage");
+    checkbox.checked = true;
+    await checkbox.fire("change");
+    await ui.saveToolsBtn.fire("click");
+    assert.deepEqual(Array.from((await runtime.options.getToolAccessConfig()).disabledTools), ["futureTool"]);
+  });
+
+  for (const limitOnly of [false, true]) {
+    it(`rejects a stale Options save without overwriting newer choices, limitOnly=${limitOnly}`, async () => {
+      const runtime = loadPrivacyRuntime();
+      const first = loadOptions({ accessApi: runtime.options });
+      const stale = loadOptions({ accessApi: runtime.options });
+      await first.loadToolAccess();
+      await stale.loadToolAccess();
+
+      const changed = first.document.getElementById("tool-getMessage");
+      changed.checked = false;
+      await changed.fire("change");
+      await first.saveToolsBtn.fire("click");
+      const saved = await runtime.options.getToolAccessConfig();
+      assert.deepEqual(Array.from(saved.disabledTools), ["getMessage"]);
+
+      if (limitOnly) {
+        const limit = stale.document.getElementById("getMessagesLimit");
+        limit.value = "7";
+        await limit.fire("input");
+      } else {
+        const checkbox = stale.document.getElementById("tool-dryRunCompose");
+        checkbox.checked = false;
+        await checkbox.fire("change");
+      }
+      const writeCount = runtime.writes.length;
+      await stale.saveToolsBtn.fire("click");
+      assert.match(stale.saveToolsStatus.textContent, /reload/i);
+      assert.equal(stale.saveToolsStatus.className, "save-status error");
+      assert.equal(runtime.writes.length, writeCount);
+      const current = await runtime.options.getToolAccessConfig();
+      assert.equal(current.revision, saved.revision);
+      assert.deepEqual(Array.from(current.disabledTools), ["getMessage"]);
+      assert.equal(current.getMessagesLimit, 10);
+      await stale.loadToolAccess();
+      assert.equal(stale.document.getElementById("tool-getMessage").checked, false);
+      assert.equal(stale.saveToolsStatus.className, "save-status");
+    });
+  }
+
+  for (const corruptPref of ["PREF_TOOL_ACCESS_STATE", "PREF_DISABLED_TOOLS"]) {
+    it(`leaves corrupt ${corruptPref} untouched until the user changes a tool and saves`, async () => {
+      const runtime = loadPrivacyRuntime({ initial: { [corruptPref]: "not-json" } });
+      const ui = loadOptions({ accessApi: runtime.options });
+      await ui.loadToolAccess();
+      assert.match(ui.saveToolsStatus.textContent, /blocked/);
+      assert.equal(ui.document.getElementById("tool-listAccounts").checked, true);
+      assert.equal(ui.document.getElementById("tool-getMessage").checked, false);
+      const writeCount = runtime.writes.length;
+      const limit = ui.document.getElementById("getMessagesLimit");
+      limit.value = "7";
+      await limit.fire("input");
+      await ui.saveToolsBtn.fire("click");
+      assert.equal(runtime.writes.length, writeCount);
+      assert.equal(runtime.values.get(runtime.prefNames[corruptPref]), "not-json");
+
+      const checkbox = ui.document.getElementById("tool-getMessage");
+      checkbox.checked = true;
+      await checkbox.fire("change");
+      await ui.saveToolsBtn.fire("click");
+      assert.equal(ui.saveToolsStatus.className, "save-status");
+      assert.equal(ui.document.getElementById("tool-getMessage").checked, true);
+      assert.equal(ui.document.getElementById("tool-getMessages").checked, false);
+      assert.notEqual(runtime.values.get(runtime.prefNames[corruptPref]), "not-json");
+      assert.equal((await runtime.options.getToolAccessConfig()).mode, "restricted");
+    });
+  }
+
+  it("keeps a migrated child's own denial when the parent is re-enabled", async () => {
+    const runtime = loadPrivacyRuntime({ legacy: true, initial: { PREF_DISABLED_TOOLS: '["sendMail"]' } });
+    const ui = loadOptions({ accessApi: runtime.options });
+    await ui.loadToolAccess();
+    const parent = ui.document.getElementById("tool-sendMail");
+    const child = ui.document.getElementById("tool-dryRunCompose");
+    assert.equal(child.checked, false);
+    assert.equal(child.disabled, true);
+    parent.checked = true;
+    await parent.fire("change");
+    assert.equal(child.disabled, false);
+    assert.equal(child.checked, false);
+    await ui.saveToolsBtn.fire("click");
+    const config = await runtime.options.getToolAccessConfig();
+    assert.equal(config.disabledTools.includes("sendMail"), false);
+    assert.equal(config.disabledTools.includes("dryRunCompose"), true);
     assert.equal(ui.document.getElementById("tool-dryRunCompose").checked, false);
   });
 });

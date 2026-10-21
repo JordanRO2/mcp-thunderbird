@@ -36,6 +36,8 @@ let getMessagesLimitStatus = null;
 let currentAccountError = "";
 let accountAccessChanged = false;
 let currentToolError = "";
+let currentToolNote = "";
+let currentToolRevision = "";
 let currentGetMessagesLimit = "";
 let toolAccessChanged = false;
 let toolSettingsChanged = false;
@@ -381,13 +383,15 @@ async function loadToolAccess() {
   toolSettingsChanged = false;
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
+    currentToolRevision = data.revision;
     currentTools = data.tools || [];
     toolChoices = new Map(currentTools.map(tool => [tool.name, tool.configuredEnabled ?? tool.enabled]));
     const groupLabels = data.groups || {};
     currentToolError = data.mode === "error"
       ? (data.error || "Invalid tool access configuration.") + " Optional tools are blocked. Change tool access and save to replace this setting."
       : "";
-    saveToolsStatus.textContent = currentToolError;
+    currentToolNote = data.note || "";
+    saveToolsStatus.textContent = currentToolError || currentToolNote;
     saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
 
     if (currentTools.length === 0) {
@@ -541,7 +545,7 @@ function onToolChange() {
   const limitChanged = getMessagesLimitInput && getMessagesLimitInput.value !== currentGetMessagesLimit;
   toolSettingsChanged = toolAccessChanged || (!currentToolError && !!limitChanged);
   saveToolsBtn.disabled = !toolSettingsChanged;
-  saveToolsStatus.textContent = currentToolError;
+  saveToolsStatus.textContent = currentToolError || currentToolNote;
   saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
 }
 
@@ -564,7 +568,7 @@ saveToolsBtn.addEventListener("click", async () => {
   }
 
   try {
-    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit);
+    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit, currentToolRevision);
     if (result.error) {
       saveToolsStatus.textContent = result.error;
       saveToolsStatus.className = "save-status error";

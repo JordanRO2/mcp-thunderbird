@@ -48,12 +48,17 @@
             "name": "disabledTools",
             "type": "array",
             "items": { "type": "string" },
-            "description": "Array of tool names to disable. Empty array means all tools enabled."
+            "description": "Array of displayed tool names to disable. Restrictions for tools absent from this version are preserved."
           },
           {
             "name": "getMessagesLimit",
             "type": "number",
             "description": "Maximum number of messages getMessages may read in one call. Must be an integer from 1 to 20."
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "description": "Revision returned by getToolAccessConfig. Reload Options if the configuration has changed since it was read."
           }
         ]
       },

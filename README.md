@@ -261,6 +261,14 @@ Each event includes `organizer: { id, commonName }`, up to 100 `attendees`, `att
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
+Starting with 0.10.0, updates respect customized **Tool Access**: if you have disabled at least one tool, newly introduced tools start unchecked and cannot be called until you enable them in Options and save. Fresh installations and profiles that have never restricted tools keep all tools enabled. Once recorded, customization remains remembered even if you later enable every tool; only tools first encountered in a later update start disabled. A tool you explicitly enable stays enabled across restarts and updates.
+
+If policy prevents saving the new restrictions, Options shows a note that Tool Access is managed by policy. Newly encountered tools stay disabled while existing tools keep following the policy's list. Migration completes after the preference is unlocked and its effective value can be updated. An untouched profile with a locked empty list keeps all tools enabled.
+
+An observed restriction remains remembered if policy later empties the disabled list, including after a restart. If Tool Access history itself cannot be saved, newly encountered tools stay disabled until saving works; existing tools continue following their effective settings.
+
+Two compatibility limits apply. A 0.9.x profile that disabled tools and then re-enabled everything looks identical to an untouched profile, so its first upgrade keeps all tools enabled. Downgrading to 0.9.3 and saving Tool Access there can rewrite the disabled list and discard restrictions for newer tools; review those choices after upgrading again.
+
 `dryRunCompose` also requires `sendMail` to be enabled: disabling its parent hides it from `tools/list` and refuses calls. Options reflects this dependency immediately, including unsaved parent changes, while preserving the child's separate enabled/disabled choice.
 
 The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`. It also refuses `saveDraft` with `sendAt`; re-enabling the block does not cancel already scheduled drafts. It also blocks adding attendees and makes meetings with attendees other than the calendar user read-only through MCP: `updateEvent` and `deleteEvent` reject every write, including time/description/recurrence edits, attendee removal, and occurrence deletion, even when `attendees` is omitted. Occurrence writes check both the series and selected occurrence; series writes also check stored exceptions. Events without attendees and events whose only attendee is the identified calendar user remain editable. If the calendar identity cannot be established, existing attendees cannot be treated as self-only. Disabling the setting permits these writes, which may email updates or cancellations without review. Event/task creation review dialogs remain available without attendees.
@@ -401,7 +409,7 @@ External attachment links, including attachments removed with Thunderbird's **De
 | AnkiConnect and Thunderbird MCP conflict | AnkiConnect also defaults to `127.0.0.1:8765`. Start Anki/AnkiConnect before Thunderbird so MCP can choose another port, then use the recorded MCP port or the stdio bridge. |
 | Bridge reports that a port is not answered by Thunderbird MCP | Check the server's current port in Options and `connection.json`, and whether another application is using that port. Reconnect the client after correcting its configuration. |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
-| Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
+| Tool not found after update | If you restrict Tool Access, new tools start unchecked. Enable the tool in Thunderbird MCP Options, save, then reconnect MCP (`/mcp` in Claude Code). Also enable any required parent tool. |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
 | `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
 

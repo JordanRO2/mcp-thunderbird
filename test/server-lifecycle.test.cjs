@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { HTTPD_PORT, createHttpdHarness } = require("./helpers/httpd.cjs");
+const { loadPrivacyRuntime, getConstantDeclaration } = require("./helpers/privacy-access.cjs");
 const REFRESH_TIMER_TYPE = 1;
 const HTTP_ACTIVITY = { ACTIVITY_TYPE_HTTP_TRANSACTION: 2, ACTIVITY_SUBTYPE_RESPONSE_HEADER: 0x5004 };
 
@@ -24,6 +25,10 @@ function loadServerLifecycle(overrides = {}) {
     assert.ok(end > start, `${endMarker} missing`);
     return source.slice(start, end);
   }
+
+  // Reuse the access harness's preference services and production helpers, but
+  // leave initialization to the real getAPI-scope code below, before start().
+  const access = overrides.accessRuntime || loadPrivacyRuntime({ initialize: false });
 
   const state = {
     attempts: 0,
@@ -181,6 +186,11 @@ function loadServerLifecycle(overrides = {}) {
   const connectionPath = "/mock-tmp/thunderbird-mcp/connection.json";
   const sandbox = {
     TextEncoder,
+    ...access.prefNames,
+    toolAccess: access.policy,
+    readAccessListPref: access.readAccessListPref,
+    buildTools: access.buildTools,
+    getConfiguredGetMessagesLimit: access.getConfiguredGetMessagesLimit,
     MCP_DEFAULT_PORT: 8765,
     MCP_MAX_PORT_ATTEMPTS: 10,
     CONNECTION_FILE_REFRESH_MS: 30000,
@@ -203,9 +213,17 @@ function loadServerLifecycle(overrides = {}) {
     },
     Services: {
       appinfo: { OS: "WINNT", processID: 4242 },
+      uuid: access.Services.uuid,
       prefs: {
-        clearUserPref() { state.listenAll = false; },
-        setBoolPref(_name, value) { state.listenAll = value; },
+        ...access.Services.prefs,
+        clearUserPref(name) {
+          access.Services.prefs.clearUserPref(name);
+          if (name === sandbox.PREF_LISTEN_ALL) state.listenAll = false;
+        },
+        setBoolPref(name, value) {
+          access.Services.prefs.setBoolPref(name, value);
+          if (name === sandbox.PREF_LISTEN_ALL) state.listenAll = value;
+        },
       },
       io: { newURI() { throw { name: "NS_ERROR_FILE_NOT_FOUND" }; } },
       dirsvc: {
@@ -227,6 +245,7 @@ function loadServerLifecycle(overrides = {}) {
       },
     },
     Ci: {
+      nsIPrefBranch: access.Ci.nsIPrefBranch,
       nsIFile: { DIRECTORY_TYPE: 1 }, nsITimer: { TYPE_ONE_SHOT: 0, TYPE_REPEATING_SLACK: REFRESH_TIMER_TYPE },
       nsIRequest: { LOAD_ANONYMOUS: 1, LOAD_BYPASS_CACHE: 2, INHIBIT_CACHING: 4, LOAD_FRESH_CONNECTION: 8 },
       nsIChannel: { LOAD_INITIAL_DOCUMENT_URI: 16 }, nsIHttpChannel: "http",
@@ -305,6 +324,8 @@ function loadServerLifecycle(overrides = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    ...["DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "MAX_REQUEST_BODY",
+      "UNDISABLEABLE_TOOLS", "GROUP_ORDER", "GROUP_LABELS", "CRUD_ORDER"].map(getConstantDeclaration),
     // Saved-search initialization reuses the production folder-role constants.
     markedSnippet("OUTBOX DESTINATION GUARD"),
     markedSnippet("CONNECTION INFO REFRESH HELPERS"),
@@ -315,14 +336,18 @@ function loadServerLifecycle(overrides = {}) {
      this.shutdown = function () { ${markedSnippet("SERVER SHUTDOWN")} };`,
     `this.getAPI = function () {
       ${markedSnippet("SERVER INSTANCE STATE")}
+      ${getConstantDeclaration("tools")}
+      ${getConstantDeclaration("ALL_TOOL_NAMES")}
+      ${markedSnippet("TOOL ACCESS STATE")}
       return {
         ${markedSnippet("SERVER LIFECYCLE")}
+        ${markedSnippet("OPTIONS ACCESS API")}
         ${markedSnippet("LISTEN ALL SETTER")}
       };
     };
     this.api = this.getAPI();`,
   ].join("\n"), sandbox);
-  return { api: sandbox.api, sandbox, state, NetUtil };
+  return { api: sandbox.api, sandbox, state, NetUtil, access };
 }
 
 // Reuse the production lifecycle above for the options page's browser API.
@@ -356,6 +381,121 @@ function loadServerStatus(api) {
     "\nthis.loadServerInfo = loadServerInfo;", ui);
   return ui;
 }
+
+describe("Tool Access initialization and server startup", () => {
+  it("writes migrated restrictions before tracking and before the listener binds", async () => {
+    const events = [];
+    const access = loadPrivacyRuntime({
+      legacy: true, initialize: false, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' },
+      beforeWrite: name => events.push(name),
+    });
+    assert.deepEqual(access.writes, []);
+    const { api, state } = loadServerLifecycle({
+      accessRuntime: access,
+      bindError() {
+        events.push("bind");
+        const disabled = JSON.parse(access.values.get(access.prefNames.PREF_DISABLED_TOOLS));
+        const tracking = JSON.parse(access.values.get(access.prefNames.PREF_TOOL_ACCESS_STATE));
+        assert.ok(disabled.includes("getMessage"));
+        assert.ok(disabled.includes("refreshFolder"));
+        assert.ok(disabled.includes("dryRunCompose"));
+        assert.equal(tracking.customized, true);
+        assert.ok(tracking.consideredTools.includes("refreshFolder"));
+        return null;
+      },
+    });
+    assert.equal(state.servers.length, 0);
+    assert.deepEqual(events, [access.prefNames.PREF_TOOL_ACCESS_STATE, access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE]);
+    assert.equal((await api.start()).success, true);
+    assert.deepEqual(events, [access.prefNames.PREF_TOOL_ACCESS_STATE, access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE, "bind"]);
+  });
+
+  it("does not repeat migration writes across repeated starts, Options contexts or runtime reloads", async () => {
+    const access = loadPrivacyRuntime({
+      legacy: true, initialize: false, initial: { PREF_DISABLED_TOOLS: '["deleteFolder"]' },
+    });
+    const first = loadServerLifecycle({ accessRuntime: access });
+    const writesAfterInitialization = access.writes.length;
+    assert.equal(writesAfterInitialization, 3);
+    assert.equal((await first.api.start()).success, true);
+    assert.equal((await first.api.start()).success, true);
+    await first.sandbox.getAPI().getToolAccessConfig();
+    assert.equal(access.writes.length, writesAfterInitialization);
+    first.sandbox.shutdown();
+
+    const reloaded = loadPrivacyRuntime({ legacy: true, initialize: false, values: access.values });
+    const second = loadServerLifecycle({ accessRuntime: reloaded });
+    assert.equal((await second.api.start()).success, true);
+    const config = await second.api.getToolAccessConfig();
+    assert.ok(config.disabledTools.includes("deleteFolder"));
+    assert.ok(config.disabledTools.includes("refreshCalendar"));
+    assert.deepEqual(reloaded.writes, []);
+  });
+
+  it("exposes and saves migrated Options choices even when server startup fails", async () => {
+    const access = loadPrivacyRuntime({
+      legacy: true, initialize: false, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' },
+    });
+    const { api, state } = loadServerLifecycle({ accessRuntime: access, importError: new Error("httpd unavailable") });
+    const beforeStart = await api.getToolAccessConfig();
+    assert.equal(beforeStart.tools.find(tool => tool.name === "refreshFolder").enabled, false);
+    assert.equal((await api.start()).success, false);
+    assert.equal(state.servers.length, 0);
+    const afterFailure = await api.getToolAccessConfig();
+    assert.equal(afterFailure.revision, beforeStart.revision);
+    const result = await api.setToolAccess(
+      afterFailure.disabledTools.filter(name => name !== "refreshFolder"),
+      afterFailure.getMessagesLimit,
+      afterFailure.revision,
+    );
+    assert.equal(result.success, true);
+    assert.equal((await api.getToolAccessConfig()).tools.find(tool => tool.name === "refreshFolder").enabled, true);
+    state.importError = null;
+    assert.equal((await api.start()).success, true);
+    assert.equal((await api.getToolAccessConfig()).tools.find(tool => tool.name === "refreshFolder").enabled, true);
+  });
+
+  for (const failure of ["corrupt deny-list", "corrupt tracking", "deny-list write", "tracking write"]) {
+    it(`keeps optional tools blocked on a running listener after ${failure}`, async () => {
+      const initial = { PREF_DISABLED_TOOLS: '["getMessage"]' };
+      if (failure === "corrupt deny-list") initial.PREF_DISABLED_TOOLS = "not-json";
+      if (failure === "corrupt tracking") initial.PREF_TOOL_ACCESS_STATE = "not-json";
+      const access = loadPrivacyRuntime({ legacy: true, initialize: false, initial });
+      if (failure === "deny-list write") access.writeErrors.add(access.prefNames.PREF_DISABLED_TOOLS);
+      if (failure === "tracking write") access.writeErrors.add(access.prefNames.PREF_TOOL_ACCESS_STATE);
+      const { api, state } = loadServerLifecycle({ accessRuntime: access });
+      assert.equal((await api.start()).success, true);
+      assert.equal(state.servers[0].listening, true);
+      const config = await api.getToolAccessConfig();
+      const trackingFailure = failure === "tracking write";
+      assert.equal(config.mode, trackingFailure ? "restricted" : "error");
+      assert.ok(config.tools.every(tool => tool.enabled === (trackingFailure
+        ? tool.name !== "getMessage" && !Object.hasOwn(access.policy.introducedIn, tool.name)
+        : tool.undisableable)));
+
+      // Drive the production handler registered by start(), reusing the access
+      // harness's request/response pattern and this fixture's stream boundary.
+      const response = await new Promise(resolve => {
+        const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+        let result = "";
+        state.servers[0].handlers.get("/")({
+          method: "POST",
+          getHeader: name => name === "Authorization" ? `Bearer ${state.connection.token}` : String(Buffer.byteLength(body)),
+          bodyInputStream: { bytes: body, available: () => body.length, channel: { bytesRead: 0, readSizes: [] } },
+        }, {
+          processAsync() {}, setStatusLine() {}, setHeader() {},
+          write(value) { result += value; }, finish() { resolve(JSON.parse(result)); },
+        });
+      });
+      assert.deepEqual(response.result.tools.map(tool => tool.name).sort(), Array.from(config.tools).filter(tool => tool.enabled).map(tool => tool.name).sort());
+      if (failure.startsWith("corrupt")) {
+        assert.deepEqual(access.writes, []);
+        const pref = failure === "corrupt tracking" ? "PREF_TOOL_ACCESS_STATE" : "PREF_DISABLED_TOOLS";
+        assert.equal(access.values.get(access.prefNames[pref]), "not-json");
+      }
+    });
+  }
+});
 
 describe("listener ownership classification", () => {
   const { sandbox } = loadServerLifecycle();
