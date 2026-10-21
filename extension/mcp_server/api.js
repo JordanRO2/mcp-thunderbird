@@ -1530,8 +1530,9 @@ function refreshTimer(ms, callback) {
 // on a completion signal. A fulfilled start promise is not such a signal.
 // Returns { status, error?, warning?, joinedInFlight, ...providerOutcome };
 // it neither formats a tool result nor cancels Thunderbird's underlying work.
-async function waitForRefresh(inFlight, key, timeoutMs, start) {
+async function waitForRefresh(inFlight, key, timeoutMs, start, request = {}) {
   const started = Date.now();
+  const waiter = { request, deadline: started + timeoutMs };
   let entry = inFlight.get(key);
   if (entry && started - entry.startedAt >= REFRESH_MAX_TIMEOUT_MS) {
     entry.settle(entry.unconfirmed());
@@ -1545,6 +1546,7 @@ async function waitForRefresh(inFlight, key, timeoutMs, start) {
     const cleanups = [];
     entry = {
       startedAt: started,
+      waiters: new Set([waiter]),
       completion: new Promise(resolve => { resolveCompletion = resolve; }),
       unconfirmed: () => lastError
         ? { status: "error", error: lastError }
@@ -1567,6 +1569,11 @@ async function waitForRefresh(inFlight, key, timeoutMs, start) {
     inFlight.set(key, entry);
     const lifecycle = {
       settle: entry.settle,
+      // Follow-up provider work may use only a still-waiting caller's budget.
+      hasActiveWaiter(predicate) {
+        return !settled && [...entry.waiters].some(current =>
+          current.deadline > Date.now() && predicate(current.request));
+      },
       reportError(message) { if (!settled) lastError = message; },
       addCleanup(cleanup) {
         if (settled) {
@@ -1585,6 +1592,8 @@ async function waitForRefresh(inFlight, key, timeoutMs, start) {
     } catch (error) {
       fail(error);
     }
+  } else {
+    entry.waiters.add(waiter);
   }
   let waitTimer;
   try {
@@ -1596,6 +1605,7 @@ async function waitForRefresh(inFlight, key, timeoutMs, start) {
     return { ...await Promise.race([entry.completion, timedOut]), joinedInFlight };
   } finally {
     waitTimer?.cancel();
+    entry.waiters.delete(waiter);
   }
 }
 // END BOUNDED REFRESH HELPERS
@@ -3248,7 +3258,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshFolder",
         group: "messages", crud: "read",
         title: "Refresh Folder",
-        description: `Refresh one IMAP, built-in Exchange (EWS/Graph), or Owl folder. Returns before/after counts and netMessageDelta (net change, not arrivals). loaded means Thunderbird reported loading; updateConfirmed requires a successful update URL. Warnings explain unconfirmed updates or a busy folder where no update ran. Account roots, saved searches and no-select folders are refused; local, POP, RSS and news folders are skipped. Offline calls fail. ${REFRESH_COMPLETION_DESCRIPTION}`,
+        description: `Refresh one IMAP, built-in Exchange (EWS/Graph), or Owl folder. Returns before/after counts and netMessageDelta (net change, not arrivals). loaded means Thunderbird reported loading; updateConfirmed requires a successful update URL. An unconfirmed first load gets one shared trailing update within the remaining timeout; the final outcome may still be unconfirmed. Warnings explain unconfirmed updates or a busy folder where no update ran. Account roots, saved searches and no-select folders are refused; local, POP, RSS and news folders are skipped. Offline calls fail. ${REFRESH_COMPLETION_DESCRIPTION}`,
         inputSchema: {
           type: "object",
           properties: {
@@ -6951,7 +6961,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     !(folder.flags & (Ci.nsMsgFolderFlags.Virtual | Ci.nsMsgFolderFlags.ImapNoselect))) {
                   const remaining = scan.deadline - Date.now();
                   if (remaining > 0) {
-                    scan.folderRefresh = await waitForFolderRefresh(folder, Math.min(SEARCH_SYNC_TIMEOUT_MS, remaining));
+                    scan.folderRefresh = await waitForFolderRefresh(folder, Math.min(SEARCH_SYNC_TIMEOUT_MS, remaining),
+                      { requireFreshUpdate: true });
                     if (scan.folderRefresh.updateConfirmed === true) syncedFolder = folder;
                   }
                 }
@@ -13623,51 +13634,85 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function startFolderSync(folder, { settle, addCleanup }) {
-              let inImapUpdate = false;
-              const listener = {
-                QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
-                onFolderEvent(eventFolder, event) {
-                  if (event !== "FolderLoaded" || eventFolder?.URI !== folder.URI) return;
-                  const noUpdateRan = inImapUpdate;
-                  // IMAP fires FolderLoaded even on failure, before the URL
-                  // listener. Give that listener's exit code the first say.
-                  Services.tm.dispatchToMainThread(() => settle({
-                    status: "loaded",
-                    updateConfirmed: false,
-                    warning: noUpdateRan
-                      ? "No update ran: Thunderbird reported the folder loaded synchronously (the folder may be busy or the update was aborted)."
-                      : "Thunderbird reported the folder loaded; a successful server update could not be confirmed.",
-                  }));
-                },
-              };
-              addCleanup(() => MailServices.mailSession.RemoveFolderListener(listener));
-              // Busy IMAP updates do not keep our URL listener, but their
-              // eventual FolderLoaded still completes this wait.
-              MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
-              if (folder.server.type === "imap") {
-                inImapUpdate = true;
-                try {
-                  folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
-                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                    OnStartRunningUrl() {},
-                    OnStopRunningUrl(url, exitCode) {
-                      // The folder has one stashed listener: an unrelated URL
-                      // can consume it before the update completes.
-                      let updatingFolder = false;
-                      try { updatingFolder = url.QueryInterface(Ci.nsIMsgMailNewsUrl).updatingFolder; } catch {}
-                      if (!updatingFolder) return;
-                      settle(Components.isSuccessCode(exitCode)
-                        ? { status: "loaded", updateConfirmed: true }
-                        : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
-                    },
-                  });
-                } finally {
-                  inImapUpdate = false;
+            function startFolderSync(folder, { settle, addCleanup, hasActiveWaiter }) {
+              let finished = false;
+              let retried = false;
+              let cleanupAttempt = () => {};
+              addCleanup(() => { finished = true; cleanupAttempt(); });
+
+              function startAttempt() {
+                let active = true;
+                let inImapUpdate = false;
+                function complete(outcome) {
+                  if (!active || finished) return;
+                  cleanupAttempt();
+                  if (!retried && outcome.status === "loaded" && outcome.updateConfirmed !== true &&
+                      hasActiveWaiter(request => request.requireFreshUpdate)) {
+                    retried = true;
+                    if (Services.io.offline) settle({ status: "error", error: REFRESH_OFFLINE_ERROR });
+                    else startAttempt();
+                    return;
+                  }
+                  settle(outcome);
                 }
-              } else {
-                return folder.updateFolder(null);
+                const listener = {
+                  QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                  onFolderEvent(eventFolder, event) {
+                    if (!active || event !== "FolderLoaded" || eventFolder?.URI !== folder.URI) return;
+                    const noUpdateRan = inImapUpdate;
+                    // IMAP fires FolderLoaded even on failure, before the URL
+                    // listener. Give that listener's exit code the first say.
+                    Services.tm.dispatchToMainThread(() => complete({
+                      status: "loaded",
+                      updateConfirmed: false,
+                      warning: noUpdateRan
+                        ? "No update ran: Thunderbird reported the folder loaded synchronously (the folder may be busy or the update was aborted)."
+                        : "Thunderbird reported the folder loaded; a successful server update could not be confirmed.",
+                    }));
+                  },
+                };
+                cleanupAttempt = () => {
+                  if (!active) return;
+                  active = false;
+                  try { MailServices.mailSession.RemoveFolderListener(listener); } catch { /* Retire callbacks even if removal fails. */ }
+                };
+                const fail = error => complete({ status: "error", error: String(error?.message || error) });
+                // Busy IMAP updates do not keep our URL listener, but their
+                // eventual FolderLoaded permits one shared trailing update.
+                try {
+                  MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
+                  if (folder.server.type === "imap") {
+                    inImapUpdate = true;
+                    try {
+                      folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
+                        QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                        OnStartRunningUrl() {},
+                        OnStopRunningUrl(url, exitCode) {
+                          if (!active) return;
+                          // The folder has one stashed listener: an unrelated URL
+                          // can consume it before the update completes.
+                          let updatingFolder = false;
+                          try { updatingFolder = url.QueryInterface(Ci.nsIMsgMailNewsUrl).updatingFolder; } catch {}
+                          if (!updatingFolder) return;
+                          complete(Components.isSuccessCode(exitCode)
+                            ? { status: "loaded", updateConfirmed: true }
+                            : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
+                        },
+                      });
+                    } finally {
+                      inImapUpdate = false;
+                    }
+                  } else {
+                    const pending = folder.updateFolder(null);
+                    if (pending && typeof pending.then === "function") {
+                      Promise.resolve(pending).catch(fail);
+                    }
+                  }
+                } catch (error) {
+                  fail(error);
+                }
               }
+              startAttempt();
             }
 
             // Internal adapter: callers choose their wait budget and receive an
@@ -13675,19 +13720,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // access and reject roots/virtual/no-select folders before calling.
             // loaded means a load was reported; updateConfirmed additionally
             // requires a successful folder-update URL exit code.
-            function waitForFolderRefresh(folder, timeoutMs) {
+            // requireFreshUpdate permits ONE trailing attempt after an
+            // unconfirmed load, shared by callers within their original budgets.
+            function waitForFolderRefresh(folder, timeoutMs, { requireFreshUpdate = false } = {}) {
               if (Services.io.offline) {
                 return Promise.resolve({ status: "error", error: REFRESH_OFFLINE_ERROR, joinedInFlight: false });
               }
               return waitForRefresh(refreshInFlight, folder.URI, timeoutMs,
-                lifecycle => startFolderSync(folder, lifecycle));
+                lifecycle => startFolderSync(folder, lifecycle), { requireFreshUpdate });
             }
 
             async function syncOneFolder(folder, timeoutMs) {
               const uri = folder.URI;
               const started = Date.now();
               const before = refreshFolderCounts(folder);
-              const outcome = await waitForFolderRefresh(folder, timeoutMs);
+              const outcome = await waitForFolderRefresh(folder, timeoutMs, { requireFreshUpdate: true });
               const after = refreshFolderCounts(folder);
               const result = {
                 success: outcome.status === "loaded",
