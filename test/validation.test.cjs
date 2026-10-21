@@ -2414,7 +2414,6 @@ describe('dryRunCompose behavior', () => {
         return (header.match(/(?:[^,"]|"[^"]*")+/g) || []).map(email => ({ email }));
       },
     };
-    if (options.sendMailDisabled) runtime.isToolEnabled = name => name !== 'sendMail';
     return { runtime, state };
   }
   const noSideEffects = state => {
@@ -2481,13 +2480,23 @@ describe('dryRunCompose behavior', () => {
     assert.equal(result.wouldSucceed, false);
     assert.match(result.blockers[0], /unknown identity/);
     assert.equal(result.resolvedIdentity, null);
+    assert.equal(result.estimatedEncodedBytes, null);
+    assert.equal(result.warningThresholdBytes, null);
   });
 
-  it('is refused when sendMail is disabled and probes no paths', () => {
-    const { runtime, state } = makeRuntime({ sendMailDisabled: true });
-    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: ['/home/user/Documents/report.pdf'] });
-    assert.match(result.error, /requires the sendMail tool/);
+  it('is refused through shared dependency access when sendMail is disabled and probes no paths', async () => {
+    const { loadPrivacyRuntime } = require('./helpers/privacy-access.cjs');
+    const access = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: '["sendMail"]' } });
+    const { runtime, state } = makeRuntime({ dispatch: true });
+    runtime.isToolEnabled = access.isToolEnabled;
+    const response = await dispatchHttpBody(state, JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dryRunCompose', arguments: {
+        to: 'a@example.com', subject: 's', body: 'b', attachments: ['/home/user/Documents/report.pdf'],
+      } },
+    }));
+    assert.match(response.error.message, /Tool is disabled/);
     assert.equal(state.fileCalls, 0);
+    noSideEffects(state);
   });
 
   it('fails a direct send with no recipients, but not a review window', () => {
@@ -2658,6 +2667,36 @@ describe('Direct send recipient preflight', () => {
   const emptyGroup = 'Undisclosed:;';
   const auto = 'archive@example.com';
   const caller = 'other@example.com';
+  for (const field of ['cc', 'bcc']) {
+    it(`deduplicates caller ${field} even when its enabled automatic list is empty`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      let merges = 0;
+      runtime.setComposeIdentity = params => { params.identity = {
+        key: 'sender', doCc: field === 'cc', doBcc: field === 'bcc', doCcList: '', doBccList: '',
+      }; };
+      runtime.MailServices.headerParser = {
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(header, `${caller}, ${caller}`);
+          assert.equal(automatic, '');
+          merges++;
+          return caller;
+        },
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(header, caller);
+          assert.equal(preserveGroups, false);
+          return [{ email: caller }];
+        },
+      };
+      const request = { ...base, [field]: `${caller}, ${caller}` };
+      const dry = runtime.dryRunCompose(request);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.recipients[field], 1);
+      assert.equal(state.sent + state.writes + state.decodes + state.native + state.params, 0);
+      assert.equal((await runtime.composeMail(request)).success, true);
+      assert.equal(merges, 2);
+      assert.equal(state.sent, 1);
+    });
+  }
   for (const config of [
     { to: '', expected: 0 },
     { to: '   ', expected: 0 },
@@ -2861,6 +2900,22 @@ describe('Conservative compose size preflight', () => {
       assert.ok(runtime.dryRunCompose({ ...args, ...config.request }).estimatedEncodedBytes > baseline + 1000);
       noExecution(state);
     }
+  });
+
+  it('ignores disabled automatic recipient lists when counting and bounding identity content', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const { runtime, state } = makeRuntime();
+    // Preserve getters rather than spreading this identity in the fixture.
+    const identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, doCc: false, doBcc: false };
+    for (const name of ['doCcList', 'doBccList']) Object.defineProperty(identity, name, {
+      get() { throw new Error('Disabled recipient list must not be read'); },
+    });
+    runtime.setComposeIdentity = params => { params.identity = identity; };
+    const dry = runtime.dryRunCompose(args);
+    assert.equal(dry.wouldSucceed, true);
+    assert.equal(dry.estimatedEncodedBytes, baseline);
+    assert.equal(dry.recipients.cc + dry.recipients.bcc, 0);
+    noExecution(state);
   });
 
   it('fails closed on unbounded identity content and raw snapshot lengths; nonpositive thresholds still disable the gate', () => {

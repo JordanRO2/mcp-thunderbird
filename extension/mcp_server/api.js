@@ -2314,7 +2314,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // Four weeks; also catches seconds/milliseconds supplied as minutes.
     const MAX_REMINDER_MINUTES = 40320;
     // Searched for schema projection helpers: none preserves arbitrary nested
-    // validation keywords. Strip only descriptions, recursively, without a key allow-list.
+    // validation keywords. Strip descriptions while preserving every other keyword.
     function stripSchemaDescriptions(schema) {
       if (!schema || typeof schema !== "object") return schema;
       if (Array.isArray(schema)) return schema.map(stripSchemaDescriptions);
@@ -2326,7 +2326,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           .map(([name, child]) => [name, stripSchemaDescriptions(child)]));
       }
       for (const key of ["items", "additionalItems", "prefixItems", "contains", "additionalProperties",
-        "unevaluatedProperties", "unevaluatedItems", "propertyNames", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"]) {
+        "unevaluatedProperties", "unevaluatedItems", "propertyNames", "contentSchema", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"]) {
         if (copy[key]) copy[key] = stripSchemaDescriptions(copy[key]);
       }
       return copy;
@@ -5262,9 +5262,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   ? `mail.identity.default.${name}` : pref);
               };
               const headerValues = [...headers];
-              for (const key of ["email", "fullName", "organization", "replyTo", "doCcList", "doBccList"]) {
+              for (const key of ["email", "fullName", "organization", "replyTo"]) {
                 headerValues.push(identity[key] ?? "");
               }
+              headerValues.push(identity.doCc ? identity.doCcList : "", identity.doBcc ? identity.doBccList : "");
               headerValues.push(identityPref("FQDN"), optionalPref("general.useragent.override"));
               for (const name of identityPref("headers").split(",")) {
                 // Thunderbird even reads header.<empty> for an empty list.
@@ -10756,11 +10757,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // automatic Cc/Bcc merge instead of counting comma-separated strings.
             function getComposeRecipients({ to, cc, bcc }, identity) {
               const headers = { to: to || "", cc: cc || "", bcc: bcc || "" };
-              for (const [field, enabled, list] of [
-                ["cc", identity.doCc, identity.doCcList],
-                ["bcc", identity.doBcc, identity.doBccList],
+              for (const [field, enabled, listProperty] of [
+                ["cc", identity.doCc, "doCcList"],
+                ["bcc", identity.doBcc, "doBccList"],
               ]) {
-                if (enabled && list) {
+                if (enabled) {
+                  const list = identity[listProperty] || "";
                   const remaining = MailServices.headerParser.removeDuplicateAddresses(headers[field], list);
                   headers[field] = [list, remaining].filter(Boolean).join(", ");
                 }
@@ -10798,7 +10800,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               headers: [...Object.values(recipients.headers), args.subject || ""], attachments: descs });
               return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody, size,
                 ...(skipReview && size.warning ? { error: size.warning } : {}) };
-
             }
             // END COMPOSE PREPARATION
 
@@ -10809,6 +10810,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 resolvedIdentity: null, isHtml: null,
                 inputBodyLength: typeof args.body === "string" ? args.body.length : 0,
                 recipients: null, attachments: [],
+                estimatedEncodedBytes: null, warningThresholdBytes: null,
               };
               const refuse = error => dryRun ? { ...report, blockers: [error] } : { error };
               try {
@@ -10853,9 +10855,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function dryRunCompose(args) {
-              if (!isToolEnabled("sendMail")) {
-                return { error: "dryRunCompose requires the sendMail tool to be enabled" };
-              }
               return composeMail(args, { dryRun: true });
             }
 

@@ -838,7 +838,7 @@ if (require.main === module) describe("direct-send preflight deadline and late c
 
 module.exports = { loadPreflight, assertPreflightRefused };
 
-describe("reply/forward size assessment uses the complete raw snapshot", () => {
+if (require.main === module) describe("reply/forward size assessment uses the complete raw snapshot", () => {
   const thresholdPref = "mailnews.message_warning_size";
   for (const tool of tools) {
     for (const uncached of [false, true]) {
@@ -884,7 +884,7 @@ describe("reply/forward size assessment uses the complete raw snapshot", () => {
 });
 
 
-describe("final reply/forward size boundaries before attachment writes", () => {
+if (require.main === module) describe("final reply/forward size boundaries before attachment writes", () => {
   const thresholdPref = "mailnews.message_warning_size";
   for (const tool of tools) {
     it(`${tool}: equality sends; a final estimate one byte above the threshold refuses before writes`, async () => {

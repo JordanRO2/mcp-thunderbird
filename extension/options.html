@@ -359,6 +359,14 @@
     and scheduled drafts. Scheduling still requires the sendMail tool to be
     enabled and an identity permitted by the unreviewed-send encryption checks.
   </p>
+  <p class="mode-note">
+    Direct sendMail also requires at least one effective recipient, including
+    enabled automatic Cc/Bcc. Direct mail sends, replies, and forwards require
+    review when their conservative size estimate exceeds Thunderbird's positive
+    large-message threshold, or the threshold/estimate cannot be read safely.
+    The add-on does not change that preference. dryRunCompose reports the same
+    blockers; review windows remain available.
+  </p>
   <ul class="account-list">
     <li>
       <label>
