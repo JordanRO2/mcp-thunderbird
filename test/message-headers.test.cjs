@@ -30,15 +30,24 @@ function productionHeaderTools() {
   const to = source.lastIndexOf("      {", end);
   assert.ok(from >= 0 && to > from, "production header tool schemas missing");
   const sandbox = {};
-  vm.runInNewContext(`this.tools = [${source.slice(from, to)}];`, sandbox);
+  vm.runInNewContext([
+    snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
+    `this.tools = [${source.slice(from, to)}];`,
+  ].join("\n"), sandbox);
   return sandbox.tools;
 }
 
+const HEADER_BATCH_LIMIT = vm.runInNewContext([
+  snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
+  "MAX_HEADER_BATCH_IDS;",
+].join("\n"));
 const ENCRYPTED_RAW = 'From: sender@example.test\r\nSubject: =?utf-8?q?Encrypted_Message?=\r\nContent-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"\r\n\r\n--b--\r\n';
 const DECRYPTION_OKAY = 0x00020000;
+const CACHED_SUBJECT = "Cached decrypted subject";
+const OUTER_SUBJECT = "Encrypted Message";
 
 function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield = 0 } = {}) {
-  const stats = { yields: 0, listAllKeys: 0, directLookups: 0, headerReads: 0 };
+  const stats = { yields: 0, listAllKeys: 0, directLookups: 0, headerReads: 0, streams: 0 };
   let generation = 0;
   let now = 0;
   let accessible = true;
@@ -54,6 +63,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
     server: null,
     updateFolder() {},
     getMsgInputStream(msgHdr) {
+      stats.streams++;
       let offset = 0;
       const raw = msgHdr.raw;
       return {
@@ -81,6 +91,8 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
 
   rows.forEach((row, index) => {
     const properties = { keywords: "custom junk $label1", ...row.properties };
+    // Explicit parser results keep fixtures faithful without copying its parser.
+    const parsedReferences = row.parsedReferences || [];
     const header = {
       messageKey: index + 1,
       messageId: `m-${index}@example.com`,
@@ -97,6 +109,8 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
       isRead: true,
       isFlagged: false,
       messageSize: 321,
+      numReferences: parsedReferences.length,
+      getStringReference: index => parsedReferences[index],
       folder,
       getStringProperty: name => properties[name] || "",
       getUint32Property: name => (name === "enigmail" ? (row.enigmail || 0) : 0),
@@ -150,7 +164,8 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
   const tools = productionHeaderTools();
   runtime.buildTools = () => tools;
   vm.runInContext([
-    ...["SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "MAX_HEADER_BATCH_IDS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    ...["SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
     snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
     snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
     snippet("// BEGIN PROTECTED SUBJECT HELPERS", "// END PROTECTED SUBJECT HELPERS"),
@@ -229,13 +244,14 @@ describe("header object shape", () => {
     const h = makeHarness({
       rows: [
         // References present: the last entry is the direct parent.
-        { properties: { references: "<root@example.com> <mid@example.com> <parent@example.com>" } },
+        { properties: { references: "<root@example.com> <mid@example.com> <parent@example.com>" },
+          parsedReferences: ["root@example.com", "mid@example.com", "parent@example.com"] },
         // Thunderbird stores a lone In-Reply-To in references.
-        { properties: { references: "<only@example.com>" } },
+        { properties: { references: "<only@example.com>" }, parsedReferences: ["only@example.com"] },
         // A stale in-reply-to property must not be consulted.
         { properties: { "in-reply-to": "<ignored@example.com>" } },
-        // Bare, unbracketed ids and odd spacing.
-        { properties: { references: "  a@example.com\n  b@example.com " } },
+        // Thunderbird accepts a bare, unfolded string as one reference.
+        { properties: { references: "a@example.com b@example.com" }, parsedReferences: ["a@example.com b@example.com"] },
       ],
     });
     const read = async index => h.call("getMessageHeaders", { messageId: `m-${index}@example.com`, folderPath: h.folder.URI });
@@ -245,23 +261,38 @@ describe("header object shape", () => {
     assert.equal(b.inReplyTo, "only@example.com");
     assert.equal(c.inReplyTo, "");
     assert.equal(c.references, "");
-    assert.equal(d.inReplyTo, "b@example.com");
+    assert.equal(d.inReplyTo, "a@example.com b@example.com");
   });
 
   it("withholds subjects of recorded-encrypted messages unless allowed", async () => {
-    const rows = [{ enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, subject: "Cached", mime2DecodedSubject: "Cached decrypted subject" } }];
+    const rows = [{ enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, subject: "Cached", mime2DecodedSubject: CACHED_SUBJECT } }];
     const blocked = makeHarness({ rows });
     const single = await blocked.call("getMessageHeaders", { messageId: "m-0@example.com", folderPath: blocked.folder.URI });
-    assert.equal(single.subject, "Encrypted Message");
+    assert.equal(single.subject, OUTER_SUBJECT);
     assert.equal(single.encryptedContentWithheld, true);
     const batch = await blocked.call("batchGetMessageHeaders", { messageIds: ["m-0@example.com"], folderPath: blocked.folder.URI });
-    assert.equal(batch.headers["m-0@example.com"].subject, "Encrypted Message");
+    assert.equal(batch.headers["m-0@example.com"].subject, OUTER_SUBJECT);
     assert.doesNotMatch(JSON.stringify(batch), /Cached decrypted/);
 
     const allowed = makeHarness({ rows, allowEncrypted: true });
     const open = await allowed.call("getMessageHeaders", { messageId: "m-0@example.com", folderPath: allowed.folder.URI });
-    assert.equal(open.subject, "Cached decrypted subject");
+    assert.equal(open.subject, CACHED_SUBJECT);
     assert.equal(open.encryptedContentWithheld, undefined);
+    assert.equal(allowed.stats.streams, 0);
+  });
+
+  it("sanitizes display fields of an actual message whose ID is rawSource", async () => {
+    const hidden = "vis\u200Bible\u{E0061}";
+    const h = makeHarness({ rows: [{ hdr: {
+      messageId: "rawSource", mime2DecodedSubject: hidden, mime2DecodedAuthor: hidden,
+      mime2DecodedRecipients: hidden, ccList: hidden,
+    } }] });
+    const result = await h.call("batchGetMessageHeaders", { messageIds: ["rawSource"], folderPath: h.folder.URI });
+    assert.equal(result.headers.rawSource.id, "rawSource");
+    for (const field of ["subject", "author", "recipients", "ccList"]) {
+      assert.equal(result.headers.rawSource[field], "visible", field);
+    }
+    assert.equal(result.failed, 0);
   });
 });
 
@@ -276,6 +307,7 @@ describe("header lookup and cooperative fallback scan", () => {
     assert.equal(h.stats.yields, 0);
     assert.equal(result.truncated, undefined);
     assert.equal(result.notScanned, undefined);
+    assert.equal(h.stats.streams, 0, "clear headers never read stored message content");
   });
 
   it("finds ids that miss the direct lookup with one yielding scan, past the old 50,000 cap", async () => {
@@ -391,6 +423,13 @@ describe("header lookup and cooperative fallback scan", () => {
 });
 
 describe("handler guards and error surfacing", () => {
+  it("shares the batch cap between the production schema and descriptions", () => {
+    const tool = productionHeaderTools().find(tool => tool.name === "batchGetMessageHeaders");
+    assert.equal(tool.inputSchema.properties.messageIds.maxItems, HEADER_BATCH_LIMIT);
+    assert.ok(tool.description.includes(`up to ${HEADER_BATCH_LIMIT} messages`));
+    assert.ok(tool.inputSchema.properties.messageIds.description.includes(`max ${HEADER_BATCH_LIMIT}`));
+  });
+
   it("returns the empty fast path without opening the folder", async () => {
     const h = makeHarness({ rows: rowsOf(1) });
     h.runtime.openFolder = () => assert.fail("must not open the folder");
@@ -403,14 +442,14 @@ describe("handler guards and error surfacing", () => {
     const args = { messageIds: Array.from({ length: 100000 }, () => 42), folderPath: h.folder.URI };
     const errors = h.runtime.validateToolArgs("batchGetMessageHeaders", args);
     assert.equal(errors.length, 1);
-    assert.match(errors[0], /at most 200 item/);
-    assert.equal(h.runtime.validateToolArgs("batchGetMessageHeaders", { messageIds: ids(200), folderPath: h.folder.URI }).length, 0);
+    assert.match(errors[0], new RegExp(`at most ${HEADER_BATCH_LIMIT} item`));
+    assert.equal(h.runtime.validateToolArgs("batchGetMessageHeaders", { messageIds: ids(HEADER_BATCH_LIMIT), folderPath: h.folder.URI }).length, 0);
   });
 
   it("keeps a handler-side cap and rejects non-string ids for direct callers", async () => {
     const h = makeHarness({ rows: rowsOf(1) });
-    const tooMany = await h.runtime.batchGetMessageHeaders(ids(201), h.folder.URI);
-    assert.match(tooMany.error, /Too many ids: 201/);
+    const tooMany = await h.runtime.batchGetMessageHeaders(ids(HEADER_BATCH_LIMIT + 1), h.folder.URI);
+    assert.match(tooMany.error, new RegExp(`Too many ids: ${HEADER_BATCH_LIMIT + 1}`));
     const bad = await h.runtime.batchGetMessageHeaders(["m-0@example.com", null], h.folder.URI);
     assert.match(bad.error, /non-empty strings/);
     const notArray = await h.runtime.batchGetMessageHeaders("m-0@example.com", h.folder.URI);
@@ -442,6 +481,31 @@ describe("handler guards and error surfacing", () => {
 });
 
 describe("bracketed and untrimmed ids", () => {
+  it("preserves the stored ID and case, matching the other message read tools", async () => {
+    const storedId = "Case.ID@Example.COM";
+    const h = makeHarness({ rows: [{ hdr: { messageId: storedId } }] });
+    const single = await h.call("getMessageHeaders", { messageId: `<${storedId}>`, folderPath: h.folder.URI });
+    assert.equal(single.id, storedId);
+    assert.equal(h.stats.listAllKeys, 0);
+    const different = await h.call("getMessageHeaders", { messageId: storedId.toLowerCase(), folderPath: h.folder.URI });
+    assert.match(different.error, /Message not found/);
+  });
+
+  for (const storedId of ["  Case.ID@Example.COM  ", " <Case.ID@Example.COM> ", "<Case.ID@Example.COM"]) {
+    it(`recovers a stored ID with surrounding whitespace or brackets: ${JSON.stringify(storedId)}`, async () => {
+      const rows = rowsOf(800);
+      rows[700].hdr = { messageId: storedId };
+      const h = makeHarness({ rows });
+      const inputId = "Case.ID@Example.COM";
+      const result = await h.call("batchGetMessageHeaders", { messageIds: [inputId], folderPath: h.folder.URI });
+      assert.equal(h.stats.directLookups, 1);
+      assert.equal(h.stats.listAllKeys, 1, "exact stored-text lookup misses without an indirectOnly override");
+      assert.ok(h.stats.yields > 0);
+      assert.equal(result.headers[inputId].id, storedId, "return the same stored id as getMessage/searchMessages");
+      assert.equal(result.failed, 0);
+    });
+  }
+
   it("matches bracketed ids on the direct path and keys results by the caller's id", async () => {
     const h = makeHarness({ rows: rowsOf(50) });
     const result = await h.call("batchGetMessageHeaders", {
@@ -481,6 +545,26 @@ describe("bracketed and untrimmed ids", () => {
 });
 
 describe("scan robustness", () => {
+  for (const indexedCopy of ["missing", "expunged"]) {
+    it(`finds a live duplicate when the indexed copy is ${indexedCopy}`, async () => {
+      const duplicateId = "duplicate@example.com";
+      const survivorSubject = "Surviving copy";
+      const rows = rowsOf(400);
+      rows[0] = { indirectOnly: indexedCopy === "missing", hdr: {
+        messageId: duplicateId, flags: 0x8, mime2DecodedSubject: "Removed copy",
+      } };
+      // Model the surviving row whose Message-ID index entry was lost when
+      // the other copy was removed, or still points at an expunged copy.
+      rows[300] = { indirectOnly: true, hdr: { messageId: duplicateId, mime2DecodedSubject: survivorSubject } };
+      const h = makeHarness({ rows });
+      const result = await h.call("getMessageHeaders", { messageId: duplicateId, folderPath: h.folder.URI });
+      assert.equal(result.id, duplicateId);
+      assert.equal(result.subject, survivorSubject);
+      assert.equal(h.stats.listAllKeys, 1);
+      assert.ok(h.stats.yields > 0);
+    });
+  }
+
   it("keeps resolved headers and reports the rest as notScanned when the database getter throws after a yield", async () => {
     const rows = rowsOf(2000);
     rows[1500].indirectOnly = true;
@@ -514,21 +598,162 @@ describe("scan robustness", () => {
   });
 });
 
+describe("header privacy after cooperative yields", () => {
+  for (const enableDuringScan of [false, true]) {
+    for (const direct of [true, false]) {
+      it(`rechecks encryption recorded after an initially-off capture (off->${enableDuringScan ? "on" : "off"}->off, direct: ${direct})`, async () => {
+        const rows = rowsOf(600);
+        const [protectedId, clearId, withheldId] = ids(3);
+        const clearSubject = "Verifiably clear subject";
+        rows[0] = { hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+        rows[1] = { hdr: { mime2DecodedSubject: clearSubject } };
+        rows[2] = { enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+        const h = makeHarness({ rows, direct, allowEncrypted: false });
+        const optInAfterYields = [];
+        h.setOnYield(count => {
+          if (count === 1) {
+            h.headers.get(1).getUint32Property = () => DECRYPTION_OKAY;
+            // Its safe subject was already captured; losing the row must not
+            // replace that snapshot with a placeholder during the final check.
+            h.headers.delete(3);
+          }
+          const enabled = enableDuringScan && count === 1;
+          h.runtime.Services.prefs.getBoolPref = () => enabled;
+          optInAfterYields.push(enabled);
+        });
+        const result = await h.call("batchGetMessageHeaders", {
+          messageIds: [protectedId, clearId, withheldId, ...ids(1, rows.length)], folderPath: h.folder.URI,
+        });
+        assert.deepEqual(optInAfterYields, [enableDuringScan, false]);
+        for (const id of [protectedId, withheldId]) {
+          assert.equal(result.headers[id].subject, OUTER_SUBJECT);
+          assert.equal(result.headers[id].encryptedContentWithheld, true);
+        }
+        assert.equal(result.headers[clearId].subject, clearSubject);
+        assert.equal(result.headers[clearId].encryptedContentWithheld, undefined);
+        assert.equal(h.stats.streams, 2, "read each protected outer subject once and never read clear content");
+        assert.ok(!JSON.stringify(result).includes(CACHED_SUBJECT));
+      });
+    }
+  }
+
+  it("checks newly recorded encryption after revocation while preserving clear subjects", async () => {
+    const rows = rowsOf(600);
+    rows[0] = { hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+    const h = makeHarness({ rows, allowEncrypted: true });
+    h.setOnYield(() => {
+      h.headers.get(1).getUint32Property = () => DECRYPTION_OKAY;
+      h.runtime.Services.prefs.getBoolPref = () => false;
+    });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["m-0@example.com", "m-1@example.com", "absent@example.com"], folderPath: h.folder.URI,
+    });
+    assert.equal(result.headers["m-0@example.com"].subject, OUTER_SUBJECT);
+    assert.equal(result.headers["m-0@example.com"].encryptedContentWithheld, true);
+    assert.equal(result.headers["m-1@example.com"].subject, "Decoded subject");
+    assert.equal(result.headers["m-1@example.com"].encryptedContentWithheld, undefined);
+    assert.ok(!JSON.stringify(result).includes(CACHED_SUBJECT));
+  });
+
+  for (const indirectOnly of [false, true]) {
+    it(`withholds a protected subject captured before opt-in revocation (scan hit: ${indirectOnly})`, async () => {
+      const rows = rowsOf(600);
+      rows[0] = { indirectOnly, enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+      const h = makeHarness({ rows, allowEncrypted: true });
+      h.setOnYield(() => { h.runtime.Services.prefs.getBoolPref = () => false; });
+      const result = await h.call("batchGetMessageHeaders", {
+        messageIds: ["m-0@example.com", "absent@example.com"], folderPath: h.folder.URI,
+      });
+      assert.ok(h.stats.yields > 0);
+      assert.equal(result.headers["m-0@example.com"].subject, OUTER_SUBJECT);
+      assert.equal(result.headers["m-0@example.com"].encryptedContentWithheld, true);
+      assert.ok(!JSON.stringify(result).includes(CACHED_SUBJECT));
+    });
+  }
+
+  it("rechecks an opt-in enabled only for a middle scan chunk", async () => {
+    const rows = rowsOf(800);
+    rows[300] = { indirectOnly: true, enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+    const h = makeHarness({ rows });
+    h.setOnYield(count => { h.runtime.Services.prefs.getBoolPref = () => count === 1; });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["m-300@example.com", "absent@example.com"], folderPath: h.folder.URI,
+    });
+    assert.equal(result.headers["m-300@example.com"].subject, OUTER_SUBJECT);
+    assert.equal(result.headers["m-300@example.com"].encryptedContentWithheld, true);
+    assert.ok(!JSON.stringify(result).includes(CACHED_SUBJECT));
+  });
+
+  for (const unavailable of ["database", "deleted", "reused key", "expunged", "outer stream"]) {
+    it(`uses a placeholder after revocation when the original has an unavailable ${unavailable}`, async () => {
+      const rows = rowsOf(600);
+      rows[0] = { enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+      const h = makeHarness({ rows, allowEncrypted: true });
+      h.setOnYield(count => {
+        if (count !== 1) return;
+        h.runtime.Services.prefs.getBoolPref = () => false;
+        if (unavailable === "database") h.setDatabaseHook(() => { throw new Error("closed"); });
+        else if (unavailable === "deleted") h.headers.delete(1);
+        else if (unavailable === "reused key") h.headers.get(1).messageId = "replacement@example.com";
+        else if (unavailable === "expunged") h.headers.get(1).flags = 0x8;
+        else h.folder.getMsgInputStream = () => { throw new Error("not offline"); };
+      });
+      const result = await h.call("batchGetMessageHeaders", {
+        messageIds: ["m-0@example.com", "absent@example.com"], folderPath: h.folder.URI,
+      });
+      assert.equal(result.headers["m-0@example.com"].subject, "[Encrypted message]");
+      assert.equal(result.headers["m-0@example.com"].encryptedContentWithheld, true);
+      assert.ok(!JSON.stringify(result).includes(CACHED_SUBJECT));
+    });
+  }
+
+  it("discards rows before outer-header reads when account access is also revoked", async () => {
+    const rows = rowsOf(600);
+    rows[0] = { enigmail: DECRYPTION_OKAY, hdr: { raw: ENCRYPTED_RAW, mime2DecodedSubject: CACHED_SUBJECT } };
+    const h = makeHarness({ rows, allowEncrypted: true });
+    h.setOnYield(() => {
+      h.revokeAccess();
+      h.runtime.Services.prefs.getBoolPref = () => false;
+    });
+    const result = await h.call("batchGetMessageHeaders", {
+      messageIds: ["m-0@example.com", "absent@example.com"], folderPath: h.folder.URI,
+    });
+    assert.match(result.error, /not accessible/);
+    assert.equal(result.headers, undefined);
+    assert.equal(h.stats.streams, 0);
+  });
+});
+
 describe("inReplyTo from parsed references", () => {
-  it("prefers Thunderbird's parsed references and falls back to the stored string", async () => {
+  it("honors parsed references, including self-reference removal and zero parents", async () => {
     const parsed = ["root@example.com", "parent@example.com"];
     const h = makeHarness({
       rows: [
-        { properties: { references: "<other@example.com>" }, hdr: { numReferences: 2, getStringReference: index => parsed[index] } },
-        { properties: { references: "<a@example.com> <b@example.com>" }, hdr: { numReferences: 0, getStringReference: () => assert.fail("not used") } },
-        { properties: { references: "<c@example.com>" }, throwOn: ["numReferences"] },
+        { properties: { references: "<root@example.com> <parent@example.com> <m-0@example.com>" }, parsedReferences: parsed },
+        { properties: { references: "<m-1@example.com>" }, hdr: { getStringReference: () => assert.fail("zero parsed references") } },
+        { properties: { references: "<>" } },
+        {},
       ],
     });
     const read = async index => h.call("getMessageHeaders", { messageId: `m-${index}@example.com`, folderPath: h.folder.URI });
     assert.equal((await read(0)).inReplyTo, "parent@example.com");
-    assert.equal((await read(0)).references, "<other@example.com>");
-    assert.equal((await read(1)).inReplyTo, "b@example.com");
-    assert.equal((await read(2)).inReplyTo, "c@example.com");
+    assert.equal((await read(0)).references, "<root@example.com> <parent@example.com> <m-0@example.com>");
+    for (const index of [1, 2, 3]) assert.equal((await read(index)).inReplyTo, "");
+  });
+
+  it("uses the raw fallback only when parsed-reference access is missing or throws", async () => {
+    const references = "<root@example.com> <parent@example.com>";
+    const h = makeHarness({ rows: [
+      { properties: { references }, hdr: { numReferences: undefined, getStringReference: undefined } },
+      { properties: { references }, throwOn: ["numReferences"] },
+      { properties: { references }, parsedReferences: ["root@example.com", "parent@example.com"],
+        hdr: { getStringReference() { throw new Error("references unavailable"); } } },
+    ] });
+    for (const messageId of ids(3)) {
+      const result = await h.call("getMessageHeaders", { messageId, folderPath: h.folder.URI });
+      assert.equal(result.inReplyTo, "parent@example.com");
+      assert.equal(result.references, references);
+    }
   });
 });
 
@@ -613,6 +838,35 @@ describe("scanFolderCooperatively", () => {
     assert.deepEqual(outcome, { complete: false, stopped: false, scanned: 0 });
     assert.equal(seen.length, 0);
     assert.equal(scan.timedOut, true);
+    assert.equal(h.stats.listAllKeys, 0, "expired work does not open a native key snapshot");
+  });
+
+  it("checks the deadline between individual rows within a chunk", async () => {
+    const h = makeHarness({ rows: rowsOf(200) });
+    const scan = scanOf(20000);
+    const outcome = await run(h, () => { h.advance(2000); }, undefined, scan);
+    assert.deepEqual(outcome, { complete: false, stopped: false, scanned: 10 });
+    assert.equal(scan.timedOut, true);
+    assert.equal(h.stats.headerReads, 10);
+    assert.equal(h.stats.yields, 0);
+  });
+
+  it("reports a native key snapshot that consumed the budget before reading headers", async () => {
+    const h = makeHarness({ rows: rowsOf(20) });
+    h.setDatabaseHook(() => h.advance(25000));
+    const scan = scanOf(20000);
+    const outcome = await run(h, () => assert.fail("must not visit"), undefined, scan);
+    assert.deepEqual(outcome, { complete: false, stopped: false, scanned: 0 });
+    assert.equal(scan.timedOut, true);
+    assert.equal(h.stats.listAllKeys, 1);
+    assert.equal(h.stats.headerReads, 0);
+  });
+
+  it("does not snapshot a folder whose access is already revoked", async () => {
+    const h = makeHarness({ rows: rowsOf(20) });
+    h.revokeAccess();
+    assert.deepEqual(await run(h, () => assert.fail("must not visit")), { complete: false, stopped: false, scanned: 0 });
+    assert.equal(h.stats.listAllKeys, 0);
   });
 
   it("stops between chunks when the budget runs out", async () => {

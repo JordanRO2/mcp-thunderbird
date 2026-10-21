@@ -33,6 +33,8 @@ function getMarkedApiSnippet(startMarker, endMarker) {
   return apiSource.slice(start, end);
 }
 
+const messageHeaderLimits = getMarkedApiSnippet('// BEGIN MESSAGE HEADER LIMITS', '// END MESSAGE HEADER LIMITS');
+
 function loadProductionAttachmentValidation(overrides = {}) {
   const sandbox = {
     ...clearOriginalRawFixture,
@@ -53,6 +55,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     getMarkedApiSnippet('// BEGIN DIRECT SEND ORIGINAL GUARD', '// END DIRECT SEND ORIGINAL GUARD'),
     getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
+    messageHeaderLimits,
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
     getMarkedApiSnippet('// BEGIN FILTER SEARCH TERM HELPERS', '// END FILTER SEARCH TERM HELPERS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
@@ -65,6 +68,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
     'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.maxHeaderBatchIds = MAX_HEADER_BATCH_IDS;',
   ].join('\n'), sandbox);
   if (sandbox.server) {
     vm.runInContext([
@@ -284,22 +288,26 @@ function createValidator(tools) {
       }
       if (value === undefined || value === null) continue;
 
-      validateAgainstSchema(value, propSchema, key, errors);
       // Array length bounds (minItems/maxItems) sit outside validateAgainstSchema;
-      // mirror the production validateToolArgs so getMessages-batch caps are tested.
+      // reject over-cap arrays before walking their items, as in production.
       if (propSchema.type === "array" && Array.isArray(value)) {
         if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
           errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
         }
         if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
           errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+          continue;
         }
       }
+      validateAgainstSchema(value, propSchema, key, errors);
     }
 
     return errors;
   };
 }
+
+const HEADER_BATCH_TOOL = 'batchGetMessageHeaders';
+const MAX_HEADER_BATCH_IDS = productionAttachmentValidation.maxHeaderBatchIds;
 
 const sampleTools = [
   {
@@ -451,13 +459,13 @@ const sampleTools = [
     },
   },
   {
-    name: "batchGetMessageHeaders",
+    name: HEADER_BATCH_TOOL,
     inputSchema: {
       type: "object",
       properties: {
         messageIds: {
           type: "array",
-          maxItems: 200,
+          maxItems: MAX_HEADER_BATCH_IDS,
           items: { type: "string", minLength: 1 },
         },
         folderPath: { type: "string" },
@@ -2201,11 +2209,14 @@ describe('Validation: getMessageHeaders', () => {
   });
 });
 
-describe('Validation: batchGetMessageHeaders', () => {
+describe(`Validation: ${HEADER_BATCH_TOOL}`, () => {
+  const folderPath = 'imap://user@server/INBOX';
+  const boundsError = `Parameter 'messageIds' must contain at most ${MAX_HEADER_BATCH_IDS} item(s)`;
+
   it('accepts a valid batch', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: Array.from({ length: 10 }, (_, index) => `<message-${index}@example.com>`),
-      folderPath: 'imap://user@server/INBOX',
+      folderPath,
     });
     assert.deepStrictEqual(errors, []);
   });
@@ -2213,38 +2224,45 @@ describe('Validation: batchGetMessageHeaders', () => {
   // No schema minItems: an empty array is valid at the dispatch layer; the
   // handler short-circuits it to { headers: {}, total: 0, failed: 0 }.
   it('accepts an empty messageIds array (handler returns the empty fast path)', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: [],
-      folderPath: 'imap://user@server/INBOX',
+      folderPath,
     });
     assert.deepStrictEqual(errors, []);
   });
 
-  it('accepts exactly 200 ids and rejects 201 with a single bounds error', () => {
+  it(`accepts exactly ${MAX_HEADER_BATCH_IDS} ids and rejects ${MAX_HEADER_BATCH_IDS + 1} with a single bounds error`, () => {
     const ids = count => Array.from({ length: count }, (_, index) => `<message-${index}@example.com>`);
-    assert.deepStrictEqual(validate('batchGetMessageHeaders', {
-      messageIds: ids(200),
-      folderPath: 'imap://user@server/INBOX',
+    assert.deepStrictEqual(validate(HEADER_BATCH_TOOL, {
+      messageIds: ids(MAX_HEADER_BATCH_IDS),
+      folderPath,
     }), []);
-    const errors = validate('batchGetMessageHeaders', {
-      messageIds: ids(201),
-      folderPath: 'imap://user@server/INBOX',
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: ids(MAX_HEADER_BATCH_IDS + 1),
+      folderPath,
     });
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /at most 200 item/);
+    assert.deepStrictEqual(errors, [boundsError]);
+  });
+
+  it('rejects an over-cap malformed batch with only the bounds error', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: Array(MAX_HEADER_BATCH_IDS + 1).fill(null),
+      folderPath,
+    });
+    assert.deepStrictEqual(errors, [boundsError]);
   });
 
   it('rejects messageIds passed as a non-array', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: '<abc@example.com>',
-      folderPath: 'imap://user@server/INBOX',
+      folderPath,
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be an array/);
   });
 
   it('rejects missing folderPath', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: ['<abc@example.com>'],
     });
     assert.equal(errors.length, 1);
@@ -2254,18 +2272,18 @@ describe('Validation: batchGetMessageHeaders', () => {
   // The recursive validator walks the items, so a null element is rejected
   // before the handler runs.
   it('rejects a null array item', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: ['<abc@example.com>', null],
-      folderPath: 'imap://user@server/INBOX',
+      folderPath,
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /messageIds\[1\]/);
   });
 
   it('rejects an empty-string id', () => {
-    const errors = validate('batchGetMessageHeaders', {
+    const errors = validate(HEADER_BATCH_TOOL, {
       messageIds: [''],
-      folderPath: 'imap://user@server/INBOX',
+      folderPath,
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /at least 1 character/);
