@@ -2482,7 +2482,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
             recurrence: { type: "string", description: "Single iCalendar RRULE (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU' or 'RRULE:FREQ=DAILY;COUNT=10'). Optional case-insensitive RRULE: prefix. Control characters, malformed rules, SECONDLY/MINUTELY, and HOURLY on all-day events are rejected. Validated with Thunderbird's recurrence parser." },
-            reminders: { type: "array", items: { type: "integer", minimum: 0, maximum: MAX_REMINDER_MINUTES }, maxItems: MAX_REMINDERS, description: `DISPLAY alarms relative to START, as whole minutes before it (0 = at the start). At most ${MAX_REMINDERS} entries, each 0–${MAX_REMINDER_MINUTES}; duplicates are removed and values sorted largest first. Omitted/null/[] adds none.` },
+            reminders: { type: "array", items: { type: "integer", minimum: 0, maximum: MAX_REMINDER_MINUTES }, maxItems: MAX_REMINDERS, description: `DISPLAY alarms relative to START, as whole minutes before it (0 = at the start). At most ${MAX_REMINDERS} entries, each 0–${MAX_REMINDER_MINUTES}; duplicates are removed and values sorted largest first. The calendar's declared alarm count and DISPLAY support are enforced. Omitted/null/[] adds none.` },
             attendees: { type: "array", items: attendeeSchema, description: "Attendees to invite. A non-empty list requires disabling Block skipReview, even when opening a review dialog: Exchange/Owl or CalDAV can email the event title/description without review. Omit, use null, or [] for no attendees. Organizer is initialized from the calendar identity; a missing calendar organizerId may be set." },
             skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
@@ -2527,7 +2527,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             recurrence: { anyOf: [{ type: "string" }, { type: "null" }], description: "Single RRULE validated by Thunderbird; optional RRULE: prefix. Empty string or null clears recurrence. Control characters, malformed rules, SECONDLY/MINUTELY, and HOURLY on all-day events are rejected. Replacing the rule discards EXDATEs and modified occurrences. Cannot be combined with a non-null recurrenceId." },
             recurrenceId: { anyOf: [{ type: "string" }, { type: "null" }], description: "ISO 8601 recurrence ID from listEvents to modify one occurrence. Omit or pass null to update the series. Cannot combine a non-null recurrenceId with recurrence." },
             attendees: { type: "array", items: attendeeSchema, description: "Replace the full list on the series or selected occurrence. [] removes all; omitted/null preserves it. Block skipReview prevents adding attendees and all writes to meetings with other attendees. Requires the calendar identity to match an existing organizer; a missing organizer is initialized. Retained attendees match by case-insensitive email and preserve responses/metadata; only supplied name/role changes. Do not round-trip a truncated listEvents attendee list." },
-            reminders: { type: "array", items: { type: "integer", minimum: 0, maximum: MAX_REMINDER_MINUTES }, maxItems: MAX_REMINDERS, description: `Replace only DISPLAY alarms relative to START at or before it, as whole minutes before start (0 = at start). [] clears this subset; omitted/null preserves all alarms exactly. Other alarms are retained. At most ${MAX_REMINDERS} entries, each 0–${MAX_REMINDER_MINUTES}; duplicates are removed and values sorted largest first. listEvents rounds second offsets to the nearest minute. Use recurrenceId to change a modified occurrence's own reminders.` },
+            reminders: { type: "array", items: { type: "integer", minimum: 0, maximum: MAX_REMINDER_MINUTES }, maxItems: MAX_REMINDERS, description: `Replace only DISPLAY alarms relative to START at or before it, as whole minutes before start (0 = at start). [] clears this subset; omitted/null preserves all alarms exactly. Other alarms are retained and count toward the calendar's declared alarm limit. New reminders require declared DISPLAY support when actions are specified. At most ${MAX_REMINDERS} entries, each 0–${MAX_REMINDER_MINUTES}; duplicates are removed and values sorted largest first. listEvents rounds second offsets to the nearest minute. Use recurrenceId to change a modified occurrence's own reminders.` },
           },
           required: ["eventId", "calendarId"],
         },
@@ -6619,10 +6619,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (attendees && attendees.length > 0) {
                   for (const entry of attendees) event.addAttendee(buildAttendee(entry));
                 }
-                for (const minutes of reminderResult.minutes) {
-                  event.addAlarm(buildReminderAlarm(minutes));
-                }
-
                 // Find target calendar
                 const calendars = getEnabledCalendars(calendarId);
                 let targetCalendar = null;
@@ -6639,6 +6635,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 event.calendar = targetCalendar;
+                if (reminders != null) assertReminderCapabilities(targetCalendar, reminderResult.minutes);
+                for (const minutes of reminderResult.minutes) {
+                  event.addAlarm(buildReminderAlarm(minutes));
+                }
                 ensureOrganizer(event, targetCalendar);
 
                 if (skipReview) {
@@ -6735,11 +6735,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 && alarm.offset.inSeconds <= 0;
             }
 
+            // Check only requested reminder changes, before replacing any alarms
+            // or initializing an organizer (which can write calendar properties).
+            function assertReminderCapabilities(calendar, minutes, retainedCount = 0) {
+              const maxCount = calendar.getProperty("capabilities.alarms.maxCount");
+              if (Number.isInteger(maxCount) && maxCount >= 0 && retainedCount + minutes.length > maxCount) {
+                throw new Error(`Calendar "${calendar.name}" allows at most ${maxCount} alarms; ${retainedCount} retained alarms plus ${minutes.length} requested reminders exceed that limit.`);
+              }
+              if (minutes.length > 0) {
+                const actions = calendar.getProperty("capabilities.alarms.actionValues");
+                if (Array.isArray(actions) && !actions.includes("DISPLAY")) {
+                  throw new Error(`Calendar "${calendar.name}" does not support DISPLAY reminders.`);
+                }
+              }
+            }
+
             // Keep full alarm records from the item clone, including provider
             // metadata. A failed read must abort the update, never act like [].
-            function applyReminderChanges(targetItem, minutes, changes) {
+            function applyReminderChanges(targetItem, minutes, changes, calendar) {
               if (minutes === null) return;
               const retained = targetItem.getAlarms().filter(alarm => !isManagedReminder(alarm));
+              assertReminderCapabilities(calendar, minutes, retained.length);
               targetItem.clearAlarms();
               for (const alarm of retained) targetItem.addAlarm(alarm);
               for (const m of minutes) targetItem.addAlarm(buildReminderAlarm(m));
@@ -7507,7 +7523,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (r.error) return { error: r.error };
                   const meta = applyEventMetaChanges(modOcc, status, showAs, categories, onlineMeeting, r.changes, attendees);
                   if (meta.error) return { error: meta.error };
-                  applyReminderChanges(modOcc, reminderUpdate.minutes, r.changes);
+                  applyReminderChanges(modOcc, reminderUpdate.minutes, r.changes, calendar);
                   if (r.changes.length === 0) return { error: "No changes specified" };
                   if (modOcc.startDate && modOcc.endDate && modOcc.endDate.compare(modOcc.startDate) <= 0) {
                     return { error: "endDate must be after startDate" };
@@ -7531,7 +7547,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const changes = r.changes;
                 const meta = applyEventMetaChanges(newItem, status, showAs, categories, onlineMeeting, changes, attendees);
                 if (meta.error) return { error: meta.error };
-                applyReminderChanges(newItem, reminderUpdate.minutes, changes);
+                applyReminderChanges(newItem, reminderUpdate.minutes, changes, calendar);
 
                 if (recurrence !== undefined) {
                   try {

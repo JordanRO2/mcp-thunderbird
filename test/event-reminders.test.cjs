@@ -8,6 +8,12 @@ const createArgs = { title: "Reminder test", startDate: "2026-09-28T10:00:00Z", 
 const updateArgs = { eventId: "event-1", calendarId: "calendar-1" };
 const range = { calendarId: "calendar-1", startDate: "2026-09-28", endDate: "2026-10-06" };
 const recurrenceId = "2026-09-28T10:00:00.000Z";
+const writeCases = [
+  ["review create", "createEvent", createArgs],
+  ["direct create", "createEvent", { ...createArgs, skipReview: true }],
+  ["series update", "updateEvent", updateArgs],
+  ["occurrence update", "updateEvent", { ...updateArgs, recurrenceId }],
+];
 
 // Full provider records, deliberately outside the subset exposed by reminders.
 function unmanagedAlarms(runtime) {
@@ -75,12 +81,7 @@ describe("Production createEvent reminders", () => {
 });
 
 describe("Production reminder validation", () => {
-  for (const [label, name, args] of [
-    ["review create", "createEvent", createArgs],
-    ["direct create", "createEvent", { ...createArgs, skipReview: true }],
-    ["series update", "updateEvent", updateArgs],
-    ["occurrence update", "updateEvent", { ...updateArgs, recurrenceId }],
-  ]) {
+  for (const [label, name, args] of writeCases) {
     it(`rejects invalid reminder inputs before lookup or writes on ${label}`, async () => {
       const runtime = loadCalendarRuntime({ blockSkipReview: false });
       runtime.seedSeries();
@@ -344,4 +345,216 @@ describe("Production reminder listing and read failures", () => {
       assertNoWrites(runtime);
     });
   }
+});
+
+describe("Production calendar alarm capabilities", () => {
+  for (const [label, name, args] of writeCases) {
+    const updating = name === "updateEvent";
+
+    it(`accepts the normalized total at maxCount on ${label}, including retained unsupported actions`, async () => {
+      const limit = updating ? 3 : 2;
+      const runtime = loadCalendarRuntime({ blockSkipReview: false, alarmMaxCount: limit, alarmActions: ["DISPLAY"] });
+      const retained = runtime.makeAlarm({ action: "EMAIL" });
+      retained.setProperty("X-DEFAULT-ALARM", "TRUE");
+      if (updating) runtime.seedSeries({ alarms: [runtime.makeAlarm(), retained] });
+      const result = await runtime.invoke(name, { ...args, reminders: [60, 0, 60] });
+      assert.equal(result.success, true, result.error);
+      const item = runtime.calls.modifies[0]?.item || runtime.calls.adds[0] || runtime.calls.dialogs[0].calendarEvent;
+      assert.equal(item.getAlarms().length, limit);
+      assert.deepEqual(item.getAlarms().slice(updating ? 1 : 0).map(alarm => alarm.offset.inSeconds), [-3600, 0]);
+      if (updating) assert.deepEqual(item.getAlarms()[0], retained, "undeclared EMAIL actions must not be filtered");
+    });
+
+    it(`rejects an excess count before alarm replacement, organizer writes or persistence on ${label}`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false, alarmMaxCount: updating ? 2 : 1 });
+      if (updating) {
+        const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm(), runtime.makeAlarm({ action: "EMAIL" })] });
+        const original = args.recurrenceId ? occurrences[0] : master;
+        original.clearAlarms = () => assert.fail("capabilities must be checked before replacing alarms");
+      }
+      const result = await runtime.invoke(name, { ...args, reminders: [60, 0], attendees: [{ email: "invitee@example.com" }] });
+      assert.match(result.error, updating ? /at most 2 alarms; 1 retained alarms plus 2 requested/ : /at most 1 alarms; 0 retained alarms plus 2 requested/);
+      assertNoWrites(runtime);
+    });
+
+    it(`treats maxCount zero as zero and preserves omitted/null reminders on ${label}`, async () => {
+      for (const reminders of [undefined, null, [], [0]]) {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false, alarmMaxCount: 0, alarmActions: [] });
+        if (updating) runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+        const result = await runtime.invoke(name, {
+          ...args, title: "Zero limit", ...(reminders !== undefined ? { reminders } : {}),
+        });
+        if (reminders?.length) {
+          assert.match(result.error, /at most 0 alarms/);
+          assertNoWrites(runtime);
+        } else {
+          assert.equal(result.success, true, result.error);
+          const item = runtime.calls.modifies[0]?.item || runtime.calls.adds[0] || runtime.calls.dialogs[0].calendarEvent;
+          assert.equal(item.getAlarms().length, updating && reminders == null ? 1 : 0);
+        }
+      }
+    });
+
+    it(`ignores absent, non-integer and non-numeric maxCount declarations on ${label}`, async () => {
+      for (const alarmMaxCount of [undefined, null, "0", "1", false, true, -1, 1.5, NaN, Infinity]) {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false, alarmMaxCount });
+        if (updating) runtime.seedSeries({ alarms: [runtime.makeAlarm({ action: "EMAIL" })] });
+        const result = await runtime.invoke(name, { ...args, reminders: [60, 0] });
+        assert.equal(result.success, true, `${String(alarmMaxCount)}: ${result.error}`);
+      }
+    });
+
+    it(`refuses new DISPLAY alarms before side effects when undeclared on ${label}`, async () => {
+      for (const alarmActions of [[], ["EMAIL"], ["AUDIO"]]) {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false, alarmActions });
+        if (updating) {
+          const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+          (args.recurrenceId ? occurrences[0] : master).clearAlarms = () => assert.fail("action check must precede replacement");
+        }
+        const result = await runtime.invoke(name, {
+          ...args, reminders: [60], attendees: [{ email: "invitee@example.com" }],
+        });
+        assert.match(result.error, /does not support DISPLAY/);
+        assertNoWrites(runtime);
+      }
+    });
+
+    it(`skips capability reads for omitted/null reminders on ${label}`, async () => {
+      for (const reminders of [undefined, null]) {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false });
+        const getProperty = runtime.calendar.getProperty.bind(runtime.calendar);
+        runtime.calendar.getProperty = property => {
+          if (property.startsWith("capabilities.alarms.")) assert.fail("preserving reminders must not inspect capabilities");
+          return getProperty(property);
+        };
+        const alarms = unmanagedAlarms(runtime);
+        if (updating) runtime.seedSeries({ alarms });
+        const result = await runtime.invoke(name, {
+          ...args, title: "Unrelated edit", ...(reminders !== undefined ? { reminders } : {}),
+        });
+        assert.equal(result.success, true, result.error);
+        if (updating) assert.deepEqual(runtime.calls.modifies[0].item.getAlarms(), alarms);
+      }
+    });
+  }
+
+  for (const skipReview of [false, true]) {
+    for (const explicit of [false, true]) {
+      it(`checks the resolved ${explicit ? "explicit" : "default"} target before ${skipReview ? "direct creation" : "review"}`, async () => {
+        const runtime = loadCalendarRuntime({ blockSkipReview: false, disabled: true, alarmMaxCount: 0, alarmActions: [] });
+        const readOnly = loadCalendarRuntime({ alarmMaxCount: 0, alarmActions: [] });
+        readOnly.calendar.id = "read-only";
+        readOnly.calendar.readOnly = true;
+        const target = loadCalendarRuntime({ alarmMaxCount: 1, alarmActions: ["DISPLAY"] });
+        target.calendar.id = "target";
+        runtime.cal.manager.getCalendars = () => [runtime.calendar, readOnly.calendar, target.calendar];
+        const args = {
+          ...createArgs, calendarId: explicit ? target.calendar.id : undefined,
+          skipReview, attendees: [{ email: "invitee@example.com" }],
+        };
+        const rejected = await runtime.invoke("createEvent", { ...args, reminders: [60, 0] });
+        assert.match(rejected.error, /at most 1 alarms/);
+        for (const fixture of [runtime, readOnly, target]) assertNoWrites(fixture);
+        const accepted = await runtime.invoke("createEvent", { ...args, reminders: [60] });
+        assert.equal(accepted.success, true, accepted.error);
+        const item = skipReview ? target.calls.adds[0] : runtime.calls.dialogs[0].calendarEvent;
+        assert.equal(item.calendar, target.calendar);
+        assert.equal(item.getAlarms().length, 1);
+        assert.equal(target.calls.calendarProperties.length, 1, "organizer initialization follows successful capability checks");
+        assertNoWrites(readOnly);
+      });
+    }
+
+    it(`keeps create Send Safety ahead of capability checks (skipReview=${skipReview})`, async () => {
+      const runtime = loadCalendarRuntime({ alarmMaxCount: 0, alarmActions: [] });
+      const result = await runtime.invoke("createEvent", {
+        ...createArgs, skipReview, reminders: [60], attendees: [{ email: "invitee@example.com" }],
+      });
+      assert.match(result.error, /Block skipReview/);
+      assert.deepEqual(runtime.calls.reads, [], "the guard must precede even calendar resolution");
+      assertNoWrites(runtime);
+    });
+  }
+
+  for (const occurrence of [false, true]) {
+    const args = { ...updateArgs, ...(occurrence ? { recurrenceId } : {}) };
+    const label = occurrence ? "occurrence" : "series";
+
+    it(`counts every retained ${label} alarm and never drops them to meet maxCount`, async () => {
+      for (const reminders of [[], [60]]) {
+        const runtime = loadCalendarRuntime({ alarmMaxCount: 6 });
+        const retained = unmanagedAlarms(runtime);
+        const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm(), ...retained] });
+        const result = await runtime.invoke("updateEvent", { ...args, reminders });
+        assert.match(result.error, /at most 6 alarms; 7 retained alarms/);
+        assertNoWrites(runtime);
+        assert.deepEqual(master.getAlarms().slice(1), retained);
+        assert.deepEqual(occurrences[0].getAlarms().slice(1), retained);
+      }
+    });
+
+    it(`refuses clearing ${label} reminders when retained alarms exceed maxCount zero`, async () => {
+      const runtime = loadCalendarRuntime({ alarmMaxCount: 0, alarmActions: [] });
+      const retained = runtime.makeAlarm({ action: "EMAIL" });
+      runtime.seedSeries({ alarms: [runtime.makeAlarm(), retained] });
+      const result = await runtime.invoke("updateEvent", { ...args, reminders: [] });
+      assert.match(result.error, /at most 0 alarms; 1 retained alarms plus 0 requested/);
+      assertNoWrites(runtime);
+    });
+
+    it(`allows clearing ${label} managed alarms while keeping undeclared actions`, async () => {
+      const runtime = loadCalendarRuntime({ alarmMaxCount: 7, alarmActions: [] });
+      const retained = unmanagedAlarms(runtime);
+      runtime.seedSeries({ alarms: [runtime.makeAlarm(), ...retained] });
+      const getProperty = runtime.calendar.getProperty.bind(runtime.calendar);
+      runtime.calendar.getProperty = property => {
+        assert.notEqual(property, "capabilities.alarms.actionValues", "[] must not validate retained actions");
+        return getProperty(property);
+      };
+      const result = await runtime.invoke("updateEvent", { ...args, reminders: [] });
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(runtime.calls.modifies[0].item.getAlarms(), retained);
+    });
+
+    it(`keeps the ${label} Send Safety error ahead of capability failures`, async () => {
+      const runtime = loadCalendarRuntime({ alarmMaxCount: 0, alarmActions: [] });
+      runtime.seedSeries({ attendees: [{ id: "mailto:other@example.com" }] });
+      const getProperty = runtime.calendar.getProperty.bind(runtime.calendar);
+      let capabilityReads = 0;
+      runtime.calendar.getProperty = property => {
+        if (property.startsWith("capabilities.alarms.")) capabilityReads++;
+        return getProperty(property);
+      };
+      const result = await runtime.invoke("updateEvent", { ...args, reminders: [60] });
+      assert.match(result.error, /Block skipReview/);
+      assert.equal(capabilityReads, 0);
+      assertNoWrites(runtime);
+    });
+  }
+
+  it("uses a selected occurrence's own alarms for the count, including an explicit empty override", async () => {
+    for (const empty of [false, true]) {
+      const runtime = loadCalendarRuntime({ alarmMaxCount: empty ? 0 : 2 });
+      const { master, occurrences } = runtime.seedSeries({ alarms: unmanagedAlarms(runtime) });
+      occurrences[0].alarms = empty ? [] : [runtime.makeAlarm({ action: "EMAIL" })];
+      const result = await runtime.invoke("updateEvent", { ...updateArgs, recurrenceId, reminders: empty ? [] : [60] });
+      assert.equal(result.success, true, result.error);
+      const { item, previous } = runtime.calls.modifies[0];
+      assert.equal(previous, occurrences[0]);
+      assert.equal(item.getAlarms().length, empty ? 0 : 2);
+      assert.equal(master.getAlarms().length, 7);
+    }
+  });
+
+  it("does not count unchanged exceptions toward the series alarm limit", async () => {
+    const runtime = loadCalendarRuntime({ alarmMaxCount: 1 });
+    const { master, occurrences } = runtime.seedSeries({ alarms: [runtime.makeAlarm()] });
+    occurrences[1].alarms = unmanagedAlarms(runtime);
+    master.recurrenceInfo.exceptions.push(occurrences[1]);
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, reminders: [30] });
+    assert.equal(result.success, true, result.error);
+    const item = runtime.calls.modifies[0].item;
+    assert.equal(item.getAlarms().length, 1);
+    assert.deepEqual(item.recurrenceInfo.exceptions[0].getAlarms(), occurrences[1].getAlarms());
+  });
 });

@@ -340,7 +340,7 @@ function loadCalendarRuntime({
   allowAllCalendars = false, parser = "cal", parserFailure,
   identity = { email: "organizer@example.com", fullName: "Organizer" },
   identityKey = "identity-1", unreadableIdentity = false, resolvedIdentity, organizerId,
-  disabled = false,
+  disabled = false, alarmMaxCount, alarmActions,
 } = {}) {
   const prefValues = new Map();
   const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_BOOL: 128 };
@@ -358,7 +358,10 @@ function loadCalendarRuntime({
     },
     getIntPref(_name, fallback) { return fallback; },
   };
-  const calendarProperties = new Map([["imip.identity.key", identityKey], ["disabled", disabled]]);
+  const calendarProperties = new Map([
+    ["imip.identity.key", identityKey], ["disabled", disabled],
+    ["capabilities.alarms.maxCount", alarmMaxCount], ["capabilities.alarms.actionValues", alarmActions],
+  ]);
   if (resolvedIdentity !== undefined) calendarProperties.set("imip.identity", resolvedIdentity);
   if (organizerId !== undefined) calendarProperties.set("organizerId", organizerId);
   const calendar = {
