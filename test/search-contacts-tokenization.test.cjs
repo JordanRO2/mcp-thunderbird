@@ -152,6 +152,34 @@ describe("searchContacts lazy parsing and raw prefilter", () => {
     });
   }
 
+  for (const property of ["EMAIL", "item1.EMAIL;TYPE=work", "email;TYPE=\"home\""]) {
+    it("lets Thunderbird decode Google-escaped addresses in " + property, () => {
+      const address = '"a:b"@example.com';
+      const card = makeSearchCard({
+        emails: [...DEFAULT_EMAILS.slice(0, 2), address],
+        // ICAL removes one escaping layer, then Google decoding removes the
+        // remaining colon escape. The prefilter must not implement a decoder.
+        raw: "BEGIN:VCARD\r\n" + property + ":" + String.raw`"a\\:b"@example.com` + "\r\nEND:VCARD\r\n",
+      });
+      const runtime = runtimeForCards([card]);
+      assert.equal(runtime.getContact(CONTACT_ID).emails[2].address, address);
+      assert.equal(runtime.searchContacts("Viliam " + address)[0]?.id, CONTACT_ID);
+      assert.equal(card.stats.emailReads, 1, "the native address list verifies the decoded match");
+      assert.equal(runtime.searchContacts('"not-the-address"@example.com').length, 0);
+      assert.equal(card.stats.emailReads, 2, "conservative candidates still require a parsed match");
+    });
+  }
+
+  it("does not parse plain emails because another property has quotes or backslashes", () => {
+    const card = makeSearchCard({ raw: [
+      "BEGIN:VCARD", "EMAIL:plain@example.com", String.raw`NOTE:Contains "quotes" and a \\ backslash`,
+      String.raw`NOTE:EMAIL:"a\\:b"@example.com`, "END:VCARD", "",
+    ].join("\r\n") });
+    assert.equal(runtimeForCards([card]).searchContacts('"absent"@example.net').length, 0);
+    assert.equal(card.stats.parses, 0);
+    assert.equal(card.stats.emailReads, 0);
+  });
+
   it("does not search notes, photos or other vCard properties as addresses", () => {
     const card = makeSearchCard({ raw: "BEGIN:VCARD\r\nNOTE:unrelated-token\r\nEND:VCARD\r\n" });
     assert.equal(runtimeForCards([card]).searchContacts("unrelated-token").length, 0);

@@ -247,6 +247,7 @@ const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_EMAIL_TYPES = ["work", "home"];
 const CONTACT_EMAIL_CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f]/;
 const CONTACT_VCARD_PROPERTY = "_vCard";
+const CONTACT_ESCAPED_EMAIL_LINE = /^(?:[^:;\r\n]+\.)?email[;:][^\r\n]*[\\"]/m;
 const CONTACT_CACHED_FIELDS = {
   displayName: "DisplayName",
   firstName: "FirstName",
@@ -6309,13 +6310,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // whose raw vCard cannot contain the remaining tokens.
                       const raw = getContactCardProperty(card, CONTACT_VCARD_PROPERTY)
                         .replace(/\r?\n[ \t]/g, "").toLowerCase();
-                      if (!unmatched.every(token => raw.includes(token))) {
-                        // EMAIL text may escape punctuation or backslashes.
-                        // This only admits candidates; parsed addresses below
-                        // still decide the match, never other vCard fields.
-                        const unescaped = raw.replace(/\\([\\,;:])/g, "$1");
-                        if (!unmatched.every(token => raw.includes(token) || unescaped.includes(token))) continue;
-                      }
+                      // Quoted/escaped EMAIL lines can have additional Google
+                      // decoding after ICAL parsing. Admit them conservatively
+                      // instead of trying to duplicate Thunderbird's decoder.
+                      if (!unmatched.every(token => raw.includes(token)) &&
+                          !CONTACT_ESCAPED_EMAIL_LINE.test(raw)) continue;
                       const emails = getContactEmailAddresses(card)
                         .map(address => address.toLowerCase());
                       if (!unmatched.every(token => emails.some(address => address.includes(token)))) continue;
