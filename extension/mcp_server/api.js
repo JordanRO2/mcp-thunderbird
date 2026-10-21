@@ -3343,7 +3343,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteVirtualFolder",
         group: "folders", crud: "delete",
         title: "Delete Saved Search",
-        description: "Delete a virtual folder (saved search). Only the view is removed -- no messages are deleted. Refuses real folders, views with subfolders, stored message headers or nonempty backing storage, and unreadable or unexpected storage; use deleteFolder for real folders.",
+        description: "Remove a saved-search view without deleting messages. Refuses real folders, subfolders, own message headers, regular backing files, shared, linked, nonempty or unreadable storage. Detaches once, then cleans inspected storage nonrecursively. Partial results list retained storage and persistence status; do not retry deletion after viewRemoved is true.",
         inputSchema: {
           type: "object",
           properties: {
@@ -13090,6 +13090,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const SAVED_SEARCH_DATABASE_SERVICE = "@mozilla.org/msgDatabase/msgDBService;1";
             const SAVED_SEARCH_CREATE_STORAGE_ERROR = "Existing or unexpected folder storage; saved search not configured";
             const SAVED_SEARCH_STORAGE_ERROR = "Cannot delete a saved search with nonempty, unreadable or unexpected storage";
+            const SAVED_SEARCH_OWNERSHIP_ERROR = "Cannot verify exclusive saved-search storage";
+            const SAVED_SEARCH_DEFINITION_FILE = "virtualFolders.dat";
+            const SAVED_SEARCH_DEFINITION_MAX_BYTES = 1024 * 1024;
             const SAVED_SEARCH_MBOX_STORE = "mbox";
             const SAVED_SEARCH_MAILDIR_STORE = "maildir";
             // nsMsgMaildirStore uses cur and tmp; Thunderbird does not use new.
@@ -13144,26 +13147,121 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { directory, names, files };
             }
 
-            function assertReadableSavedSearchStorage(file) {
-              if (file.isReadable() !== true || file.isSymlink() !== false) {
-                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+            function savedSearchStorageKey(path) {
+              if (typeof path !== "string" || !path) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const key = path.replace(/\\/g, "/").normalize().toLowerCase();
+              if (key.split("/").some(part => part === "." || part === "..")) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              return key.replace(/\/+$/, "");
+            }
+
+            function sameSavedSearchStorage(first, second) {
+              return first.equals(second) || savedSearchStorageKey(first.path) === savedSearchStorageKey(second.path);
+            }
+
+            function containsSavedSearchStorage(container, file) {
+              const seen = new Set();
+              for (let ancestor = file.parent; ancestor; ancestor = ancestor.parent) {
+                const key = savedSearchStorageKey(ancestor.path);
+                if (seen.has(key)) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                seen.add(key);
+                if (sameSavedSearchStorage(container, ancestor)) return true;
               }
-              // As in attachment validation, Windows isSymlink misses junctions.
-              // Resolve each existing component before comparing its target.
-              if (Services.appinfo?.OS === "WINNT") {
-                for (let component = file.clone(); component; component = component.parent) {
-                  if (component.isReadable() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
-                  const target = component.target;
-                  if (!target || target.replace(/\\/g, "/").toLowerCase() !==
-                      component.path.replace(/\\/g, "/").toLowerCase()) {
-                    throw new Error(SAVED_SEARCH_STORAGE_ERROR);
-                  }
+              return false;
+            }
+
+            function savedSearchStoragePaths(folder) {
+              const backing = folder.filePath.clone();
+              if (folder.isServer === true) return [backing];
+              if (folder.isServer !== false) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const children = backing.clone();
+              children.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+              return [backing, folder.summaryFile.clone(), children];
+            }
+
+            function assertReadableSavedSearchStorage(file, root) {
+              // Check every component down to the account's configured storage
+              // root. An immediate-parent check misses deeper POSIX symlinks.
+              const seen = new Set();
+              let leaf = true;
+              for (let component = file.clone(); component; component = component.parent) {
+                const key = savedSearchStorageKey(component.path);
+                if (seen.has(key) || component.isReadable() !== true || component.isSymlink() !== false ||
+                    (!leaf && component.isDirectory() !== true)) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                seen.add(key);
+                // Windows isSymlink misses junctions; isReadable forces native
+                // resolution before reading target, as in attachment validation.
+                if (Services.appinfo?.OS === "WINNT" &&
+                    savedSearchStorageKey(component.target) !== key) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                // Case-folding is conservative for collision refusals, but
+                // cannot prove positive identity on a case-sensitive volume.
+                if (root && component.equals(root)) return;
+                leaf = false;
+              }
+              if (root) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+            }
+
+            function assertExclusiveSavedSearchStorage(folder) {
+              try {
+                const paths = savedSearchStoragePaths(folder);
+                if (paths.some((path, index) => paths.slice(index + 1).some(other => sameSavedSearchStorage(path, other)))) {
+                  throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
                 }
+                const root = folder.server.localPath.clone();
+                if (!root.equals(folder.server.rootFolder.filePath) || root.isDirectory() !== true) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                const directory = folder.parent.filePath.clone();
+                if (!folder.parent.isServer) directory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+                if (paths.some(file => !file.parent.equals(directory)) ||
+                    paths[1].leafName !== paths[0].leafName + SAVED_SEARCH_SUMMARY_SUFFIX) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                assertReadableSavedSearchStorage(directory, root);
+
+                // Public accounts/allServers/allFolders omit hidden servers.
+                // Include registered preference keys without applying access
+                // filters; never return another folder's name/path in a refusal.
+                const manager = MailServices.accounts;
+                const servers = new Set(manager.allServers);
+                for (const account of manager.accounts) servers.add(account.incomingServer);
+                for (const key of Services.prefs.getCharPref("mail.accountmanager.accounts", "").split(",").filter(Boolean)) {
+                  servers.add(manager.getAccount(key.trim()).incomingServer);
+                }
+                const serverKeys = new Set();
+                for (const pref of Services.prefs.getChildList("mail.server.")) {
+                  const match = /^mail\.server\.([^.]+)\./.exec(pref);
+                  if (!match) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                  if (match[1] !== "default") serverKeys.add(match[1]);
+                }
+                for (const key of serverKeys) servers.add(manager.getIncomingServer(key));
+                const pending = [...manager.allFolders];
+                for (const server of servers) pending.push(server.rootFolder);
+                const visited = new Set();
+                while (pending.length) {
+                  const other = pending.pop();
+                  if (visited.has(other)) continue;
+                  visited.add(other);
+                  pending.push(...other.subFolders);
+                  if (other === folder) continue;
+                  const otherPaths = savedSearchStoragePaths(other);
+                  // POSIX equals does not resolve symlinks. A different account
+                  // can alias this storage through any of its ancestors too.
+                  for (const path of otherPaths) {
+                    visitSavedSearchStorageDirectory(path.parent, entry => {
+                      if (sameSavedSearchStorage(path, entry)) assertReadableSavedSearchStorage(entry);
+                    });
+                  }
+                  const ownsNestedStorage = other.isServer
+                    ? other.server !== folder.server
+                    : other.msgStore.storeType === SAVED_SEARCH_MAILDIR_STORE;
+                  if (paths.some(path => otherPaths.some(otherPath => sameSavedSearchStorage(path, otherPath) || containsSavedSearchStorage(path, otherPath))) ||
+                      (ownsNestedStorage && paths.some(path => containsSavedSearchStorage(otherPaths[0], path)))) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                }
+                if (!visited.has(folder)) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                return root;
+              } catch {
+                throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
               }
             }
 
-            function visitSavedSearchStorageDirectory(directory, visit) {
-              assertReadableSavedSearchStorage(directory);
+            function visitSavedSearchStorageDirectory(directory, visit, root) {
+              assertReadableSavedSearchStorage(directory, root);
               if (directory.isDirectory() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
               const entries = directory.directoryEntries;
               try {
@@ -13173,46 +13271,110 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function assertEmptySavedSearchStorage(folder) {
+            function inspectSavedSearchStorage(folder, root) {
               const storeType = folder.msgStore.storeType;
               if (storeType !== SAVED_SEARCH_MBOX_STORE && storeType !== SAVED_SEARCH_MAILDIR_STORE) {
                 throw new Error(SAVED_SEARCH_STORAGE_ERROR);
               }
-              const file = folder.filePath;
+              const paths = savedSearchStoragePaths(folder);
+              const [file] = paths;
               if (!file || typeof file.leafName !== "string" || !file.leafName) {
                 throw new Error(SAVED_SEARCH_STORAGE_ERROR);
               }
-              const childDirectory = file.clone();
-              childDirectory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
-              const paths = [file, childDirectory];
-              const found = [null, null];
+              const found = paths.map(() => null);
+              const items = [];
               // exists() can report false on access errors. Establish absence
               // through a successful parent-directory scan, not a false exists.
               visitSavedSearchStorageDirectory(file.parent, entry => {
                 for (let i = 0; i < paths.length; i++) {
                   if (paths[i].equals(entry) || paths[i].leafName.normalize().toLowerCase() ===
                       entry.leafName.normalize().toLowerCase()) {
-                    if (found[i]) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
-                    found[i] = entry;
+                    // Normalization detects ambiguity; only native equality can
+                    // authorize deleting an actual directory entry.
+                    if (found[i] || !paths[i].equals(entry)) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                    found[i] = entry.clone();
                   }
                 }
-              });
+              }, root);
               const refuseEntry = () => { throw new Error(SAVED_SEARCH_STORAGE_ERROR); };
-              const [backing, children] = found;
+              const [backing, summary, children] = found;
               if (backing) {
-                assertReadableSavedSearchStorage(backing);
+                assertReadableSavedSearchStorage(backing, root);
                 if (storeType === SAVED_SEARCH_MBOX_STORE) {
-                  if (backing.isFile() !== true || backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  if (backing.isFile() === true) {
+                    // remove(false) still unlinks a file that gained mail after
+                    // inspection. Refuse even zero-byte regular backing files.
+                    throw new Error("Cannot safely delete a saved search with a regular backing file");
+                  } else {
+                    // nsMsgBrkMBoxStore::DiscoverSubFolders (TB 128/140/153/158)
+                    // creates an empty backing directory beside a saved search's
+                    // .msf. Accept that native placeholder only with no entries,
+                    // including no empty subdirectories.
+                    visitSavedSearchStorageDirectory(backing, refuseEntry, root);
+                  }
                 } else {
                   visitSavedSearchStorageDirectory(backing, entry => {
                     if (!SAVED_SEARCH_MAILDIR_DIRECTORIES.has(entry.leafName)) {
                       throw new Error(SAVED_SEARCH_STORAGE_ERROR);
                     }
-                    visitSavedSearchStorageDirectory(entry, refuseEntry);
-                  });
+                    visitSavedSearchStorageDirectory(entry, refuseEntry, root);
+                    items.push({ file: entry.clone(), directory: true });
+                  }, root);
                 }
+                items.push({ file: backing, directory: true });
               }
-              if (children) visitSavedSearchStorageDirectory(children, refuseEntry);
+              if (children) {
+                visitSavedSearchStorageDirectory(children, refuseEntry, root);
+                items.push({ file: children, directory: true });
+              }
+              if (summary) {
+                assertReadableSavedSearchStorage(summary, root);
+                if (summary.isFile() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                items.push({ file: summary, directory: false });
+              }
+              return { paths, items };
+            }
+
+            function remainingSavedSearchStorage(paths, root) {
+              const remaining = new Set();
+              visitSavedSearchStorageDirectory(paths[0].parent, entry => {
+                if (paths.some(path => sameSavedSearchStorage(path, entry))) remaining.add(entry.path);
+              }, root);
+              return [...remaining];
+            }
+
+            function verifySavedSearchPersistence(uri) {
+              // loadVirtualFolders can turn a real folder into a view from a
+              // stale URI, so never call it here. SaveVirtualFolders silently
+              // does nothing before loading: verify the saved file instead.
+              const profile = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
+              let definition;
+              visitSavedSearchStorageDirectory(profile, entry => {
+                if (entry.leafName.normalize().toLowerCase() === SAVED_SEARCH_DEFINITION_FILE.toLowerCase()) {
+                  if (definition || entry.leafName !== SAVED_SEARCH_DEFINITION_FILE) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  definition = entry.clone();
+                }
+              });
+              if (!definition) return true;
+              assertReadableSavedSearchStorage(definition, profile);
+              if (definition.isFile() !== true || !Number.isSafeInteger(definition.fileSize) ||
+                  definition.fileSize < 0 || definition.fileSize > SAVED_SEARCH_DEFINITION_MAX_BYTES) {
+                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              }
+              const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+              let text;
+              try {
+                stream.init(definition, 0x01, 0, 0);
+                const raw = readMessageStreamFully(stream, SAVED_SEARCH_DEFINITION_MAX_BYTES);
+                text = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(raw, byte => byte.charCodeAt(0)));
+              } finally {
+                stream.close();
+              }
+              const lines = text.split(/\r?\n/);
+              if (lines[0] !== "version=1") throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const key = decodeURIComponent(uri).normalize().toLowerCase();
+              return !lines.some(line => line.startsWith("uri=") &&
+                decodeURIComponent(line.slice(4)).normalize().toLowerCase() === key);
             }
 
             function getVirtualFolderHelper() {
@@ -13489,53 +13651,147 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (typeof folderPath !== "string" || !folderPath) {
                   return { error: "folderPath must be a non-empty string" };
                 }
+                if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+                  return { error: "Saved-search deletion is not supported with Panorama enabled" };
+                }
                 const r = getAccessibleFolder(folderPath);
                 if (r.error) return r;
                 const folder = r.folder;
-                if (!isVisibleFolder(folder)) return { error: SAVED_SEARCH_ACCESS_ERROR };
+                // GetFlags may open/rebuild the summary. Read only the in-memory
+                // Virtual bit until storage ownership and links are inspected.
+                if (folder.server.hidden !== false || typeof folder.URI !== "string" || !folder.URI) {
+                  return { error: SAVED_SEARCH_ACCESS_ERROR };
+                }
 
                 // Guard: deleting a real folder here would destroy mail, whereas
                 // deleting a saved search only removes a view.
-                if (!isVirtualFolder(folder)) {
+                if (folder.getFlag(VIRTUAL_FOLDER_FLAG) !== true) {
                   return { error: "Not a saved search (virtual folder). Use deleteFolder for real folders." };
                 }
                 const parent = folder.parent;
                 if (!parent) return { error: "Saved search has no parent folder" };
-                if (!isVisibleFolder(parent) || parent.server !== folder.server || ![...parent.subFolders].includes(folder)) {
+                if (parent.server !== folder.server || !isFolderAccessible(parent) || ![...parent.subFolders].includes(folder)) {
                   return { error: "Could not verify saved-search parent" };
                 }
                 if (folder.hasSubFolders !== false || [...folder.subFolders].length !== 0) {
                   return { error: "Cannot delete a saved search with subfolders or unreadable child state" };
                 }
 
+                const storageRoot = assertExclusiveSavedSearchStorage(folder);
+                // Inspect before opening a summary: even committing a linked or
+                // aliased summary could modify storage this view does not own.
+                const plan = inspectSavedSearchStorage(folder, storageRoot);
+
                 // Counts describe search hits, not the folder's own storage. A
                 // genuine view may have positive counts but must have no headers.
+                const dbService = Cc[SAVED_SEARCH_DATABASE_SERVICE].getService(Ci.nsIMsgDBService);
                 let db;
                 try {
                   // The folder getter may rebuild a missing/unreadable summary,
                   // concealing stored mail behind a new empty DB. Open the existing
                   // summary without recovery (leaveInvalidDB=true) instead.
                   // nsIMsgDatabase.idl: nsIMsgDBService.openFolderDB, TB 128+.
-                  db = Cc[SAVED_SEARCH_DATABASE_SERVICE]
-                    .getService(Ci.nsIMsgDBService).openFolderDB(folder, true);
+                  db = dbService.openFolderDB(folder, true);
                   if (!db || db.summaryValid !== true) throw new Error("Could not inspect a valid saved-search database");
                   for (const _header of db.enumerateMessages()) {
                     throw new Error("Cannot delete a saved search containing message headers of its own");
                   }
                 } finally {
-                  try { if (db) db.close(true); }
-                  finally { folder.msgDatabase = null; }
+                  // Close(true) only commits Mork; ForceClosed releases its
+                  // tables/store even when other native references still exist.
+                  try { if (db) db.forceClosed(); }
+                  finally { db = null; folder.msgDatabase = null; }
                 }
 
                 const label = folder.prettyName || folder.name;
+                const uri = folder.URI;
                 // nsMailDatabase::GetSummaryValid bypasses store validation for
                 // Virtual folders. An empty DB alone cannot prove storage empty:
-                // native deletion also removes the backing store and .sbd tree.
-                assertEmptySavedSearchStorage(folder);
-                // Two arguments on every supported version. Never retry a delete
-                // after an exception: native work may already be partly complete.
-                parent.propagateDelete(folder, true);
-                return { success: true, message: `Saved search "${label}" deleted` };
+                // storage is checked separately and retained until after detach.
+                if (folder.hasSubFolders !== false || [...folder.subFolders].length !== 0 ||
+                    folder.parent !== parent || ![...parent.subFolders].includes(folder) || folder.getFlag(VIRTUAL_FOLDER_FLAG) !== true) {
+                  return { error: "Saved-search hierarchy changed during inspection" };
+                }
+
+                // TB 128/140/153/158: nsMsgDBFolder::PropagateDelete(false) removes
+                // the child/cache entry and calls NotifyFolderRemoved, without
+                // DeleteStorage. Keep Virtual set: nsMsgAccountManager's listener
+                // removes VF listeners/registration and saves virtualFolders.dat.
+                // 128/140/153 also clear flags, potentially reopening the summary.
+                // Pinned source citations are in this change's commit message.
+                let detachFailed = false;
+                try { parent.propagateDelete(folder, false); }
+                catch { detachFailed = true; } // Exactly one call, even on failure.
+
+                let viewRemoved = null;
+                try { viewRemoved = folder.parent === null && ![...parent.subFolders].includes(folder); }
+                catch { /* Preserve storage if the native outcome is unreadable. */ }
+                let persisted = false;
+                if (viewRemoved) {
+                  try {
+                    // Native observer errors are swallowed. Save explicitly and
+                    // verify persistence before removing inspected paths.
+                    MailServices.accounts.saveVirtualFolders();
+                    persisted = verifySavedSearchPersistence(uri);
+                  } catch { /* Report a partial result and preserve all storage. */ }
+                }
+
+                let releaseFailed = false;
+                let reopened;
+                try {
+                  try {
+                    reopened = dbService.cachedDBForFilePath(plan.paths[0]);
+                    if (reopened) reopened.forceClosed();
+                  } finally {
+                    reopened = null;
+                    folder.msgDatabase = null;
+                  }
+                } catch { releaseFailed = true; }
+
+                if (viewRemoved === null) {
+                  return {
+                    error: "Could not confirm saved-search detach; storage retained. Inspect the folder pane before retrying.",
+                    partial: true, viewRemoved: null, persisted: false, cleanupComplete: false,
+                    leftoverStorage: plan.paths.map(file => file.path),
+                  };
+                }
+                if (!viewRemoved) {
+                  return { error: "Native saved-search detach failed; storage retained" };
+                }
+
+                let cleanupFailed = detachFailed || releaseFailed || !persisted;
+                if (!cleanupFailed) {
+                  for (const item of plan.items) {
+                    try {
+                      assertReadableSavedSearchStorage(item.file, storageRoot);
+                      if (item.directory ? item.file.isDirectory() !== true : item.file.isFile() !== true) {
+                        throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                      }
+                      // Never recursively remove storage or enumerate new items
+                      // into the plan. A directory that gained a message/child
+                      // must fail removal, preserving that content.
+                      item.file.remove(false);
+                    } catch { cleanupFailed = true; }
+                  }
+                }
+                let leftoverStorage;
+                try { leftoverStorage = remainingSavedSearchStorage(plan.paths, storageRoot); }
+                catch {
+                  cleanupFailed = true;
+                  leftoverStorage = plan.paths.map(file => file.path);
+                }
+                const partial = cleanupFailed || leftoverStorage.length !== 0;
+                const result = {
+                  success: true, viewRemoved: true, persisted,
+                  cleanupComplete: !partial, partial, leftoverStorage,
+                  message: `Saved search "${label}" removed`,
+                };
+                if (partial) {
+                  result.warning = persisted
+                    ? "View removed and its definition saved, but storage cleanup was incomplete. Retained storage may reappear as a folder after restart. Review leftoverStorage; do not retry deletion."
+                    : "View removed, but persistence failed and storage was retained. It may reappear after restart. Review leftoverStorage; do not retry deletion.";
+                }
+                return result;
               } catch (e) {
                 return { error: e.toString() };
               }
