@@ -6518,6 +6518,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             async function refreshCalendar(calendarId, timeoutMs) {
               if (!cal) return { error: "Calendar not available" };
               try {
+                if (Services.io.offline) return { success: false, status: "error", error: REFRESH_OFFLINE_ERROR };
                 const timeout = clampRefreshTimeout(timeoutMs);
                 const calendars = getEnabledCalendars(calendarId);
                 if (calendarId) {
