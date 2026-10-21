@@ -2,103 +2,25 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
+const {
+  loadContactRuntime, FakeVCardPropertyEntry, FakeVCardProperties, FakeFlatCard, FakeAddrBookCard, FakeAddressBook,
+} = require("./helpers/contact-runtime.cjs");
 
-function loadContactFieldHelpers() {
-  const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
-  const source = fs.readFileSync(apiPath, "utf8");
-  const startMarker = "// BEGIN CONTACT FIELD HELPERS";
-  const endMarker = "// END CONTACT FIELD HELPERS";
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker);
-  assert.ok(start >= 0, "contact field helper start marker missing");
-  assert.ok(end > start, "contact field helper end marker missing");
-
-  const snippet = source.slice(start, end);
-  const sandbox = {};
-  vm.createContext(sandbox);
-  vm.runInContext(
-    `${snippet}
-this.contactFieldHelpers = {
-  normalizeContactBirthday,
-  contactBirthdayToVCard,
-  contactBirthdayToFlatParts,
-  validateContactFields,
-  readContactFields,
-  formatContact,
-  applyContactFields,
-  shouldSynthesizePhoneDisplayName,
-};`,
-    sandbox
-  );
-  return sandbox.contactFieldHelpers;
-}
-
-const helpers = loadContactFieldHelpers();
+const helpers = loadContactRuntime();
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-class FakeVCardPropertyEntry {
-  constructor(name, params, type, value) {
-    this.name = name;
-    this.params = params;
-    this.type = type;
-    this.value = value;
-  }
-}
-
-class FakeVCardProperties {
-  constructor(entries = []) {
-    this.entries = entries;
-  }
-
-  getAllEntries(name) {
-    return this.entries.filter(entry => entry.name === name);
-  }
-
-  getFirstEntry(name) {
-    return this.getAllEntries(name)[0] || null;
-  }
-
-  getFirstValue(name) {
-    return this.getFirstEntry(name)?.value ?? null;
-  }
-
-  addEntry(entry) {
-    this.entries.push(entry);
-  }
-
-  removeEntry(entry) {
-    const index = this.entries.indexOf(entry);
-    if (index >= 0) this.entries.splice(index, 1);
-  }
-
-  clearValues(name) {
-    this.entries = this.entries.filter(entry => entry.name !== name);
-  }
-}
-
 function makeFlatCard(properties = {}) {
-  const stored = new Map(Object.entries(properties));
-  return {
+  return new FakeFlatCard({
     UID: "flat-uid",
-    supportsVCard: false,
-    displayName: "Flat Contact",
-    primaryEmail: "flat@example.com",
-    firstName: "Flat",
-    lastName: "Contact",
-    getProperty(name, fallback = "") {
-      return stored.has(name) ? stored.get(name) : fallback;
-    },
-    setProperty(name, value) {
-      stored.set(name, value);
-    },
-    stored,
-  };
+    DisplayName: "Flat Contact",
+    PrimaryEmail: "flat@example.com",
+    FirstName: "Flat",
+    LastName: "Contact",
+    ...properties,
+  });
 }
 
 describe("contact birthday normalization", () => {
@@ -187,6 +109,8 @@ describe("contact handler payload validation", () => {
 describe("contact field reads", () => {
   it("formats vCard-backed cards with the full contact shape", () => {
     const vCardProperties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("email", { type: "WORK" }, "text", "ada.work@example.com"),
+      new FakeVCardPropertyEntry("email", { pref: "1" }, "text", "ada@example.com"),
       new FakeVCardPropertyEntry("tel", { type: "WORK" }, "text", "+48 111"),
       new FakeVCardPropertyEntry("tel", { type: ["voice", "cell"] }, "uri", "tel:+48 222"),
       new FakeVCardPropertyEntry(
@@ -217,6 +141,10 @@ describe("contact field reads", () => {
       id: "vcard-uid",
       displayName: "Ada Example",
       email: "ada@example.com",
+      emails: [
+        { address: "ada@example.com" },
+        { type: "work", address: "ada.work@example.com" },
+      ],
       firstName: "Ada",
       lastName: "Example",
       phones: [
@@ -244,6 +172,7 @@ describe("contact field reads", () => {
 
   it("reads the same fields from legacy flat cards", () => {
     const card = makeFlatCard({
+      SecondEmail: "flat.second@example.com",
       HomePhone: "555-0100",
       CellularNumber: "555-0101",
       WorkAddress: "1 Main St",
@@ -257,6 +186,10 @@ describe("contact field reads", () => {
       BirthDay: "5",
     });
     const details = plain(helpers.readContactFields(card));
+    assert.deepEqual(details.emails, [
+      { address: "flat@example.com" },
+      { address: "flat.second@example.com" },
+    ]);
     assert.deepEqual(details.phones, [
       { type: "home", number: "555-0100" },
       { type: "mobile", number: "555-0101" },
@@ -343,7 +276,7 @@ describe("contact field writes", () => {
       "uri",
       "tel:+48 100"
     );
-    changedPhone.group = "item1";
+    changedPhone.params.group = "item1";
     const exactPhoneParams = { type: ["WORK", "VOICE"], pref: "2" };
     const exactPhone = new FakeVCardPropertyEntry(
       "tel",
@@ -351,7 +284,7 @@ describe("contact field writes", () => {
       "text",
       "+48 200"
     );
-    exactPhone.group = "item2";
+    exactPhone.params.group = "item2";
     const omittedPhone = new FakeVCardPropertyEntry(
       "tel",
       { type: "home", pref: "3" },
@@ -366,7 +299,7 @@ describe("contact field writes", () => {
       "text",
       ["", "", "Old Street", "Old City", "", "", ""]
     );
-    changedAddress.group = "item3";
+    changedAddress.params.group = "item3";
     const exactAddressParams = { type: ["WORK", "postal"], pref: "2" };
     const exactAddressValue = ["", "", ["Exact Street", "Suite 5"], "Warsaw", "", "", "Poland"];
     const exactAddress = new FakeVCardPropertyEntry(
@@ -375,7 +308,7 @@ describe("contact field writes", () => {
       "text",
       exactAddressValue
     );
-    exactAddress.group = "item4";
+    exactAddress.params.group = "item4";
     const omittedAddress = new FakeVCardPropertyEntry(
       "adr",
       { type: "home" },
@@ -407,19 +340,19 @@ describe("contact field writes", () => {
     assert.equal(changedPhone.value, "tel:+48 400");
     assert.equal(changedPhone.type, "uri");
     assert.strictEqual(changedPhone.params, changedPhoneParams);
-    assert.equal(changedPhone.group, "item1");
+    assert.equal(changedPhone.params.group, "item1");
     assert.equal(exactPhone.value, "+48 200");
     assert.strictEqual(exactPhone.params, exactPhoneParams);
-    assert.equal(exactPhone.group, "item2");
+    assert.equal(exactPhone.params.group, "item2");
     assert.ok(!vCardProperties.entries.includes(omittedPhone));
 
     assert.deepEqual(vCardProperties.getAllEntries("adr"), [changedAddress, exactAddress]);
     assert.deepEqual(plain(changedAddress.value), ["", "", "New Street", "Krakow", "", "", ""]);
     assert.strictEqual(changedAddress.params, changedAddressParams);
-    assert.equal(changedAddress.group, "item3");
+    assert.equal(changedAddress.params.group, "item3");
     assert.strictEqual(exactAddress.value, exactAddressValue);
     assert.strictEqual(exactAddress.params, exactAddressParams);
-    assert.equal(exactAddress.group, "item4");
+    assert.equal(exactAddress.params.group, "item4");
     assert.ok(!vCardProperties.entries.includes(omittedAddress));
   });
 
@@ -543,11 +476,349 @@ describe("contact field writes", () => {
   });
 });
 
+describe("contact email addresses", () => {
+  it("deep-validates email collections", () => {
+    assert.equal(helpers.validateContactFields({
+      emails: [{ address: "ada@example.com" }, { type: "home", address: "ada@home.example" }],
+    }), null);
+    assert.match(helpers.validateContactFields({ emails: "ada@example.com" }), /emails must be an array/);
+    assert.match(helpers.validateContactFields({ emails: ["ada@example.com"] }), /emails\[0\] must be an object/);
+    assert.match(
+      helpers.validateContactFields({ emails: [{ address: "ada@example.com", label: "x" }] }),
+      /Unknown emails\[0\] property: label/
+    );
+    assert.match(
+      helpers.validateContactFields({ emails: [{ type: "other", address: "ada@example.com" }] }),
+      /emails\[0\]\.type must be one of: work, home/
+    );
+    assert.match(
+      helpers.validateContactFields({ emails: [{ address: " " }] }),
+      /emails\[0\]\.address must be a non-empty string/
+    );
+    assert.match(
+      helpers.validateContactFields({
+        emails: [{ address: "ada@example.com" }, { type: "work", address: " ADA@example.com " }],
+      }),
+      /emails\[1\]\.address repeats an earlier address/
+    );
+  });
+
+  it("accepts email alongside emails only when it restates the primary address", () => {
+    const emails = [{ address: "ada@example.com" }, { address: "ada@home.example" }];
+    assert.equal(helpers.validateContactFields({ email: "ada@example.com", emails }), null);
+    assert.match(
+      helpers.validateContactFields({ email: "ada@home.example", emails }),
+      /email must equal emails\[0\]\.address/
+    );
+    assert.equal(helpers.validateContactFields({ email: "", emails: [] }), null);
+    assert.match(
+      helpers.validateContactFields({ email: "ada@example.com", emails: [] }),
+      /email must equal emails\[0\]\.address/
+    );
+  });
+
+  it("counts an email collection as contact content", () => {
+    assert.equal(helpers.validateContactFields({ emails: [{ address: "ada@example.com" }] }, true), null);
+    assert.match(helpers.validateContactFields({ emails: [] }, true), /non-empty contact field/);
+  });
+
+  it("lists addresses in Thunderbird's order of preference", () => {
+    const vCardProperties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("email", {}, "text", "first-unranked@example.com"),
+      new FakeVCardPropertyEntry("email", { pref: "1" }, "text", "primary@example.com"),
+      new FakeVCardPropertyEntry("email", { type: ["internet", "HOME"] }, "text", "home@example.com"),
+      new FakeVCardPropertyEntry("email", { pref: "2" }, "text", "second@example.com"),
+      new FakeVCardPropertyEntry("email", {}, "text", " "),
+    ]);
+    const details = plain(helpers.readContactFields({ supportsVCard: true, vCardProperties }));
+    assert.deepEqual(details.emails, [
+      { address: "primary@example.com" },
+      { address: "second@example.com" },
+      { address: "first-unranked@example.com" },
+      { type: "home", address: "home@example.com" },
+    ]);
+  });
+
+  for (const pref of ["0", "2junk", "invalid"]) {
+    it(`uses native ordering even for PREF=${pref}`, () => {
+      const first = new FakeVCardPropertyEntry("email", { pref }, "text", "native-first@example.com");
+      const second = new FakeVCardPropertyEntry("email", { pref: "1" }, "text", "second@example.com");
+      const card = new FakeAddrBookCard({}, new FakeVCardProperties([first, second]));
+      const details = helpers.readContactFields(card);
+      assert.equal(details.email, "native-first@example.com");
+      assert.deepEqual(plain(details.emails), [
+        { address: "native-first@example.com" }, { address: "second@example.com" },
+      ]);
+    });
+  }
+
+  for (const primary of ["", " primary@example.com "]) {
+    it(`preserves the native primary ${JSON.stringify(primary)} when formatting trims or omits it`, () => {
+      const first = new FakeVCardPropertyEntry("email", { pref: "1" }, "text", primary);
+      const second = new FakeVCardPropertyEntry("email", {}, "text", "second@example.com");
+      const card = new FakeAddrBookCard({}, new FakeVCardProperties([first, second]));
+      const details = helpers.readContactFields(card);
+      assert.equal(details.email, primary);
+      assert.deepEqual(plain(details.emails), [
+        ...(primary ? [{ address: primary.trim() }] : []), { address: "second@example.com" },
+      ]);
+      assert.equal(card.primaryEmail, primary);
+      assert.deepEqual(card.vCardProperties.getAllEntries("email"), [first, second]);
+      assert.equal(first.value, primary);
+      assert.deepEqual(first.params, { pref: "1" });
+    });
+  }
+
+  for (const requestedType of [undefined, "home"]) {
+    it(`keeps the address's group when its type becomes ${requestedType || "untyped"}`, () => {
+      const work = new FakeVCardPropertyEntry("email", { type: ["WORK", "internet"], group: "work-label" }, "text", "Ada@Work.Example");
+      const other = new FakeVCardPropertyEntry("email", { group: "other-label" }, "text", "other@example.com");
+      const label = new FakeVCardPropertyEntry("x-ablabel", { group: "work-label" }, "text", "Research");
+      const properties = new FakeVCardProperties([other, work, label]);
+      const params = work.params;
+      helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+        emails: [{ address: " ada@work.example ", ...(requestedType ? { type: requestedType } : {}) }],
+      }, FakeVCardPropertyEntry);
+      assert.deepEqual(properties.getAllEntries("email"), [work]);
+      assert.strictEqual(work.params, params);
+      assert.equal(work.value, "ada@work.example");
+      assert.deepEqual(plain(work.params), {
+        type: requestedType ? ["internet", requestedType] : "internet", group: "work-label", pref: "1",
+      });
+      assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
+    });
+  }
+
+  it("preserves all TYPE tokens and metadata when writing the exposed type back unchanged", () => {
+    const firstParams = {
+      type: ["work", "home", "INTERNET"], pref: "1", group: "item1", "x-custom": "Keep me",
+    };
+    const secondParams = { type: ["HOME", "work", "INTERNET"], group: "item2", altid: "other" };
+    const first = new FakeVCardPropertyEntry("email", firstParams, "text", "first@example.com");
+    const second = new FakeVCardPropertyEntry("email", secondParams, "text", "second@example.com");
+    const label = new FakeVCardPropertyEntry("x-ablabel", { group: "item1" }, "text", "Research");
+    const properties = new FakeVCardProperties([label, first, second]);
+    const card = new FakeAddrBookCard({}, properties);
+    const before = structuredClone([firstParams, secondParams]);
+    const read = helpers.readContactFields(card);
+    assert.deepEqual(plain(read.emails), [
+      { type: "work", address: "first@example.com" }, { type: "home", address: "second@example.com" },
+    ]);
+
+    assert.equal(helpers.applyContactFields(card, { emails: read.emails }, FakeVCardPropertyEntry), null);
+    assert.deepEqual(properties.getAllEntries("email"), [first, second]);
+    assert.strictEqual(first.params, firstParams);
+    assert.strictEqual(second.params, secondParams);
+    assert.deepEqual([first.params, second.params], before);
+    assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
+  });
+
+  it("preserves serialized email metadata across getContact, unchanged updateContact and reload", () => {
+    const rawProperty = "_vCard";
+    const params = [
+      { type: ["work", "home", "INTERNET"], pref: "1", group: "item1", "x-custom": "keep" },
+      { type: ["HOME", "work", "INTERNET"], group: "item2", altid: "other" },
+    ];
+    const properties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("fn", {}, "text", "Round Trip"),
+      new FakeVCardPropertyEntry("x-ablabel", { group: "item1" }, "text", "Research"),
+      new FakeVCardPropertyEntry("note", {}, "text", "Keep this note"),
+      ...params.map((value, index) => new FakeVCardPropertyEntry("email", value, "text", `address${index}@example.com`)),
+    ]);
+    const book = new FakeAddressBook();
+    const { UID } = book.addCard(new FakeAddrBookCard({}, properties));
+    const runtime = loadContactRuntime({ books: [book] });
+    const beforeRaw = book.savedCards.get(UID).getProperty(rawProperty);
+    const beforeParams = structuredClone(params);
+    const read = runtime.getContact(UID);
+    assert.deepEqual(plain(read.emails).map(email => email.type), ["work", "home"]);
+
+    assert.equal(runtime.update(UID, { emails: read.emails }).success, true);
+    const reloaded = book.reloadCard(UID);
+    const afterRaw = reloaded.getProperty(rawProperty);
+    const emailLines = [beforeRaw, afterRaw].map(raw =>
+      raw.split(/\r?\n/).filter(line => /(?:^|\.)EMAIL[;:]/i.test(line))
+    );
+    assert.equal(emailLines[0].length, 2);
+    assert.deepEqual(emailLines[1], emailLines[0], "stored TYPE tokens, groups and parameters are unchanged");
+    assert.deepEqual(reloaded.vCardProperties.getAllEntries("email").map(entry => entry.params), beforeParams);
+    assert.equal(reloaded.vCardProperties.getFirstValue("note"), "Keep this note");
+    assert.equal(reloaded.vCardProperties.getFirstValue("x-ablabel"), "Research");
+
+    const changed = [{ ...read.emails[0], type: "home" }, { address: read.emails[1].address }];
+    assert.equal(runtime.update(UID, { emails: changed }).success, true);
+    const changedEntries = book.reloadCard(UID).vCardProperties.getAllEntries("email");
+    assert.deepEqual(plain(changedEntries.map(entry => entry.params)), [
+      { ...beforeParams[0], type: ["home", "INTERNET"] },
+      { ...beforeParams[1], type: "INTERNET" },
+    ], "an actual type change updates work/home while preserving other metadata");
+  });
+
+  it("reserves all address matches before reusing a type bucket for a new address", () => {
+    const retained = new FakeVCardPropertyEntry("email", { type: "work", group: "retained-label" }, "text", "kept@example.com");
+    const replaced = new FakeVCardPropertyEntry("email", { type: "work", group: "replaced-label" }, "text", "old@example.com");
+    const properties = new FakeVCardProperties([retained, replaced]);
+    helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+      emails: [{ type: "work", address: "new@example.com" }, { address: "KEPT@example.com" }],
+    }, FakeVCardPropertyEntry);
+    assert.deepEqual(properties.getAllEntries("email"), [replaced, retained]);
+    assert.equal(replaced.value, "new@example.com");
+    assert.equal(replaced.params.group, "replaced-label");
+    assert.equal(retained.value, "KEPT@example.com");
+    assert.equal(retained.params.group, "retained-label");
+    assert.equal(retained.params.type, undefined);
+  });
+
+  for (const type of ["PREF", ["WORK", "pReF", "internet"]]) {
+    it(`removes legacy TYPE=PREF from a demoted address with TYPE=${JSON.stringify(type)}`, () => {
+      const oldPrimary = new FakeVCardPropertyEntry("email", { type, pref: "1", group: "item1" }, "text", "old@example.com");
+      const newPrimary = new FakeVCardPropertyEntry("email", {}, "text", "new@example.com");
+      const properties = new FakeVCardProperties([oldPrimary, newPrimary]);
+      helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+        emails: [{ address: "new@example.com" }, { type: "home", address: "old@example.com" }],
+      }, FakeVCardPropertyEntry);
+      assert.deepEqual(properties.getAllEntries("email"), [newPrimary, oldPrimary]);
+      assert.equal(newPrimary.params.pref, "1");
+      assert.deepEqual(plain(oldPrimary.params), {
+        type: Array.isArray(type) ? ["internet", "home"] : "home", group: "item1",
+      });
+    });
+  }
+
+  it("replaces the vCard collection and makes the first address the only preferred one", () => {
+    const oldPrimary = new FakeVCardPropertyEntry("email", { type: "work", pref: "1" }, "text", "old@example.com");
+    oldPrimary.params.group = "item1";
+    const other = new FakeVCardPropertyEntry("email", {}, "text", "other@example.com");
+    const home = new FakeVCardPropertyEntry("email", { type: "home" }, "text", "home-old@example.com");
+    const omitted = new FakeVCardPropertyEntry("email", { type: "work" }, "text", "omitted@example.com");
+    const url = new FakeVCardPropertyEntry("url", {}, "uri", "https://example.com");
+    const vCardProperties = new FakeVCardProperties([oldPrimary, url, other, home, omitted]);
+    const card = { supportsVCard: true, vCardProperties, primaryEmail: "unchanged" };
+
+    const result = helpers.applyContactFields(card, {
+      emails: [
+        { address: "other@example.com" },
+        { type: "work", address: "old@example.com" },
+        { type: "home", address: " new@example.com " },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.equal(result, null);
+    assert.equal(card.primaryEmail, "unchanged");
+    const entries = vCardProperties.getAllEntries("email");
+    assert.deepEqual(entries.map(entry => entry.value), [
+      "other@example.com",
+      "old@example.com",
+      "new@example.com",
+    ]);
+    assert.strictEqual(entries[0], other);
+    assert.equal(other.params.pref, "1");
+    assert.strictEqual(entries[1], oldPrimary);
+    assert.equal(oldPrimary.params.pref, undefined);
+    assert.equal(oldPrimary.params.type, "work");
+    assert.equal(oldPrimary.params.group, "item1");
+    // A changed address reuses the entry of the same type, as phones do.
+    assert.strictEqual(entries[2], home);
+    assert.deepEqual(plain(home.params), { type: "home" });
+    assert.ok(!vCardProperties.entries.includes(omitted));
+    assert.ok(vCardProperties.entries.includes(url));
+    assert.deepEqual(plain(helpers.readContactFields(card).emails), [
+      { address: "other@example.com" },
+      { type: "work", address: "old@example.com" },
+      { type: "home", address: "new@example.com" },
+    ]);
+  });
+
+  it("changes an address in place, keeping its entry and metadata", () => {
+    const params = { type: ["HOME", "internet"] };
+    const entry = new FakeVCardPropertyEntry("email", params, "text", "before@example.com");
+    entry.params.group = "item2";
+    const vCardProperties = new FakeVCardProperties([entry]);
+    helpers.applyContactFields({ supportsVCard: true, vCardProperties }, {
+      email: "after@example.com",
+      emails: [{ type: "home", address: "after@example.com" }],
+    }, FakeVCardPropertyEntry);
+
+    assert.deepEqual(vCardProperties.getAllEntries("email"), [entry]);
+    assert.equal(entry.value, "after@example.com");
+    assert.strictEqual(entry.params, params);
+    assert.deepEqual(plain(params.type), ["HOME", "internet"]);
+    assert.equal(params.pref, "1");
+    assert.equal(entry.params.group, "item2");
+  });
+
+  it("clears every vCard address with an empty collection", () => {
+    const vCardProperties = new FakeVCardProperties([
+      new FakeVCardPropertyEntry("email", { pref: "1" }, "text", "primary@example.com"),
+      new FakeVCardPropertyEntry("email", {}, "text", "secondary@example.com"),
+    ]);
+    helpers.applyContactFields({ supportsVCard: true, vCardProperties }, {
+      email: "",
+      emails: [],
+    }, FakeVCardPropertyEntry);
+    assert.equal(vCardProperties.getAllEntries("email").length, 0);
+  });
+
+  it("writes the primary and second address of legacy flat cards", () => {
+    const card = makeFlatCard({ SecondEmail: "old.second@example.com" });
+    helpers.applyContactFields(card, {
+      emails: [{ address: " one@example.com " }, { type: "work", address: "two@example.com" }],
+    }, FakeVCardPropertyEntry);
+    assert.equal(card.primaryEmail, "one@example.com");
+    assert.equal(card.stored.get("SecondEmail"), "two@example.com");
+
+    helpers.applyContactFields(card, { emails: [] }, FakeVCardPropertyEntry);
+    assert.equal(card.primaryEmail, "");
+    assert.equal(card.stored.get("SecondEmail"), "");
+  });
+
+  it("rejects more than two addresses on flat cards before mutating any fields", () => {
+    const card = makeFlatCard({ SecondEmail: "second@example.com" });
+    const result = helpers.applyContactFields(card, {
+      displayName: "Changed Name",
+      emails: [
+        { address: "one@example.com" },
+        { address: "two@example.com" },
+        { address: "three@example.com" },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.match(result.error, /Non-vCard.*at most two email addresses/);
+    assert.equal(card.displayName, "Flat Contact");
+    assert.equal(card.primaryEmail, "flat@example.com");
+    assert.equal(card.stored.get("SecondEmail"), "second@example.com");
+  });
+
+  it("reads every address of a card for searching", () => {
+    assert.deepEqual(plain(helpers.getContactEmailAddresses({
+      emailAddresses: ["primary@example.com", "", "third@example.com"],
+      primaryEmail: "ignored@example.com",
+    })), ["primary@example.com", "third@example.com"]);
+
+    const legacy = makeFlatCard({ SecondEmail: "flat.second@example.com" });
+    assert.deepEqual(plain(helpers.getContactEmailAddresses(legacy)), [
+      "flat@example.com",
+      "flat.second@example.com",
+    ]);
+
+    const throwing = {
+      get emailAddresses() { throw new Error("not implemented"); },
+      get primaryEmail() { throw new Error("vCard unavailable"); },
+      getProperty(name, fallback) { return name === "PrimaryEmail" ? "only@example.com" : fallback; },
+    };
+    assert.deepEqual(plain(helpers.getContactEmailAddresses(throwing)), ["only@example.com"]);
+  });
+});
+
 describe("phone-only display name synthesis", () => {
   it("synthesizes only for a truly phone-only payload", () => {
     assert.equal(helpers.shouldSynthesizePhoneDisplayName({
       phones: [{ type: "home", number: "555-0100" }],
     }), true);
+    assert.equal(helpers.shouldSynthesizePhoneDisplayName({
+      emails: [{ address: "ada@example.com" }],
+      phones: [{ type: "home", number: "555-0100" }],
+    }), false);
     assert.equal(helpers.shouldSynthesizePhoneDisplayName({
       displayName: "Ada",
       phones: [{ type: "home", number: "555-0100" }],
@@ -560,36 +831,5 @@ describe("phone-only display name synthesis", () => {
       phones: [{ type: "home", number: "555-0100" }],
       addresses: [{ type: "home", city: "Warsaw" }],
     }), false);
-  });
-});
-
-describe("contact tool wiring", () => {
-  const apiSource = fs.readFileSync(
-    path.resolve(__dirname, "../extension/mcp_server/api.js"),
-    "utf8"
-  );
-
-  it("defines getContact as a UID-based read tool", () => {
-    const start = apiSource.indexOf('name: "getContact"');
-    const end = apiSource.indexOf('name: "createContact"', start);
-    assert.ok(start >= 0 && end > start, "getContact tool definition missing");
-    const definition = apiSource.slice(start, end);
-    assert.match(definition, /group: "contacts", crud: "read"/);
-    assert.match(definition, /contactId: \{ type: "string"/);
-    assert.match(definition, /required: \["contactId"\]/);
-  });
-
-  it("dispatches getContact through the existing UID lookup and shared formatter", () => {
-    assert.match(apiSource, /case "getContact":\s*return getContact\(args\.contactId\);/);
-    const start = apiSource.indexOf("function getContact(contactId)");
-    const end = apiSource.indexOf("function createContact(", start);
-    const handler = apiSource.slice(start, end);
-    assert.match(handler, /findContactByUID\(contactId\)/);
-    assert.match(handler, /formatContact\(found\.card, found\.book\)/);
-  });
-
-  it("uses the shared full-contact formatter in searchContacts", () => {
-    assert.match(apiSource, /results\.push\(formatContact\(card, book\)\)/);
-    assert.match(apiSource, /if \(card\.isMailList\) continue;\s*if \(card\.UID === contactId\)/);
   });
 });

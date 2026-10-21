@@ -171,11 +171,21 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 
 | Tool | Description |
 |------|-------------|
-| `searchContacts` | Search contacts across all address books by email or name and return full contact details. Supports `maxResults`. |
-| `getContact` | Read full contact details by UID |
-| `createContact` | Create a contact with optional email/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
-| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty phone/address arrays clear those collections |
+| `searchContacts` | Search contacts across all address books by any of their email addresses or by name and return full contact details. Supports `maxResults`. |
+| `getContact` | Read full contact details by UID, including all email addresses (`emails`, in preference order) |
+| `createContact` | Create a contact with optional email addresses/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
+| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty email/phone/address arrays clear those collections |
 | `deleteContact` | Delete a contact by UID |
+
+Contacts return `email` as Thunderbird's primary address and `emails` as all non-empty stored addresses in Thunderbird's preference order, with an optional `type: "work" | "home"`. Searches match any email address or name; multiple words must all match somewhere in those fields.
+
+On create and update, `emails` accepts typed or untyped `{ address, type? }` entries. Local and CardDAV address books preserve all supplied addresses and types. Other address-book types retain the legacy limit of two addresses without types; a third address is refused. On update, omitted fields stay unchanged, `emails` replaces the whole collection in the supplied order, and `emails: []` clears it. If `email` is supplied too, it must equal the first trimmed address (or be `""` with an empty collection). Email values containing control characters are refused before changes are made.
+
+Updating `email` alone with a non-empty value replaces the primary address and keeps the others. **`email: ""` clears all addresses on vCard-backed cards, but only the primary on legacy flat cards.** Use `emails: []` to explicitly clear the whole collection on either kind of card.
+
+Reads preserve duplicate addresses already stored in Thunderbird; writes reject duplicates case-insensitively, so remove duplicates before sending a returned list as an update. The `emails` list trims address whitespace and omits empty entries, while `email` preserves Thunderbird's primary value. An empty preferred entry or surrounding whitespace can therefore make `emails[0].address` differ from `email`; reading a contact never changes its primary address to force agreement.
+
+If a stored vCard cannot be read, contact reads and searches fall back to cached fields. Updates are refused before changing or saving the card, so they cannot overwrite unrelated data lost by the failed parse.
 
 ### Calendar
 
