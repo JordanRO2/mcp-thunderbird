@@ -1325,6 +1325,7 @@ const REFRESH_MIN_TIMEOUT_MS = 1000;
 const REFRESH_MAX_TIMEOUT_MS = 25000;
 const REFRESH_ABANDON_MS = 60000;
 const REFRESH_TIMEOUT_DESCRIPTION = `Maximum wait in ms (default ${REFRESH_DEFAULT_TIMEOUT_MS}); clamped to ${REFRESH_MIN_TIMEOUT_MS}-${REFRESH_MAX_TIMEOUT_MS}.`;
+const REFRESH_OFFLINE_ERROR = "Thunderbird is offline; switch it online to refresh.";
 
 function clampRefreshTimeout(timeoutMs) {
   const n = Number(timeoutMs);
@@ -3809,6 +3810,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Best-effort refresh for IMAP folders. updateFolder starts async work
              * and may not complete before callers read from Thunderbird's cache.
+             * refreshFolder observes FolderLoaded even when this call already
+             * started the update and Thunderbird discards its new URL listener.
              */
             function refreshImapFolderSync(folder) {
               if (folder.server && folder.server.type === "imap") {
@@ -11775,32 +11778,61 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function startFolderSync(folder, { settle, addCleanup }) {
+              let inImapUpdate = false;
+              const listener = {
+                QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                onFolderEvent(eventFolder, event) {
+                  if (event !== "FolderLoaded" || eventFolder?.URI !== folder.URI) return;
+                  const noUpdateRan = inImapUpdate;
+                  // IMAP fires FolderLoaded even on failure, before the URL
+                  // listener. Give that listener's exit code the first say.
+                  Services.tm.dispatchToMainThread(() => settle({
+                    status: "loaded",
+                    updateConfirmed: false,
+                    warning: noUpdateRan
+                      ? "No update ran: Thunderbird reported the folder loaded synchronously (the folder may be busy or the update was aborted)."
+                      : "Thunderbird reported the folder loaded; a successful server update could not be confirmed.",
+                  }));
+                },
+              };
+              addCleanup(() => MailServices.mailSession.RemoveFolderListener(listener));
+              // Busy IMAP updates do not keep our URL listener, but their
+              // eventual FolderLoaded still completes this wait.
+              MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
               if (folder.server.type === "imap") {
-                folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
-                  QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                  OnStartRunningUrl() {},
-                  OnStopRunningUrl(url, exitCode) {
-                    settle(Components.isSuccessCode(exitCode)
-                      ? { status: "loaded" }
-                      : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
-                  },
-                });
+                inImapUpdate = true;
+                try {
+                  folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(url, exitCode) {
+                      // The folder has one stashed listener: an unrelated URL
+                      // can consume it before the update completes.
+                      let updatingFolder = false;
+                      try { updatingFolder = url.QueryInterface(Ci.nsIMsgMailNewsUrl).updatingFolder; } catch {}
+                      if (!updatingFolder) return;
+                      settle(Components.isSuccessCode(exitCode)
+                        ? { status: "loaded", updateConfirmed: true }
+                        : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
+                    },
+                  });
+                } finally {
+                  inImapUpdate = false;
+                }
               } else {
-                const listener = {
-                  QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
-                  onFolderEvent(eventFolder, event) {
-                    if (event === "FolderLoaded" && eventFolder?.URI === folder.URI) settle({ status: "loaded" });
-                  },
-                };
-                addCleanup(() => MailServices.mailSession.RemoveFolderListener(listener));
-                MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
-                folder.updateFolder(null);
+                return folder.updateFolder(null);
               }
             }
 
             // Internal adapter: callers choose their wait budget and receive an
-            // outcome without tool metadata or message-count reads.
+            // outcome without tool metadata or message-count reads. Resolve
+            // access and reject roots/virtual/no-select folders before calling.
+            // loaded means a load was reported; updateConfirmed additionally
+            // requires a successful folder-update URL exit code.
             function waitForFolderRefresh(folder, timeoutMs) {
+              if (Services.io.offline) {
+                return Promise.resolve({ status: "error", error: REFRESH_OFFLINE_ERROR, joinedInFlight: false });
+              }
               return waitForRefresh(refreshInFlight, folder.URI, timeoutMs,
                 lifecycle => startFolderSync(folder, lifecycle));
             }
@@ -11815,6 +11847,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 success: outcome.status === "loaded",
                 folderPath: uri,
                 status: outcome.status,
+                updateConfirmed: outcome.updateConfirmed === true,
                 elapsedMs: Date.now() - started,
                 totalBefore: before.total,
                 totalAfter: after.total,
@@ -11826,6 +11859,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
               if (outcome.joinedInFlight) result.joinedInFlight = true;
               if (outcome.error) result.error = outcome.error;
+              if (outcome.warning) result.warning = outcome.warning;
               return result;
             }
 
@@ -11834,31 +11868,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const lookup = getAccessibleFolder(folderPath);
                 if (lookup.error) return { error: lookup.error };
                 const folder = lookup.folder;
+                if (Services.io.offline) return { success: false, status: "error", error: REFRESH_OFFLINE_ERROR };
                 const timeout = clampRefreshTimeout(timeoutMs);
-
-                if (!folder.server || REFRESH_LOCAL_SERVER_TYPES.has(folder.server.type)) {
-                  return { success: true, folderPath: folder.URI, skipped: "no server-side folder to sync" };
-                }
                 if (folder.isServer) {
-                  const wanted = Ci.nsMsgFolderFlags.Inbox | Ci.nsMsgFolderFlags.CheckNew;
-                  const targets = Array.from(folder.descendants).filter(f =>
-                    (f.flags & wanted) && !(f.flags & (Ci.nsMsgFolderFlags.Virtual | Ci.nsMsgFolderFlags.ImapNoselect)));
-                  if (targets.length === 0) {
-                    return { error: `No Inbox or check-new folders found under ${folderPath}` };
-                  }
-                  const results = await Promise.all(targets.map(f => syncOneFolder(f, timeout)));
-                  return {
-                    success: results.every(r => r.success),
-                    folderPath: folder.URI,
-                    scope: "account",
-                    results,
-                  };
+                  return { error: `Account roots cannot be refreshed; select an individual folder: ${folderPath}` };
                 }
                 if (folder.flags & Ci.nsMsgFolderFlags.Virtual) {
                   return { error: `Saved-search (virtual) folders cannot be refreshed; refresh their source folders: ${folderPath}` };
                 }
                 if (folder.flags & Ci.nsMsgFolderFlags.ImapNoselect) {
                   return { error: `IMAP folder cannot be selected (no-select): ${folderPath}` };
+                }
+                if (!folder.server || REFRESH_LOCAL_SERVER_TYPES.has(folder.server.type)) {
+                  return { success: true, folderPath: folder.URI, skipped: "refresh is not supported for this folder type" };
                 }
                 return await syncOneFolder(folder, timeout);
               } catch (e) {

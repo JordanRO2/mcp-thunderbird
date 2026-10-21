@@ -2,274 +2,340 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
+const { loadRefreshRuntime } = require("./helpers/refresh-runtime.cjs");
 
-const FLAGS = {
-  Inbox: 0x00001000,
-  SentMail: 0x00000200,
-  Virtual: 0x00000020,
-  CheckNew: 0x20000000,
-  ImapNoselect: 0x01000000,
-};
+const WAIT_MS = 1000;
+const UPDATE_MS = 50;
+const BUSY_UPDATE_MS = 300;
+const BUSY_START_DELAY_MS = 10;
+const STORE_MS = 40;
+const FAILURE = 0x80004005;
+const FLAGS = { Virtual: 0x20, ImapNoselect: 0x01000000 };
+const FOLDER_URI = "imap://account/Inbox";
 
-// nsITimer stand-in backed by setTimeout.
-function makeCc() {
-  return {
-    "@mozilla.org/timer;1": {
-      createInstance() {
-        let handle = null;
-        return {
-          initWithCallback(cb, ms) { handle = setTimeout(() => cb.notify(), ms); },
-          cancel() { clearTimeout(handle); },
-        };
-      },
-    },
-  };
-}
-
-function makeMailSession() {
+// Reuse the original folder/count fixture, now modelling Thunderbird's single
+// stashed URL listener and FolderLoaded-before-OnStopRunningUrl ordering.
+function loadRefresh({ type = "imap", offline = false, denied = false, delay = UPDATE_MS, exitCode = 0 } = {}) {
   const listeners = new Set();
-  return {
-    listeners,
-    AddFolderListener(l) { listeners.add(l); },
-    RemoveFolderListener(l) { listeners.delete(l); },
-    fire(folder, event) { for (const l of [...listeners]) l.onFolderEvent(folder, event); },
-  };
-}
-
-function loadRefresh({ folders, mailSession = makeMailSession() }) {
-  const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
-  const source = fs.readFileSync(apiPath, "utf8");
-  const start = source.indexOf("// BEGIN REFRESH FOLDER TOOL");
-  const end = source.indexOf("// END REFRESH FOLDER TOOL", start);
-  assert.ok(start >= 0, "refreshFolder start marker missing");
-  assert.ok(end > start, "refreshFolder end marker missing");
-  const sharedStart = source.indexOf("// BEGIN BOUNDED REFRESH HELPERS");
-  const sharedEnd = source.indexOf("// END BOUNDED REFRESH HELPERS", sharedStart);
-  assert.ok(sharedStart >= 0 && sharedEnd > sharedStart);
-  let shared = source.slice(sharedStart, sharedEnd);
-  const sandbox = {
-    Cc: makeCc(),
-    Ci: {
-      nsITimer: { TYPE_ONE_SHOT: 0 },
-      nsIFolderListener: { event: 0x80 },
-      nsIMsgImapMailFolder: "nsIMsgImapMailFolder",
-      nsMsgFolderFlags: FLAGS,
+  const mailSession = {
+    AddFolderListener(listener) { listeners.add(listener); },
+    RemoveFolderListener(listener) { listeners.delete(listener); },
+    fire(folder, event = "FolderLoaded") {
+      for (const listener of [...listeners]) listener.onFolderEvent(folder, event);
     },
-    ChromeUtils: { generateQI: () => function () { return this; } },
-    Components: { isSuccessCode: (code) => code === 0 },
-    MailServices: { mailSession },
-    getAccessibleFolder: (uri) => folders[uri] ? { folder: folders[uri] } : { error: `Folder not found: ${uri}` },
   };
-  vm.createContext(sandbox);
-  vm.runInContext(`${shared}
-${source.slice(start, end)}
-this.refreshFolder = refreshFolder;
-this.clampRefreshTimeout = clampRefreshTimeout;`, sandbox);
-  return sandbox;
-}
-
-// A fake folder whose counts grow by `arrivals` when complete() runs.
-function makeFolder(uri, { type = "imap", flags = 0, arrivals = 0 } = {}) {
-  return {
-    URI: uri,
-    flags,
-    isServer: false,
-    server: { type },
-    total: 10,
-    unread: 2,
-    updateCalls: 0,
-    imapUpdateCalls: 0,
-    getTotalMessages() { return this.total; },
-    getNumUnread() { return this.unread; },
-    complete() { this.total += arrivals; this.unread += arrivals; },
-    updateFolder() { this.updateCalls++; },
+  let harness;
+  const folder = {
+    URI: FOLDER_URI, server: { type }, flags: 0, isServer: false,
+    total: 10, unread: 2, arrivals: 2, countReads: 0,
+    updateCalls: 0, imapUpdateCalls: 0, urlRunning: false, updatingFolder: false,
+    urlListener: null, updateUrl: null,
+    getTotalMessages() { this.countReads++; return this.total; },
+    getNumUnread() { this.countReads++; return this.unread; },
     QueryInterface() { return this; },
+    getNewMessages() { assert.fail("account-level Get Mail must not be used"); },
+    finishUrl(url, status = exitCode) {
+      this.urlRunning = false;
+      this.updatingFolder = false;
+      if (url.updatingFolder) {
+        if (status === 0) { this.total += this.arrivals; this.unread += this.arrivals; }
+        // The base folder fires loaded for success AND failure, first.
+        mailSession.fire(this);
+      }
+      const listener = this.urlListener;
+      this.urlListener = null; // Whichever URL ends first consumes this slot.
+      listener?.OnStopRunningUrl(url, status);
+    },
+    updateFolderWithListener(_window, listener) {
+      this.imapUpdateCalls++;
+      if (!this.urlRunning) {
+        if (harness.runtime.Services.io.offline) { mailSession.fire(this); return; }
+        this.urlRunning = this.updatingFolder = true;
+        this.urlListener = listener;
+        this.updateUrl = { updatingFolder: true, QueryInterface() { return this; } };
+        if (delay !== null) harness.clock.schedule(delay, () => this.finishUrl(this.updateUrl));
+      } else if (!this.updatingFolder) {
+        // A body fetch is running: no update starts and no listener is saved.
+        mailSession.fire(this);
+      }
+      // A running update will send FolderLoaded later; the new listener is lost.
+    },
+    updateFolder() {
+      this.updateCalls++;
+      if (type === "imap") this.updateFolderWithListener(null, null);
+      else if (delay !== null) harness.clock.schedule(delay, () => mailSession.fire(this));
+    },
   };
+  harness = loadRefreshRuntime({
+    blocks: ["REFRESH FOLDER TOOL"],
+    expose: ["refreshFolder", "waitForFolderRefresh"],
+    globals: {
+      Services: { io: { offline } },
+      Ci: { nsMsgFolderFlags: FLAGS, nsIFolderListener: { event: 0x80 }, nsIMsgImapMailFolder: "imap", nsIMsgMailNewsUrl: "mail-url" },
+      MailServices: { mailSession },
+      getAccessibleFolder: uri => denied ? { error: "Account not accessible" }
+        : uri === folder.URI ? { folder } : { error: "Folder not found" },
+    },
+  });
+  return { ...harness, folder, listeners, mailSession, refresh: timeout => harness.runtime.refreshFolder(folder.URI, timeout ?? WAIT_MS) };
 }
 
-// IMAP folder whose updateFolderWithListener finishes after `delayMs` with `exitCode`.
-function imapFolder(uri, { arrivals = 0, delayMs = 10, exitCode = 0, never = false, flags = 0 } = {}) {
-  const f = makeFolder(uri, { type: "imap", arrivals, flags });
-  f.updateFolderWithListener = (win, listener) => {
-    f.imapUpdateCalls++;
-    f.pendingListener = listener;
-    if (!never) setTimeout(() => { f.complete(); listener.OnStopRunningUrl(null, exitCode); }, delayMs);
-  };
-  return f;
-}
-
-describe("refreshFolder", () => {
-  it("clamps timeoutMs into [1000, 25000] with a 15000 default", () => {
-    const { clampRefreshTimeout } = loadRefresh({ folders: {} });
-    assert.equal(clampRefreshTimeout(undefined), 15000);
-    assert.equal(clampRefreshTimeout(-5), 15000);
-    assert.equal(clampRefreshTimeout("abc"), 15000);
-    assert.equal(clampRefreshTimeout(10), 1000);
-    assert.equal(clampRefreshTimeout(99999), 25000);
-    assert.equal(clampRefreshTimeout(5000.7), 5000);
+describe("refreshFolder IMAP completion", () => {
+  it("waits for the update, confirms its successful URL, and reports net counts", async () => {
+    const h = loadRefresh();
+    const pending = h.refresh();
+    assert.equal(h.listeners.size, 1);
+    await h.clock.advance(UPDATE_MS);
+    const result = await pending;
+    assert.equal(result.success, true);
+    assert.equal(result.status, "loaded");
+    assert.equal(result.updateConfirmed, true);
+    assert.equal(result.warning, undefined);
+    assert.equal(result.totalBefore, 10);
+    assert.equal(result.totalAfter, 12);
+    assert.equal(result.unreadAfter, 4);
+    assert.equal(result.netMessageDelta, 2);
+    assert.equal(result.elapsedMs, UPDATE_MS);
+    assert.equal(h.folder.imapUpdateCalls, 1);
+    assert.equal(h.folder.updateCalls, 0);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.clock.activeTimers.length, 0);
   });
 
-  it("IMAP: waits on updateFolderWithListener (not getNewMessages) and reports counts", async () => {
-    const f = imapFolder("imap://acct/Archive", { arrivals: 2 });
-    f.getNewMessages = () => assert.fail("account-level getNewMessages must not be used");
-    const { refreshFolder } = loadRefresh({ folders: { [f.URI]: f } });
-    const res = await refreshFolder(f.URI, 5000);
-    assert.equal(res.success, true);
-    assert.equal(res.status, "loaded");
-    assert.equal(res.netMessageDelta, 2);
-    assert.equal(res.totalBefore, 10);
-    assert.equal(res.unreadAfter, 4);
-    assert.equal(f.imapUpdateCalls, 1);
+  it("lets a failing update exit code beat the preceding FolderLoaded", async () => {
+    const h = loadRefresh({ exitCode: FAILURE });
+    const pending = h.refresh();
+    await h.clock.advance(UPDATE_MS);
+    const result = await pending;
+    assert.equal(result.status, "error");
+    assert.equal(result.success, false);
+    assert.equal(result.updateConfirmed, false);
+    assert.match(result.error, /0x80004005/);
+    assert.equal(result.netMessageDelta, 0);
+    assert.equal(h.listeners.size, 0);
   });
 
-  it("IMAP: maps a failing exit code to a structured error", async () => {
-    const f = imapFolder("imap://acct/Broken", { exitCode: 0x80004005 });
-    const { refreshFolder } = loadRefresh({ folders: { [f.URI]: f } });
-    const res = await refreshFolder(f.URI, 5000);
-    assert.equal(res.success, false);
-    assert.equal(res.status, "error");
-    assert.match(res.error, /0x80004005/);
+  for (const exitCode of [0, FAILURE]) {
+    it(`observes a pre-existing update without a URL callback (exit ${exitCode})`, async () => {
+      const h = loadRefresh({ delay: BUSY_UPDATE_MS, exitCode });
+      h.folder.updateFolder(); // The existing fire-and-forget folder-read path.
+      await h.clock.advance(BUSY_START_DELAY_MS);
+      const pending = h.refresh();
+      assert.equal(h.folder.urlListener, null, "busy update must discard the new listener");
+      await h.clock.advance(BUSY_UPDATE_MS - BUSY_START_DELAY_MS);
+      const result = await pending;
+      assert.equal(result.status, "loaded");
+      assert.equal(result.updateConfirmed, false);
+      assert.match(result.warning, /reported.*loaded.*could not be confirmed/);
+      assert.equal(result.netMessageDelta, exitCode === 0 ? 2 : 0);
+      assert.equal(result.elapsedMs, BUSY_UPDATE_MS - BUSY_START_DELAY_MS);
+      assert.equal(h.listeners.size, 0);
+    });
+  }
+
+  it("reports synchronous FolderLoaded during a body fetch as no update ran", async () => {
+    const h = loadRefresh();
+    h.folder.urlRunning = true;
+    const pending = h.refresh();
+    await h.clock.flush();
+    const result = await pending;
+    assert.equal(result.status, "loaded");
+    assert.equal(result.updateConfirmed, false);
+    assert.match(result.warning, /No update ran/);
+    assert.equal(result.elapsedMs, 0);
+    assert.equal(h.folder.updateUrl, null);
+    assert.equal(h.listeners.size, 0);
   });
 
-  it("times out without stacking syncs: a repeat call joins the running one", async () => {
-    const f = imapFolder("imap://acct/Slow", { never: true, arrivals: 1 });
-    const { refreshFolder } = loadRefresh({ folders: { [f.URI]: f } });
+  for (const exitCode of [0, FAILURE]) {
+    it(`ignores a non-update URL consuming the listener (exit ${exitCode})`, async () => {
+      const h = loadRefresh({ delay: BUSY_UPDATE_MS });
+      // A STORE queued ahead of SELECT can finish first. A STORE issued after
+      // SELECT normally waits, so this deliberately models the earlier queue.
+      const storeUrl = { updatingFolder: false, QueryInterface() { return this; } };
+      h.clock.schedule(STORE_MS, () => h.folder.finishUrl(storeUrl, exitCode));
+      let completed = false;
+      const pending = h.refresh().then(result => { completed = true; return result; });
+      await h.clock.advance(STORE_MS);
+      assert.equal(completed, false);
+      assert.equal(h.folder.urlListener, null);
+      await h.clock.advance(BUSY_UPDATE_MS - STORE_MS);
+      const result = await pending;
+      assert.equal(result.status, "loaded");
+      assert.equal(result.updateConfirmed, false);
+      assert.equal(result.netMessageDelta, 2);
+      assert.match(result.warning, /could not be confirmed/);
+    });
+  }
 
-    const first = await refreshFolder(f.URI, 1000);
-    assert.equal(first.success, false);
-    assert.equal(first.status, "timeout");
-    assert.match(first.error, /not confirmed/);
-
-    const secondP = refreshFolder(f.URI, 5000);
-    setTimeout(() => { f.complete(); f.pendingListener.OnStopRunningUrl(null, 0); }, 20);
-    const second = await secondP;
-    assert.equal(second.status, "loaded");
-    assert.equal(second.joinedInFlight, true);
-    assert.equal(f.imapUpdateCalls, 1, "no second sync was started");
-
-    // Once finished, the slot is free again.
-    const third = refreshFolder(f.URI, 5000);
-    setTimeout(() => f.pendingListener.OnStopRunningUrl(null, 0), 10);
-    assert.equal((await third).joinedInFlight, undefined);
-    assert.equal(f.imapUpdateCalls, 2);
+  it("ignores an unidentifiable URL instead of treating it as a successful update", async () => {
+    const h = loadRefresh();
+    let completed = false;
+    const pending = h.refresh().then(result => { completed = true; return result; });
+    h.folder.urlListener.OnStopRunningUrl(null, 0);
+    await h.clock.flush();
+    assert.equal(completed, false);
+    await h.clock.advance(UPDATE_MS);
+    assert.equal((await pending).updateConfirmed, true);
   });
 
-  it("skips local-store folders (Local Folders, POP, RSS, news)", async () => {
-    const folders = {};
-    for (const type of ["none", "pop3", "rss", "nntp"]) {
-      folders[`${type}://x/Inbox`] = makeFolder(`${type}://x/Inbox`, { type });
-    }
-    const { refreshFolder } = loadRefresh({ folders });
-    for (const [uri, f] of Object.entries(folders)) {
-      const res = await refreshFolder(uri, 5000);
-      assert.equal(res.success, true);
-      assert.match(res.skipped, /no server-side folder/);
-      assert.equal(f.updateCalls, 0);
-    }
-  });
-
-  it("rejects unknown paths, saved searches and no-select folders", async () => {
-    const virt = makeFolder("owl://acct/Saved", { type: "owl", flags: FLAGS.Virtual });
-    const noselect = imapFolder("imap://acct/[Gmail]", { flags: FLAGS.ImapNoselect });
-    const { refreshFolder } = loadRefresh({ folders: { [virt.URI]: virt, [noselect.URI]: noselect } });
-    assert.match((await refreshFolder("imap://nope", 5000)).error, /not found/);
-    assert.match((await refreshFolder(virt.URI, 5000)).error, /virtual/);
-    assert.match((await refreshFolder(noselect.URI, 5000)).error, /no-select/);
-    assert.equal(virt.updateCalls + noselect.imapUpdateCalls, 0);
+  it("cleans up when starting an update throws", async () => {
+    const h = loadRefresh();
+    h.folder.updateFolderWithListener = () => { throw new Error("Cannot start update"); };
+    const result = await h.refresh();
+    assert.equal(result.status, "error");
+    assert.match(result.error, /Cannot start update/);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.clock.activeTimers.length, 0);
   });
 });
 
-describe("refreshFolder on add-on accounts (Owl)", () => {
-  // Owl folder whose updateFolder fires FolderLoaded after `delayMs`.
-  function owlFolder(uri, mailSession, { arrivals = 0, delayMs = 20, never = false, flags = 0 } = {}) {
-    const f = makeFolder(uri, { type: "owl", arrivals, flags });
-    f.updateFolder = () => {
-      f.updateCalls++;
-      if (!never) setTimeout(() => { f.complete(); mailSession.fire(f, "FolderLoaded"); }, delayMs);
-    };
-    return f;
+describe("refreshFolder lifecycle and access", () => {
+  it("keeps listening after a caller timeout and lets a fresh caller join", async () => {
+    const h = loadRefresh({ delay: null });
+    const first = h.refresh();
+    await h.clock.advance(WAIT_MS);
+    const timeout = await first;
+    assert.equal(timeout.status, "timeout");
+    assert.equal(timeout.success, false);
+    assert.equal(timeout.updateConfirmed, false);
+    assert.match(timeout.error, /not confirmed/);
+    assert.equal(h.listeners.size, 1);
+    const second = h.refresh();
+    h.folder.finishUrl(h.folder.updateUrl, 0);
+    await h.clock.flush();
+    const result = await second;
+    assert.equal(result.status, "loaded");
+    assert.equal(result.joinedInFlight, true);
+    assert.equal(h.folder.imapUpdateCalls, 1);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("retries a stale folder wait and retires its observer without renewing age", async () => {
+    const h = loadRefresh({ delay: null });
+    const first = h.refresh();
+    await h.clock.advance(WAIT_MS);
+    await first;
+    await h.clock.advance(h.runtime.REFRESH_MAX_TIMEOUT_MS - WAIT_MS);
+    const second = h.refresh();
+    assert.equal(h.folder.imapUpdateCalls, 2);
+    assert.equal(h.listeners.size, 1, "the old observer was retired");
+    h.mailSession.fire(h.folder);
+    await h.clock.flush();
+    const result = await second;
+    assert.equal(result.joinedInFlight, undefined);
+    assert.equal(result.status, "loaded");
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("provides a 5-second structured adapter without reading message counts", async () => {
+    const h = loadRefresh({ delay: null });
+    const searchWaitMs = 5000;
+    const pending = h.runtime.waitForFolderRefresh(h.folder, searchWaitMs);
+    await h.clock.advance(searchWaitMs);
+    const result = await pending;
+    assert.equal(result.status, "timeout");
+    assert.equal(result.joinedInFlight, false);
+    assert.equal(result.folderPath, undefined);
+    assert.equal(h.folder.countReads, 0);
+    h.folder.finishUrl(h.folder.updateUrl, 0);
+    await h.clock.flush();
+  });
+
+  it("refuses offline calls without starting or joining a provider", async () => {
+    const h = loadRefresh({ offline: true });
+    for (const call of [() => h.refresh(), () => h.runtime.waitForFolderRefresh(h.folder, WAIT_MS)]) {
+      const result = await call();
+      assert.equal(result.status, "error");
+      assert.match(result.error, /offline/);
+    }
+    assert.equal(h.folder.imapUpdateCalls, 0);
+    assert.equal(h.folder.countReads, 0);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.clock.activeTimers.length, 0);
+  });
+
+  it("does not join an existing refresh after Thunderbird goes offline", async () => {
+    const h = loadRefresh({ delay: null });
+    const first = h.refresh();
+    await h.clock.advance(WAIT_MS);
+    await first;
+    h.runtime.Services.io.offline = true;
+    const result = await h.refresh();
+    assert.equal(result.status, "error");
+    assert.match(result.error, /offline/);
+    assert.equal(result.joinedInFlight, undefined);
+    assert.equal(h.folder.imapUpdateCalls, 1);
+    await h.clock.advance(h.runtime.REFRESH_ABANDON_MS);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("rejects inaccessible and unknown folders before provider or count access", async () => {
+    const denied = loadRefresh({ denied: true });
+    assert.match((await denied.refresh()).error, /not accessible/);
+    assert.equal(denied.folder.countReads, 0);
+    assert.equal(denied.folder.imapUpdateCalls, 0);
+    const unknown = loadRefresh();
+    assert.match((await unknown.runtime.refreshFolder("missing")).error, /not found/);
+  });
+
+  for (const type of ["imap", "owl", "none", "pop3"]) {
+    it(`refuses a ${type} account root without walking descendants`, async () => {
+      const h = loadRefresh({ type });
+      h.folder.isServer = true;
+      Object.defineProperty(h.folder, "descendants", { get() { return assert.fail("must not fan out"); } });
+      assert.match((await h.refresh()).error, /Account roots/);
+      assert.equal(h.folder.updateCalls + h.folder.imapUpdateCalls, 0);
+      assert.equal(h.folder.countReads, 0);
+    });
   }
 
-  it("waits for the folder's FolderLoaded event and removes its listener", async () => {
-    const mailSession = makeMailSession();
-    const sent = owlFolder("owl://acct/Sent", mailSession, { arrivals: 1 });
-    const { refreshFolder } = loadRefresh({ folders: { [sent.URI]: sent }, mailSession });
-    const res = await refreshFolder(sent.URI, 5000);
-    assert.equal(res.success, true);
-    assert.equal(res.status, "loaded");
-    assert.equal(res.netMessageDelta, 1);
-    assert.equal(sent.updateCalls, 1);
-    assert.equal(mailSession.listeners.size, 0);
+  it("refuses saved searches and no-select folders, including local saved searches", async () => {
+    for (const [type, flag, message] of [["imap", FLAGS.ImapNoselect, /no-select/], ["owl", FLAGS.Virtual, /virtual/], ["none", FLAGS.Virtual, /virtual/]]) {
+      const h = loadRefresh({ type });
+      h.folder.flags = flag;
+      assert.match((await h.refresh()).error, message);
+      assert.equal(h.folder.updateCalls + h.folder.imapUpdateCalls, 0);
+    }
   });
 
-  it("ignores other folders' FolderLoaded and other events", async () => {
-    const mailSession = makeMailSession();
-    const other = makeFolder("owl://acct/Other", { type: "owl" });
-    const inbox = makeFolder("owl://acct/Inbox", { type: "owl" });
-    inbox.updateFolder = () => {
-      setTimeout(() => mailSession.fire(other, "FolderLoaded"), 5);
-      setTimeout(() => mailSession.fire(inbox, "CompactCompleted"), 10);
-      setTimeout(() => mailSession.fire(inbox, "FolderLoaded"), 40);
-    };
-    const { refreshFolder } = loadRefresh({ folders: { [inbox.URI]: inbox }, mailSession });
-    const res = await refreshFolder(inbox.URI, 5000);
-    assert.equal(res.status, "loaded");
-    assert.ok(res.elapsedMs >= 35, `settled early after ${res.elapsedMs}ms`);
+  it("skips unsupported individual local, POP, RSS and news folders", async () => {
+    for (const type of ["none", "pop3", "rss", "nntp"]) {
+      const h = loadRefresh({ type });
+      const result = await h.refresh();
+      assert.equal(result.success, true);
+      assert.match(result.skipped, /not supported/);
+      assert.equal(h.folder.updateCalls, 0);
+    }
   });
+});
 
-  it("catches a FolderLoaded fired synchronously inside updateFolder", async () => {
-    const mailSession = makeMailSession();
-    const inbox = makeFolder("owl://acct/Inbox", { type: "owl" });
-    inbox.updateFolder = () => mailSession.fire(inbox, "FolderLoaded");
-    const { refreshFolder } = loadRefresh({ folders: { [inbox.URI]: inbox }, mailSession });
-    assert.equal((await refreshFolder(inbox.URI, 5000)).status, "loaded");
-  });
+describe("refreshFolder generic providers", () => {
+  for (const type of ["owl", "ews", "graph"]) {
+    it(`waits for ${type} loaded without claiming a confirmed successful update`, async () => {
+      const h = loadRefresh({ type });
+      const pending = h.refresh();
+      h.mailSession.fire({ URI: "other" });
+      h.mailSession.fire(h.folder, "CompactCompleted");
+      await h.clock.advance(UPDATE_MS);
+      const result = await pending;
+      assert.equal(result.status, "loaded");
+      assert.equal(result.updateConfirmed, false);
+      assert.match(result.warning, /could not be confirmed/);
+      assert.equal(result.elapsedMs, UPDATE_MS);
+      assert.equal(h.folder.updateCalls, 1);
+      assert.equal(h.listeners.size, 0);
+    });
+  }
 
-  it("keeps listening past a timeout; a repeat call joins and sees the end", async () => {
-    const mailSession = makeMailSession();
-    const slow = owlFolder("owl://acct/Slow", mailSession, { never: true });
-    const { refreshFolder } = loadRefresh({ folders: { [slow.URI]: slow }, mailSession });
-
-    const first = await refreshFolder(slow.URI, 1000);
-    assert.equal(first.status, "timeout");
-    assert.equal(mailSession.listeners.size, 1, "listener stays until the sync really ends");
-
-    const secondP = refreshFolder(slow.URI, 5000);
-    setTimeout(() => mailSession.fire(slow, "FolderLoaded"), 20);
-    const second = await secondP;
-    assert.equal(second.status, "loaded");
-    assert.equal(second.joinedInFlight, true);
-    assert.equal(slow.updateCalls, 1);
-    assert.equal(mailSession.listeners.size, 0);
-  });
-
-  it("account root: refreshes the Inbox and check-new folders, as Get Messages does", async () => {
-    const mailSession = makeMailSession();
-    const inbox = owlFolder("owl://acct/Inbox", mailSession, { flags: FLAGS.Inbox, arrivals: 3 });
-    const watched = owlFolder("owl://acct/Watched", mailSession, { flags: FLAGS.CheckNew });
-    const sent = owlFolder("owl://acct/Sent", mailSession, { flags: FLAGS.SentMail });
-    const root = { URI: "owl://acct", isServer: true, flags: 0, server: { type: "owl" }, descendants: [inbox, watched, sent] };
-    const { refreshFolder } = loadRefresh({ folders: { [root.URI]: root }, mailSession });
-
-    const res = await refreshFolder(root.URI, 5000);
-    assert.equal(res.success, true);
-    assert.equal(res.scope, "account");
-    // Spread into this realm: arrays built inside the vm context fail deepEqual on prototype.
-    assert.deepEqual([...res.results.map(r => r.folderPath)], [inbox.URI, watched.URI]);
-    assert.equal(res.results[0].netMessageDelta, 3);
-    assert.equal(sent.updateCalls, 0);
-  });
-
-  it("IMAP account root uses the IMAP path for its Inbox", async () => {
-    const inbox = imapFolder("imap://acct/INBOX", { flags: FLAGS.Inbox });
-    const root = { URI: "imap://acct", isServer: true, flags: 0, server: { type: "imap" }, descendants: [inbox] };
-    const { refreshFolder } = loadRefresh({ folders: { [root.URI]: root } });
-    const res = await refreshFolder(root.URI, 5000);
-    assert.equal(res.success, true);
-    assert.equal(inbox.imapUpdateCalls, 1);
-    assert.equal(inbox.updateCalls, 0);
+  it("accepts synchronous generic-provider loading without the IMAP no-update claim", async () => {
+    const h = loadRefresh({ type: "owl" });
+    h.folder.updateFolder = () => h.mailSession.fire(h.folder);
+    const pending = h.refresh();
+    await h.clock.flush();
+    const result = await pending;
+    assert.equal(result.status, "loaded");
+    assert.doesNotMatch(result.warning, /No update ran/);
+    assert.equal(h.listeners.size, 0);
   });
 });

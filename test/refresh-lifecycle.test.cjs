@@ -151,8 +151,16 @@ describe("bounded refresh production lifecycle", () => {
     await clock.advance(SHORT_WAIT_MS);
     assert.equal((await first).status, "timeout");
     const second = runtime.waitForRefresh(inFlight, KEY, LONG_WAIT_MS, () => assert.fail("must join"));
-    await clock.advance(LONG_WAIT_MS);
-    const result = await second;
+    let finished = false;
+    const observedSecond = (async () => {
+      const result = await second;
+      finished = true;
+      return result;
+    })();
+    await clock.advance(LONG_WAIT_MS - 1);
+    assert.equal(finished, false);
+    await clock.advance(1);
+    const result = await observedSecond;
     assert.equal(result.status, "timeout");
     assert.equal(result.joinedInFlight, true);
     assert.equal(clock.now, SHORT_WAIT_MS + LONG_WAIT_MS);
