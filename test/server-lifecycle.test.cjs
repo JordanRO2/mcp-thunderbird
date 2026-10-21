@@ -405,9 +405,9 @@ describe("Tool Access initialization and server startup", () => {
       },
     });
     assert.equal(state.servers.length, 0);
-    assert.deepEqual(events, [access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE]);
+    assert.deepEqual(events, [access.prefNames.PREF_TOOL_ACCESS_STATE, access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE]);
     assert.equal((await api.start()).success, true);
-    assert.deepEqual(events, [access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE, "bind"]);
+    assert.deepEqual(events, [access.prefNames.PREF_TOOL_ACCESS_STATE, access.prefNames.PREF_DISABLED_TOOLS, access.prefNames.PREF_TOOL_ACCESS_STATE, "bind"]);
   });
 
   it("does not repeat migration writes across repeated starts, Options contexts or runtime reloads", async () => {
@@ -416,7 +416,7 @@ describe("Tool Access initialization and server startup", () => {
     });
     const first = loadServerLifecycle({ accessRuntime: access });
     const writesAfterInitialization = access.writes.length;
-    assert.equal(writesAfterInitialization, 2);
+    assert.equal(writesAfterInitialization, 3);
     assert.equal((await first.api.start()).success, true);
     assert.equal((await first.api.start()).success, true);
     await first.sandbox.getAPI().getToolAccessConfig();
@@ -467,8 +467,11 @@ describe("Tool Access initialization and server startup", () => {
       assert.equal((await api.start()).success, true);
       assert.equal(state.servers[0].listening, true);
       const config = await api.getToolAccessConfig();
-      assert.equal(config.mode, "error");
-      assert.ok(config.tools.every(tool => tool.enabled === tool.undisableable));
+      const trackingFailure = failure === "tracking write";
+      assert.equal(config.mode, trackingFailure ? "restricted" : "error");
+      assert.ok(config.tools.every(tool => tool.enabled === (trackingFailure
+        ? tool.name !== "getMessage" && !Object.hasOwn(access.policy.introducedIn, tool.name)
+        : tool.undisableable)));
 
       // Drive the production handler registered by start(), reusing the access
       // harness's request/response pattern and this fixture's stream boundary.
@@ -484,7 +487,7 @@ describe("Tool Access initialization and server startup", () => {
           write(value) { result += value; }, finish() { resolve(JSON.parse(result)); },
         });
       });
-      assert.deepEqual(response.result.tools.map(tool => tool.name).sort(), ["getAccountAccess", "listAccounts", "listFolders"]);
+      assert.deepEqual(response.result.tools.map(tool => tool.name).sort(), Array.from(config.tools).filter(tool => tool.enabled).map(tool => tool.name).sort());
       if (failure.startsWith("corrupt")) {
         assert.deepEqual(access.writes, []);
         const pref = failure === "corrupt tracking" ? "PREF_TOOL_ACCESS_STATE" : "PREF_DISABLED_TOOLS";

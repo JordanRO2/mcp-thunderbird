@@ -265,6 +265,8 @@ Starting with 0.10.0, updates respect customized **Tool Access**: if you have di
 
 If policy prevents saving the new restrictions, Options shows a note that Tool Access is managed by policy. Newly encountered tools stay disabled while existing tools keep following the policy's list. Migration completes after the preference is unlocked and its effective value can be updated. An untouched profile with a locked empty list keeps all tools enabled.
 
+An observed restriction remains remembered if policy later empties the disabled list, including after a restart. If Tool Access history itself cannot be saved, newly encountered tools stay disabled until saving works; existing tools continue following their effective settings.
+
 Two compatibility limits apply. A 0.9.x profile that disabled tools and then re-enabled everything looks identical to an untouched profile, so its first upgrade keeps all tools enabled. Downgrading to 0.9.3 and saving Tool Access there can rewrite the disabled list and discard restrictions for newer tools; review those choices after upgrading again.
 
 `dryRunCompose` also requires `sendMail` to be enabled: disabling its parent hides it from `tools/list` and refuses calls. Options reflects this dependency immediately, including unsaved parent changes, while preserving the child's separate enabled/disabled choice.

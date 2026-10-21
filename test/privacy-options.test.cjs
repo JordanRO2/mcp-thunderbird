@@ -594,7 +594,9 @@ describe("Options Tool Access upgrades with the production preference API", () =
       await ui.saveToolsBtn.fire("click");
       assert.match(ui.saveToolsStatus.textContent, /managed by policy/i);
       assert.equal(ui.saveToolsStatus.className, "save-status error");
-      assert.equal(runtime.values.has(runtime.prefNames.PREF_TOOL_ACCESS_STATE), false);
+      const observed = JSON.parse(runtime.values.get(runtime.prefNames.PREF_TOOL_ACCESS_STATE));
+      assert.equal(observed.customized, true);
+      assert.equal(observed.consideredRelease, "0.9.3");
       assert.equal(runtime.isToolEnabled("refreshFolder"), false);
       runtime.locked.clear();
       await ui.saveToolsBtn.fire("click");

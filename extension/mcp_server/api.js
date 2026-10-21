@@ -1467,6 +1467,7 @@ const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_TOOL_ACCESS_STATE = "extensions.thunderbird-mcp.toolAccessState";
+const PREF_TOOL_ACCESS_CUSTOMIZED = "extensions.thunderbird-mcp.toolAccessCustomized";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
@@ -3595,6 +3596,45 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // BEGIN TOOL ACCESS STATE
     const TOOL_ACCESS_ERROR = "Tool access preferences are corrupt, unreadable, or could not be saved. All non-infrastructure tools are blocked. Change tool selections explicitly to repair them.";
     const TOOL_ACCESS_POLICY = "Tool Access is managed by policy.";
+    const TOOL_ACCESS_TRACKING_ERROR = "Tool Access history could not be saved. New tools stay disabled until the settings can be saved.";
+    // Searched tracking readers/writers and boolean preference helpers. Reuse
+    // parseState; the opt-in reader's false-on-error behavior is unsafe here.
+    function readToolAccessState() {
+      const type = Services.prefs.getPrefType(PREF_TOOL_ACCESS_STATE);
+      if (type === Ci.nsIPrefBranch.PREF_INVALID) return null;
+      if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Invalid tracking preference type");
+      return toolAccess.parseState(Services.prefs.getStringPref(PREF_TOOL_ACCESS_STATE));
+    }
+
+    function writeToolAccessState(state) {
+      let saved = false;
+      if (state.customized) globalThis.__tbMcpToolAccessCustomized = true;
+      try {
+        try {
+          if (Services.prefs.prefIsLocked?.(PREF_TOOL_ACCESS_STATE)) return false;
+          Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(state));
+        } catch { return false; }
+        saved = JSON.stringify(readToolAccessState()) === JSON.stringify(state);
+        return saved;
+      } finally {
+        if (!saved && state.customized) {
+          // A policy may lock tracking false and later empty the deny-list.
+          // Keep a permanent observation journal for that restart/unlock case;
+          // it never contains or advances the considered-tool inventory.
+          try {
+            Services.prefs.setBoolPref(PREF_TOOL_ACCESS_CUSTOMIZED, true);
+            const remembered = Services.prefs.getBoolPref(PREF_TOOL_ACCESS_CUSTOMIZED);
+            globalThis.__tbMcpToolAccessCustomized = remembered || globalThis.__tbMcpToolAccessCustomized;
+          } catch { /* Runtime evidence and the pending-tool guard remain active. */ }
+        }
+      }
+    }
+
+    function pendingToolAccessState(disabled, state) {
+      const baseline = toolAccess.considerTools([], state, []).state;
+      const pending = toolAccess.considerTools(disabled, { ...baseline, customized: true }, ALL_TOOL_NAMES);
+      return { disabled: pending.disabled, state, error: "", note: TOOL_ACCESS_TRACKING_ERROR };
+    }
     // Searched readAccessListPref/setToolAccess and migration/revision helpers.
     // Reuse the deny-list parser; there was no tracking record or stale-save guard.
     function ensureToolAccessState() {
@@ -3603,12 +3643,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       let locked = false;
       try {
         locked = Services.prefs.prefIsLocked?.(PREF_DISABLED_TOOLS) || false;
-        const type = Services.prefs.getPrefType(PREF_TOOL_ACCESS_STATE);
-        if (type !== Ci.nsIPrefBranch.PREF_INVALID) {
-          if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Invalid tracking preference type");
-          state = toolAccess.parseState(Services.prefs.getStringPref(PREF_TOOL_ACCESS_STATE));
-        }
+        state = readToolAccessState();
         if (corrupt || disabled.includes("__all__")) throw new Error(TOOL_ACCESS_ERROR);
+        let remembered = false;
+        try {
+          // Only true is ever written. Any present value is evidence, including
+          // a locked false default hiding a user write or a malformed journal.
+          remembered = Services.prefs.getPrefType(PREF_TOOL_ACCESS_CUSTOMIZED) !== Ci.nsIPrefBranch.PREF_INVALID;
+        } catch { remembered = true; } // Uncertain history must not mean untouched.
+        if (disabled.length || state?.customized || remembered) globalThis.__tbMcpToolAccessCustomized = true;
+        if (globalThis.__tbMcpToolAccessCustomized && !state?.customized) {
+          const observed = { ...toolAccess.considerTools([], state, []).state, customized: true };
+          // Persist the observation before any denial can change. This write
+          // deliberately retains the old considered release and tool names.
+          if (!writeToolAccessState(observed)) return pendingToolAccessState(disabled, state);
+          state = observed;
+        }
         const next = toolAccess.considerTools(disabled, state, ALL_TOOL_NAMES);
         // No await between reading and committing. An interrupted migration may
         // repeat additions, but must never mark an unwritten denial considered.
@@ -3632,7 +3682,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           next.disabled = effective;
         }
         if (JSON.stringify(next.state) !== JSON.stringify(state)) {
-          Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(next.state));
+          if (!writeToolAccessState(next.state)) return pendingToolAccessState(next.disabled, state);
         }
         return { ...next, error: "", note: locked ? TOOL_ACCESS_POLICY : "" };
       } catch {
@@ -3641,7 +3691,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     }
 
     function getToolAccessRevision(access) {
-      const preferences = [PREF_DISABLED_TOOLS, PREF_TOOL_ACCESS_STATE, PREF_GET_MESSAGES_LIMIT].map(name => {
+      const preferences = [PREF_DISABLED_TOOLS, PREF_TOOL_ACCESS_STATE, PREF_TOOL_ACCESS_CUSTOMIZED, PREF_GET_MESSAGES_LIMIT].map(name => {
         try {
           const type = Services.prefs.getPrefType(name);
           let value = null;
@@ -15039,13 +15089,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const { state } = toolAccess.considerTools([], access.state, ALL_TOOL_NAMES);
             state.customized ||= disabledTools.length > 0 || !!access.error;
             delete globalThis.__tbMcpToolAccessRevision;
+            if (!access.error && state.customized && !access.state?.customized) {
+              const observed = { ...toolAccess.considerTools([], access.state, []).state, customized: true };
+              if (!writeToolAccessState(observed)) return { error: TOOL_ACCESS_TRACKING_ERROR };
+              access.state = observed;
+            }
             // During repair keep a durable fail-closed value until the tracking
             // write succeeds. A crash/write failure must not turn corruption into
             // an apparently untouched profile, especially for an enable-all save.
             // Retain absent-catalog denials in that staging value across restarts.
             writeDisabledTools(access.error ? ["__all__", ...disabledTools] : disabledTools);
             if (JSON.stringify(state) !== JSON.stringify(access.state)) {
-              Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(state));
+              if (!writeToolAccessState(state)) return { error: TOOL_ACCESS_TRACKING_ERROR };
             }
             if (access.error) writeDisabledTools(disabledTools);
             if (requestedLimit !== null) {

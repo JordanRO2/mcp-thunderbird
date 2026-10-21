@@ -17,6 +17,29 @@ async function saveSelection(runtime, disabled, limit = 10) {
   return runtime.options.setToolAccess(disabled, limit, revision);
 }
 
+// Reuse the production legacy inventory to check staging without copying it.
+function assertPendingCustomization(runtime) {
+  const state = JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE));
+  assert.equal(state.customized, true);
+  assert.equal(state.consideredRelease, "0.9.3");
+  assert.deepEqual(state.consideredTools, Array.from(runtime.policy.legacyTools));
+}
+
+// Reuse the production HTTP/Options harness for the failure/restart matrix.
+async function assertNewToolsBlocked(runtime) {
+  const calls = runtime.calls.length;
+  const listed = (await runtime.http("tools/list")).result.tools.map(tool => tool.name);
+  const config = await runtime.options.getToolAccessConfig();
+  for (const name of introduced) {
+    assert.ok(!listed.includes(name), name);
+    const option = config.tools.find(tool => tool.name === name);
+    assert.equal(option.enabled, false, name);
+    assert.equal(option.configuredEnabled, false, name);
+    assert.match((await runtime.http("tools/call", { name, arguments: {} })).error.message, /Tool is disabled/);
+  }
+  assert.equal(runtime.calls.length, calls);
+}
+
 // Existing dependency tests transform the production registry; do the same
 // for a future catalog entry and execute the actual buildTools() in the VM.
 function addedTool(name, release) {
@@ -68,7 +91,11 @@ describe("production Tool Access upgrade migration", () => {
     const runtime = loadPrivacyRuntime({ legacy: true, initial: { PREF_DISABLED_TOOLS: '["sendMail","retiredTool"]' } });
     const disabled = JSON.parse(runtime.values.get(prefNames.PREF_DISABLED_TOOLS));
     assert.deepEqual(disabled, ["sendMail", "retiredTool", ...runtime.tools.map(tool => tool.name).filter(name => introduced.includes(name))]);
-    assert.deepEqual(runtime.writes.map(write => write.name), [prefNames.PREF_DISABLED_TOOLS, prefNames.PREF_TOOL_ACCESS_STATE]);
+    assert.deepEqual(runtime.writes.map(write => write.name), [prefNames.PREF_TOOL_ACCESS_STATE, prefNames.PREF_DISABLED_TOOLS, prefNames.PREF_TOOL_ACCESS_STATE]);
+    const observed = JSON.parse(runtime.writes[0].value);
+    assert.equal(observed.customized, true);
+    assert.equal(observed.consideredRelease, "0.9.3");
+    assert.deepEqual(observed.consideredTools, Array.from(runtime.policy.legacyTools));
     const state = JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE));
     assert.equal(state.customized, true);
     assert.equal(state.consideredRelease, "0.10.0");
@@ -93,6 +120,7 @@ describe("production Tool Access upgrade migration", () => {
       assert.equal(runtime.values.get(prefNames.PREF_DISABLED_TOOLS), raw);
       assert.deepEqual(runtime.writes.map(write => write.name), [prefNames.PREF_TOOL_ACCESS_STATE]);
       assert.equal(JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, false);
+      assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), false);
     });
   }
 
@@ -173,6 +201,164 @@ describe("production Tool Access upgrade migration", () => {
   }
 });
 
+describe("sticky customization before migration", () => {
+  for (const restart of [false, true]) {
+    it(`retains customization when migration read-back becomes a locked empty list, restart=${restart}`, async () => {
+      const defaults = new Map();
+      const locked = new Set();
+      let runtime;
+      runtime = loadPrivacyRuntime({ legacy: true, initialize: false, defaults, locked,
+        initial: { PREF_DISABLED_TOOLS: '["getMessage"]' },
+        beforeWrite(name) {
+          if (name !== prefNames.PREF_DISABLED_TOOLS) return;
+          assertPendingCustomization(runtime);
+          defaults.set(name, "[]");
+          locked.add(name);
+        },
+      });
+      runtime.ensureToolAccessState();
+      if (restart) runtime = loadPrivacyRuntime({ legacy: true, values: runtime.values, defaults, locked });
+      for (let read = 0; read < 3; read++) {
+        await assertNewToolsBlocked(runtime);
+        assert.equal(runtime.isToolEnabled("getMessage"), true);
+        assertPendingCustomization(runtime);
+        assert.equal(runtime.Services.prefs.getStringPref(prefNames.PREF_DISABLED_TOOLS), "[]");
+      }
+      assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), false, "normal staging needs no fallback journal");
+    });
+  }
+
+  it("records customization even when the deny-list was already locked before initialization", async () => {
+    const defaults = new Map([[prefNames.PREF_DISABLED_TOOLS, '["getMessage"]']]);
+    const locked = new Set([prefNames.PREF_DISABLED_TOOLS]);
+    const first = loadPrivacyRuntime({ legacy: true, defaults, locked });
+    assertPendingCustomization(first);
+    defaults.set(prefNames.PREF_DISABLED_TOOLS, "[]");
+    const next = loadPrivacyRuntime({ legacy: true, values: first.values, defaults, locked });
+    await assertNewToolsBlocked(next);
+    assert.equal(next.isToolEnabled("getMessage"), true);
+  });
+
+  for (const failure of ["locked", "hidden write", "rejected write"]) {
+    it(`journals observed customization across empty policy, restart and unlock after ${failure}`, async () => {
+      const baseline = JSON.stringify(reference.policy.considerTools([], null, []).state);
+      const defaults = new Map([[prefNames.PREF_TOOL_ACCESS_STATE, baseline]]);
+      const locked = new Set(failure === "rejected write" ? [] : [prefNames.PREF_TOOL_ACCESS_STATE]);
+      const writeErrors = new Set(failure === "rejected write" ? [prefNames.PREF_TOOL_ACCESS_STATE] : []);
+      const exposeLocks = failure !== "hidden write";
+      let runtime = loadPrivacyRuntime({ legacy: true, defaults, locked, writeErrors, exposeLocks,
+        initial: { PREF_DISABLED_TOOLS: '["getMessage"]', PREF_TOOL_ACCESS_STATE: baseline },
+      });
+      await assertNewToolsBlocked(runtime);
+      assert.equal(runtime.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), true);
+      assert.equal(runtime.Services.prefs.getStringPref(prefNames.PREF_TOOL_ACCESS_STATE), baseline);
+      assert.ok(!runtime.writes.some(write => write.name === prefNames.PREF_DISABLED_TOOLS));
+      defaults.set(prefNames.PREF_DISABLED_TOOLS, "[]");
+      locked.add(prefNames.PREF_DISABLED_TOOLS);
+      await assertNewToolsBlocked(runtime);
+      runtime = loadPrivacyRuntime({ legacy: true, values: runtime.values, defaults, locked, writeErrors, exposeLocks });
+      await assertNewToolsBlocked(runtime);
+      assert.equal(runtime.isToolEnabled("getMessage"), true);
+      locked.delete(prefNames.PREF_TOOL_ACCESS_STATE);
+      writeErrors.clear();
+      await assertNewToolsBlocked(runtime);
+      assertPendingCustomization(runtime);
+      locked.clear();
+      await assertNewToolsBlocked(runtime);
+      assert.equal(JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).consideredRelease, "0.10.0");
+      assert.equal((await saveSelection(runtime, [])).success, true);
+      assert.equal(runtime.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), true);
+      const future = loadPrivacyRuntime({ legacy: true, values: runtime.values, defaults, locked, ...addedTool("futureTool", "0.11.0") });
+      assert.equal(future.isToolEnabled("futureTool"), false);
+      for (const name of introduced) assert.equal(future.isToolEnabled(name), true, name);
+    });
+  }
+
+  it("keeps the observation when only the considered-catalog write fails", async () => {
+    const first = loadPrivacyRuntime({ legacy: true, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' },
+      beforeWrite(name, value) {
+        if (name === prefNames.PREF_TOOL_ACCESS_STATE && JSON.parse(value).consideredRelease === "0.10.0") {
+          throw new Error("Catalog commit rejected");
+        }
+      },
+    });
+    await assertNewToolsBlocked(first);
+    assertPendingCustomization(first);
+    assert.equal(first.isToolEnabled("sendMail"), true);
+    const next = loadPrivacyRuntime({ legacy: true, values: first.values });
+    await assertNewToolsBlocked(next);
+    assert.equal(JSON.parse(next.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).consideredRelease, "0.10.0");
+  });
+
+  it("retains runtime evidence if both tracking and its journal reject writes", async () => {
+    const writeErrors = new Set([prefNames.PREF_TOOL_ACCESS_STATE, prefNames.PREF_TOOL_ACCESS_CUSTOMIZED]);
+    const runtime = loadPrivacyRuntime({ legacy: true, writeErrors, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' } });
+    runtime.values.set(prefNames.PREF_DISABLED_TOOLS, "[]");
+    await assertNewToolsBlocked(runtime);
+    assert.equal(runtime.isToolEnabled("getMessage"), true);
+    writeErrors.clear();
+    await assertNewToolsBlocked(runtime);
+    assert.equal(JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
+  });
+
+  for (const exposeLocks of [true, false]) {
+    it(`keeps repair's fail-closed staging when tracking is locked, lock API=${exposeLocks}`, async () => {
+      const defaults = new Map([[prefNames.PREF_TOOL_ACCESS_STATE, "{"]]);
+      const locked = new Set([prefNames.PREF_TOOL_ACCESS_STATE]);
+      const first = loadPrivacyRuntime({ legacy: true, defaults, locked, exposeLocks });
+      assert.ok((await saveSelection(first, [])).error);
+      assert.deepEqual(JSON.parse(first.values.get(prefNames.PREF_DISABLED_TOOLS)), ["__all__"]);
+      const next = loadPrivacyRuntime({ legacy: true, values: first.values, defaults, locked, exposeLocks });
+      await assertNewToolsBlocked(next);
+      locked.clear();
+      assert.equal((await saveSelection(next, [])).success, true);
+      assert.equal(JSON.parse(next.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
+      assert.equal(next.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), true);
+    });
+  }
+
+  for (const journal of ["malformed", "unreadable", "false"]) {
+    it(`treats ${journal} customization history conservatively without rewriting it`, async () => {
+      const raw = journal === "false" ? false : "unexpected";
+      const runtime = loadPrivacyRuntime({ legacy: true,
+        initial: { PREF_TOOL_ACCESS_CUSTOMIZED: raw },
+        unreadable: journal === "unreadable" ? ["PREF_TOOL_ACCESS_CUSTOMIZED"] : [],
+      });
+      await assertNewToolsBlocked(runtime);
+      assert.equal(runtime.isToolEnabled("getMessage"), true);
+      assert.equal(runtime.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), raw);
+      assert.equal(JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
+    });
+  }
+
+  it("keeps history when the fallback journal also has a locked false default", async () => {
+    const baseline = JSON.stringify(reference.policy.considerTools([], null, []).state);
+    const defaults = new Map([[prefNames.PREF_TOOL_ACCESS_STATE, baseline], [prefNames.PREF_TOOL_ACCESS_CUSTOMIZED, false]]);
+    const locked = new Set([prefNames.PREF_TOOL_ACCESS_STATE, prefNames.PREF_TOOL_ACCESS_CUSTOMIZED]);
+    const first = loadPrivacyRuntime({ legacy: true, defaults, locked, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' } });
+    await assertNewToolsBlocked(first);
+    assert.equal(first.Services.prefs.getBoolPref(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), false);
+    first.values.set(prefNames.PREF_DISABLED_TOOLS, "[]");
+    locked.delete(prefNames.PREF_TOOL_ACCESS_STATE);
+    const next = loadPrivacyRuntime({ legacy: true, values: first.values, defaults, locked });
+    await assertNewToolsBlocked(next);
+    assert.equal(next.isToolEnabled("getMessage"), true);
+    assert.equal(JSON.parse(next.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
+  });
+
+  it("does not label an untouched profile customized when tracking temporarily cannot be written", async () => {
+    const writeErrors = new Set([prefNames.PREF_TOOL_ACCESS_STATE]);
+    const runtime = loadPrivacyRuntime({ legacy: true, writeErrors });
+    await assertNewToolsBlocked(runtime);
+    assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), false);
+    writeErrors.clear();
+    const config = await runtime.options.getToolAccessConfig();
+    assert.equal(config.mode, "all");
+    assert.ok(config.tools.every(tool => tool.enabled));
+    assert.equal(JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, false);
+  });
+});
+
 describe("Tool Access migration with managed preferences", () => {
   for (const exposeLocks of [true, false]) {
     it(`blocks only unseen tools while the effective deny-list cannot change, lock API=${exposeLocks}`, async () => {
@@ -199,14 +385,14 @@ describe("Tool Access migration with managed preferences", () => {
           messages: [{ messageId: "fixture", folderPath: "imap://fixture/Inbox" }],
         } });
         assert.equal(JSON.parse(call.result.content[0].text).handled, "getMessages");
-        assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
-        assert.ok(runtime.writes.every(write => write.name === prefNames.PREF_DISABLED_TOOLS));
-        if (exposeLocks) assert.equal(runtime.writes.length, 0);
+        assertPendingCustomization(runtime);
+        assert.ok(runtime.writes.filter(write => write.name === prefNames.PREF_TOOL_ACCESS_STATE).length <= 1);
+        if (exposeLocks) assert.ok(runtime.writes.every(write => write.name === prefNames.PREF_TOOL_ACCESS_STATE));
         else assert.ok(JSON.parse(runtime.values.get(prefNames.PREF_DISABLED_TOOLS)).includes("refreshFolder"));
         assert.equal(runtime.Services.prefs.getStringPref(prefNames.PREF_DISABLED_TOOLS), defaults.get(prefNames.PREF_DISABLED_TOOLS));
         // An explicit enable cannot bypass the blocked migration through Options.
         assert.match((await runtime.options.setToolAccess([], 10, config.revision)).error, /managed by policy/i);
-        assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
+        assertPendingCustomization(runtime);
         runtime = loadPrivacyRuntime({ legacy: true, values: runtime.values, defaults, locked, exposeLocks });
       }
       locked.delete(prefNames.PREF_DISABLED_TOOLS);
@@ -267,7 +453,7 @@ describe("Tool Access migration with managed preferences", () => {
     assert.match(config.note, /managed by policy/i);
     assert.equal(runtime.isToolEnabled("refreshFolder"), false);
     assert.equal(runtime.isToolEnabled("getMessages"), true);
-    assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
+    assertPendingCustomization(runtime);
   });
 
   it("keeps already-considered tools enabled while a later release waits for an unlock", async () => {
@@ -309,7 +495,7 @@ describe("Tool Access migration with managed preferences", () => {
     const config = await runtime.options.getToolAccessConfig();
     assert.doesNotMatch(config.note, /new tools stay disabled/i);
     assert.ok(introduced.every(name => config.disabledTools.includes(name)));
-    assert.deepEqual(runtime.writes.map(write => write.name), [prefNames.PREF_TOOL_ACCESS_STATE]);
+    assert.deepEqual(runtime.writes.map(write => write.name), [prefNames.PREF_TOOL_ACCESS_STATE, prefNames.PREF_TOOL_ACCESS_STATE]);
     assert.ok(introduced.every(name => JSON.parse(runtime.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).consideredTools.includes(name)));
   });
 
@@ -317,25 +503,25 @@ describe("Tool Access migration with managed preferences", () => {
     const defaults = new Map([[prefNames.PREF_DISABLED_TOOLS, '["getMessage"]']]);
     const runtime = loadPrivacyRuntime({ legacy: true, defaults, exposeLocks: false,
       locked: new Set([prefNames.PREF_DISABLED_TOOLS]),
-      beforeWrite() { defaults.set(prefNames.PREF_DISABLED_TOOLS, '["deleteMessages"]'); },
+      beforeWrite(name) { if (name === prefNames.PREF_DISABLED_TOOLS) defaults.set(name, '["deleteMessages"]'); },
     });
     const config = await runtime.options.getToolAccessConfig();
     assert.equal(config.tools.find(tool => tool.name === "getMessage").enabled, true);
     assert.equal(config.tools.find(tool => tool.name === "deleteMessages").enabled, false);
     for (const name of introduced) assert.equal(runtime.isToolEnabled(name), false, name);
-    assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
+    assertPendingCustomization(runtime);
   });
 
   it("keeps corrupt read-back fully fail-closed instead of treating it as managed access", async () => {
     const runtime = loadPrivacyRuntime({ legacy: true, initialize: false,
       initial: { PREF_DISABLED_TOOLS: '["getMessage"]' },
-      beforeWrite() { runtime.readErrors.add(prefNames.PREF_DISABLED_TOOLS); },
+      beforeWrite(name) { if (name === prefNames.PREF_DISABLED_TOOLS) runtime.readErrors.add(name); },
     });
     const config = await runtime.options.getToolAccessConfig();
     assert.equal(config.mode, "error");
     assert.equal(config.note, undefined);
     assert.ok(config.tools.every(tool => tool.enabled === tool.undisableable));
-    assert.equal(runtime.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
+    assertPendingCustomization(runtime);
   });
 });
 
@@ -380,9 +566,11 @@ describe("Tool Access corruption, failures and revisions", () => {
     it(`fails closed on a migration write failure at ${name} and safely retries after restart`, async () => {
       const writeErrors = new Set([prefNames[name]]);
       const first = loadPrivacyRuntime({ legacy: true, writeErrors, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' } });
-      assert.equal((await first.options.getToolAccessConfig()).mode, "error");
-      assert.equal(first.isToolEnabled("sendMail"), false);
-      assert.equal(first.values.has(prefNames.PREF_TOOL_ACCESS_STATE), false);
+      const trackingFailure = name === "PREF_TOOL_ACCESS_STATE";
+      assert.equal((await first.options.getToolAccessConfig()).mode, trackingFailure ? "restricted" : "error");
+      assert.equal(first.isToolEnabled("sendMail"), trackingFailure);
+      if (trackingFailure) assert.equal(first.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), true);
+      else assertPendingCustomization(first);
       const next = loadPrivacyRuntime({ legacy: true, values: first.values });
       for (const tool of introduced) assert.equal(next.isToolEnabled(tool), false);
       assert.equal(JSON.parse(next.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
@@ -410,7 +598,8 @@ describe("Tool Access corruption, failures and revisions", () => {
     const first = loadPrivacyRuntime({ legacy: true });
     first.writeErrors.add(prefNames.PREF_TOOL_ACCESS_STATE);
     assert.ok((await saveSelection(first, ["getMessage"])).error);
-    assert.equal(first.isToolEnabled("sendMail"), false);
+    assert.equal(first.isToolEnabled("sendMail"), true);
+    assert.equal(first.values.get(prefNames.PREF_TOOL_ACCESS_CUSTOMIZED), true);
     const next = loadPrivacyRuntime({ legacy: true, values: first.values });
     assert.equal(JSON.parse(next.values.get(prefNames.PREF_TOOL_ACCESS_STATE)).customized, true);
     assert.equal((await saveSelection(next, [])).success, true);
