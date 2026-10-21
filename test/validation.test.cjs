@@ -922,6 +922,7 @@ describe('Production contact schemas and dispatch', () => {
   const toolsByName = new Map(productionContacts.tools.map(tool => [tool.name, tool]));
   const contactFields = [
     'email',
+    'emails',
     'displayName',
     'firstName',
     'lastName',
@@ -946,6 +947,12 @@ describe('Production contact schemas and dispatch', () => {
     assert.deepEqual(Array.from(updateSchema.required), ['contactId']);
 
     for (const schema of [createSchema, updateSchema]) {
+      const emailItems = schema.properties.emails.items;
+      assert.deepEqual(Object.keys(emailItems.properties), ['type', 'address']);
+      assert.deepEqual(Array.from(emailItems.properties.type.enum), ['work', 'home']);
+      assert.deepEqual(Array.from(emailItems.required), ['address']);
+      assert.equal(emailItems.additionalProperties, false);
+
       const phoneItems = schema.properties.phones.items;
       assert.deepEqual(Object.keys(phoneItems.properties), ['type', 'number']);
       assert.deepEqual(Array.from(phoneItems.properties.type.enum), [
@@ -1021,6 +1028,25 @@ describe('Validation: contact write operations', () => {
       addresses: [{ type: 'home', city: 'Warsaw', label: 'private' }],
     });
     assert.ok(addressErrors.some(error => /Unknown parameter: addresses\[0\]\.label/.test(error)));
+  });
+
+  it('createContact accepts typed and untyped email items and deep-validates them', () => {
+    assert.deepEqual(validate('createContact', {
+      emails: [
+        { address: 'ada@example.com' },
+        { type: 'home', address: 'ada@home.example' },
+      ],
+    }), []);
+
+    const typeErrors = validate('createContact', {
+      emails: [{ type: 'other', address: 'ada@example.com' }],
+    });
+    assert.ok(typeErrors.some(error => /must be one of/.test(error)));
+
+    const unknownErrors = validate('createContact', {
+      emails: [{ address: 'ada@example.com', label: 'private' }],
+    });
+    assert.ok(unknownErrors.some(error => /Unknown parameter: emails\[0\]\.label/.test(error)));
   });
 
   it('getContact requires a contactId', () => {

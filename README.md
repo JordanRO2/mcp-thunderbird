@@ -142,10 +142,10 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 
 | Tool | Description |
 |------|-------------|
-| `searchContacts` | Search contacts across all address books by email or name and return full contact details. Supports `maxResults`. |
-| `getContact` | Read full contact details by UID |
-| `createContact` | Create a contact with optional email/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
-| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty phone/address arrays clear those collections |
+| `searchContacts` | Search contacts across all address books by any of their email addresses or by name and return full contact details. Supports `maxResults`. |
+| `getContact` | Read full contact details by UID, including every email address (`emails`, primary first) |
+| `createContact` | Create a contact with optional email addresses/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
+| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty email/phone/address arrays clear those collections |
 | `deleteContact` | Delete a contact by UID |
 
 ### Calendar

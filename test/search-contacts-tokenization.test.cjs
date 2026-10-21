@@ -3,7 +3,8 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
-// Mirrors the XPCOM-free matcher inside searchContacts; email represents card.primaryEmail.
+// Mirrors the XPCOM-free matcher inside searchContacts; emails represents
+// getContactEmailAddresses(card), every address of the card.
 function matchesContactQuery(card, query) {
   const lowerQuery = (query || "").toLowerCase();
   const hasQuery = !!lowerQuery;
@@ -13,11 +14,11 @@ function matchesContactQuery(card, query) {
   }
   const failedQuery = hasQuery && queryTokens.length === 0;
 
-  const email = (card.email || "").toLowerCase();
+  const emails = (card.emails || []).map(address => address.toLowerCase());
   const displayName = (card.displayName || "").toLowerCase();
   const firstName = (card.firstName || "").toLowerCase();
   const lastName = (card.lastName || "").toLowerCase();
-  const fields = [email, displayName, firstName, lastName];
+  const fields = [...emails, displayName, firstName, lastName];
 
   if (failedQuery) return false;
   return !hasQuery || queryTokens.every(token =>
@@ -30,7 +31,7 @@ describe("searchContacts tokenization", () => {
     displayName: "Klocok, Viliam",
     firstName: "Viliam",
     lastName: "Klocok",
-    email: "viliam.klocok@gmail.com",
+    emails: ["viliam.klocok@gmail.com", "v.klocok@example.org"],
   };
 
   it("matches reporter's CardDAV displayName cases", () => {
@@ -44,6 +45,12 @@ describe("searchContacts tokenization", () => {
     assert.equal(matchesContactQuery(klocok, "Viliam"), true);
     assert.equal(matchesContactQuery(klocok, "Klocok"), true);
     assert.equal(matchesContactQuery(klocok, "viliam.klocok@gmail.com"), true);
+  });
+
+  it("matches any of the contact's email addresses", () => {
+    assert.equal(matchesContactQuery(klocok, "v.klocok@example.org"), true);
+    assert.equal(matchesContactQuery(klocok, "example.org Viliam"), true);
+    assert.equal(matchesContactQuery(klocok, "klocok@example.com"), false);
   });
 
   it("splits comma-included queries into AND tokens", () => {
