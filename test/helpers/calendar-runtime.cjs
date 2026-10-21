@@ -125,7 +125,8 @@ class CalendarItem {
     this.properties = new Map();
     this.attendees = [];
     this.categories = [];
-    // null inherits the parent's alarms; [] is an explicit empty override.
+    // null inherits and caches the parent's alarms on first read; [] is an
+    // explicit empty override.
     this.alarms = null;
     this.recurrenceInfo = null;
   }
@@ -143,7 +144,10 @@ class CalendarItem {
   addAttendee(attendee) { this.attendees.push(attendee); }
   removeAttendee(attendee) { this.attendees = this.attendees.filter(value => value !== attendee); }
   getAlarms() {
-    return (this.alarms ?? (this.parentItem !== this ? this.parentItem.getAlarms() : [])).slice();
+    if (this.alarms === null && this.parentItem !== this) {
+      this.alarms = this.parentItem.getAlarms();
+    }
+    return (this.alarms ?? []).slice();
   }
   addAlarm(alarm) {
     if (this.alarms === null) this.alarms = this.getAlarms();
@@ -168,9 +172,12 @@ class CalendarItem {
         clone.recurrenceInfo[name] = this.recurrenceInfo[name].map(item => {
           const copy = item.clone();
           copy.parentItem = clone;
-          // Unmodified proxies follow the cloned series; exceptions keep their
-          // own snapshot, including explicit empty alarm lists.
-          if (name === "occurrences" && item.alarms === null) copy.alarms = null;
+          // Re-expanding a cloned series creates fresh unmodified proxies,
+          // even if a previous listing cached their inherited alarms.
+          // Stored exceptions keep their own snapshot, including empty lists.
+          if (name === "occurrences" && !this.recurrenceInfo.getExceptionFor(item.recurrenceId)) {
+            copy.alarms = null;
+          }
           return copy;
         });
       }

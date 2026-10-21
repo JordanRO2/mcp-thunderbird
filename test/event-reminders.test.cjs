@@ -142,7 +142,6 @@ describe("Production managed reminder replacement", () => {
           assert.equal(result.mode, "occurrence");
           assert.equal(item.parentItem, master);
           assert.equal(item.recurrenceId.compare(original.recurrenceId), 0);
-          assert.equal(original.alarms, null, "the stored occurrence still inherits");
         }
         const alarms = item.getAlarms();
         assert.deepEqual(alarms.slice(0, retained.length), retained);
@@ -246,6 +245,8 @@ describe("Production managed reminder replacement", () => {
     exception.title = "Modified occurrence";
     exception.alarms = [runtime.makeAlarm({ seconds: -300 }), ...unmanagedAlarms(runtime)];
     master.recurrenceInfo.exceptions.push(exception);
+    const before = await runtime.invoke("listEvents", range);
+    assert.deepEqual(plain(before.map(event => event.reminders)), [[60], [5]]);
     const result = await runtime.invoke("updateEvent", { ...updateArgs, reminders: [90] });
     assert.equal(result.success, true, result.error);
     const written = runtime.calls.modifies[0].item;
@@ -254,6 +255,7 @@ describe("Production managed reminder replacement", () => {
     assert.notEqual(keptException, exception);
     assert.equal(keptException.title, exception.title);
     assert.equal(master.getAlarms()[0].offset.inSeconds, -3600);
+    assert.equal(occurrences[0].getAlarms()[0].offset.inSeconds, -3600, "previously read proxies keep their cached alarms");
     assert.equal(exception.getAlarms()[0].offset.inSeconds, -300);
     runtime.items.set(master.id, written);
     const listed = await runtime.invoke("listEvents", range);
