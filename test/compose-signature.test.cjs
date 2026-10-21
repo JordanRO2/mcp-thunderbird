@@ -9,6 +9,8 @@ const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderPa
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const MAX_SIGNATURE_BYTES = 1024 * 1024;
+const IMAGE_SIGNATURE_BYTES = 18 * 1024 * 1024;
+const DEFAULT_SIZE_WARNING_BYTES = 20 * 1024 * 1024;
 const DRAFTS_URI = "imap://user@example.test/Drafts";
 
 // Reuse the production-marker VM pattern from privacy-messages.test.cjs and
@@ -22,10 +24,14 @@ function snippet(name) {
 
 function loadSignatureHelpers(options = {}) {
   const bytes = Buffer.from(options.bytes ?? "signature", "utf8").toString("latin1");
-  const calls = { opens: 0, closes: 0, reads: [], warnings: [], conversions: [], mimeFiles: [] };
+  const calls = { stats: 0, opens: 0, closes: 0, reads: [], warnings: [], conversions: [], mimeFiles: [] };
   let cursor = 0;
   const file = {
-    fileSize: Object.hasOwn(options, "fileSize") ? options.fileSize : bytes.length,
+    get fileSize() {
+      calls.stats++;
+      if (options.statError) throw options.statError;
+      return Object.hasOwn(options, "fileSize") ? options.fileSize : bytes.length;
+    },
     leafName: options.leafName || "signature.txt",
     exists: () => options.exists !== false,
     isFile: () => options.isFile !== false,
@@ -307,6 +313,108 @@ describe("Direct compose identity signatures", () => {
     const result = await api.dispatchTool("sendMail", { to: "to@example.test", subject: "Subject", body: "Hello", skipReview: true });
     assert.match(result.error, /blocks skipReview/);
     assert.equal(calls.sends.length, 0);
+  });
+});
+
+describe("Review signature size estimates", () => {
+  const args = { to: "to@example.test", subject: "Subject", body: "Hello", isHtml: true, includeSignature: false };
+
+  for (const options of [
+    { mimeType: "image/png", leafName: "signature" },
+    { mimeError: new Error("unknown type"), leafName: "signature.PNG" },
+  ]) {
+    it(`counts a large image signature using only stat (${options.leafName})`, async () => {
+      const identity = { attachSignature: true };
+      const { api, calls, file } = loadComposeTools(identity, { ...options, fileSize: IMAGE_SIGNATURE_BYTES });
+      identity.signature = file;
+      const dry = await api.dispatchTool("dryRunCompose", args);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.warningThresholdBytes, DEFAULT_SIZE_WARNING_BYTES);
+      // 18 MiB at 72-column base64 wrapping, including the terminal CRLF.
+      assert.ok(dry.estimatedEncodedBytes >= 25864876);
+      assert.match(dry.warnings[0], /exceeds Thunderbird's large-message threshold/);
+      assert.equal(dry.blockers.length, 0);
+      assert.equal(dry.attachments.length, 0, "signature metadata is not a caller attachment");
+      assert.equal(calls.stats, 1);
+      assert.equal(calls.opens + calls.reads.length + calls.sends.length + calls.reviews.length, 0);
+
+      const directArgs = { ...args, skipReview: true, includeSignature: true };
+      const direct = await api.dispatchTool("dryRunCompose", directArgs);
+      const unsigned = await api.dispatchTool("dryRunCompose", { ...directArgs, includeSignature: false });
+      assert.equal(direct.wouldSucceed, true);
+      assert.equal(direct.estimatedEncodedBytes, unsigned.estimatedEncodedBytes);
+      assert.equal(direct.warnings.length, 0);
+      assert.equal(calls.stats, 1, "direct sending still omits images without stat");
+      assert.equal((await api.dispatchTool("sendMail", directArgs)).success, true);
+      assert.equal(calls.sends.length, 1);
+      assert.equal(calls.stats, 1);
+      assert.equal(calls.opens + calls.reads.length, 0);
+
+      assert.equal((await api.dispatchTool("sendMail", args)).success, true);
+      assert.equal(calls.reviews.length, 1, "a review warning must not block the window");
+      assert.equal(calls.reviews[0].composeFields.body, calls.sends[0].fields.body);
+      assert.equal(calls.opens + calls.reads.length, 0);
+    });
+  }
+
+  it("keeps a bounded small image below the threshold without reading it", async () => {
+    const identity = { attachSignature: true };
+    const { api, calls, file } = loadComposeTools(identity, { mimeType: "image/png", fileSize: 54 });
+    identity.signature = file;
+    const dry = await api.dispatchTool("dryRunCompose", args);
+    assert.equal(dry.wouldSucceed, true);
+    assert.ok(dry.estimatedEncodedBytes > 76 && dry.estimatedEncodedBytes < DEFAULT_SIZE_WARNING_BYTES);
+    assert.equal(dry.warnings.length, 0);
+    assert.equal(calls.stats, 1);
+    assert.equal(calls.opens + calls.reads.length + calls.sends.length + calls.reviews.length, 0);
+  });
+
+  for (const [label, options] of [
+    ["unreadable image stat", { mimeType: "image/png", statError: new Error("stat failed") }],
+    ["invalid image size", { mimeType: "image/png", fileSize: -1 }],
+    ["oversized text file", { fileSize: MAX_SIGNATURE_BYTES + 1 }],
+    ["unreadable text file", { initError: new Error("read failed") }],
+    ["HTML file with an image resource", { mimeType: "text/html", bytes: '<img src="file:///signature.png">' }],
+  ]) {
+    it(`reports an unknown review estimate for an ${label}`, async () => {
+      const identity = { attachSignature: true };
+      const { api, calls, file } = loadComposeTools(identity, options);
+      identity.signature = file;
+      const dry = await api.dispatchTool("dryRunCompose", args);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.estimatedEncodedBytes, null);
+      assert.equal(dry.blockers.length, 0);
+      assert.match(dry.warnings[0], /estimate excludes the identity signature/);
+      assert.equal(calls.sends.length + calls.reviews.length, 0);
+      if (!options.initError && !options.bytes) assert.equal(calls.opens + calls.reads.length, 0);
+    });
+  }
+
+  for (const htmlSigText of ['<img src="file:///signature.png">', '<div style="background: url(https://example.test/image)">Jane</div>']) {
+    it(`warns about unbounded inline signature resources: ${htmlSigText}`, async () => {
+      const { api, calls } = loadComposeTools({ htmlSigText, htmlSigFormat: true });
+      const dry = await api.dispatchTool("dryRunCompose", args);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.estimatedEncodedBytes, null);
+      assert.match(dry.warnings[0], /estimate excludes the identity signature/);
+      assert.equal(calls.opens + calls.reads.length + calls.sends.length + calls.reviews.length, 0);
+    });
+  }
+
+  it("still bounds plain files, blank files and HTML signatures without embedded resources", async () => {
+    for (const config of [
+      { identity: { attachSignature: true }, bytes: "Jane" },
+      { identity: { attachSignature: true }, bytes: " \n\t" },
+      { identity: { htmlSigText: '<b>Jane</b> <a href="mailto:jane@example.test">Email</a>', htmlSigFormat: true } },
+    ]) {
+      const { api, calls, file } = loadComposeTools(config.identity, config);
+      config.identity.signature = file;
+      const dry = await api.dispatchTool("dryRunCompose", args);
+      assert.equal(dry.wouldSucceed, true);
+      assert.ok(Number.isSafeInteger(dry.estimatedEncodedBytes));
+      assert.equal(dry.warnings.length, 0);
+      assert.equal(calls.sends.length + calls.reviews.length, 0);
+    }
   });
 });
 

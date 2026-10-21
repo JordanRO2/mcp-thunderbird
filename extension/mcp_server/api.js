@@ -5800,7 +5800,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function getIdentitySignature(identity) {
+            // Optional review metadata records resources the direct path omits.
+            function getIdentitySignature(identity, reviewSignature) {
               if (!identity) return null;
               try {
                 if (identity.attachSignature) {
@@ -5814,6 +5815,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       ? contentType.startsWith("image/")
                       : /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|tiff?|webp)$/i.test(file.leafName);
                     if (isImage) {
+                      if (reviewSignature) {
+                        const size = file.fileSize;
+                        if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid signature image size");
+                        // Estimate only: reuse the attachment estimator's binary
+                        // base64 bound without opening or attaching this file.
+                        reviewSignature.attachments.push({ name: file.leafName, size, contentType: "application/octet-stream" });
+                        return null;
+                      }
                       console.warn("thunderbird-mcp: image signature files are omitted from direct sends and saved drafts");
                       return null;
                     }
@@ -5821,8 +5830,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (content && content.trim()) {
                       return { content, isHtmlSig: contentType ? contentType === "text/html" : /\.html?$/i.test(file.leafName) };
                     }
+                    return null;
                   }
                   // Thunderbird ignores inline signature text when a file is selected.
+                  if (reviewSignature) reviewSignature.excluded = true;
                   return null;
                 }
                 const inline = identity.htmlSigText;
@@ -5830,6 +5841,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { content: inline, isHtmlSig: identity.htmlSigFormat === true };
                 }
               } catch (error) {
+                if (reviewSignature) reviewSignature.excluded = true;
                 console.warn("thunderbird-mcp: could not read identity signature", error);
               }
               return null;
@@ -5894,9 +5906,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Returns "" when the identity has no signature.
              */
-            function buildSignatureFragment(identity, useHtml) {
-              const sig = getIdentitySignature(identity);
+            function buildSignatureFragment(identity, useHtml, reviewSignature) {
+              const sig = getIdentitySignature(identity, reviewSignature);
               if (!sig) return "";
+              // Do not follow resources in HTML signatures. Their contents (and
+              // CSS references) cannot be bounded by the signature text alone.
+              if (reviewSignature && useHtml && sig.isHtmlSig &&
+                  /<\s*(?:img|style|link|svg|object|embed|iframe|video|audio)\b|\b(?:src|srcset|style|background|poster)\s*=/i.test(sig.content)) {
+                reviewSignature.excluded = true;
+              }
 
               const asText = sig.isHtmlSig ? htmlSignatureToPlainText(sig.content) : sig.content;
               // Honor the identity's suppress_signature_separator preference.
@@ -5921,8 +5939,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * identity signature. Mirrors the plain/HTML envelope rules used by
              * the compose-window paths.
              */
-            function buildBodyWithSignature(body, identity, useHtml, isHtml, includeSignature = true) {
-              const sigFragment = includeSignature ? buildSignatureFragment(identity, useHtml) : "";
+            function buildBodyWithSignature(body, identity, useHtml, isHtml, includeSignature = true, reviewSignature) {
+              const sigFragment = includeSignature ? buildSignatureFragment(identity, useHtml, reviewSignature) : "";
 
               if (!useHtml) {
                 return (body || "") + sigFragment;
@@ -10798,9 +10816,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // The window inserts its own signature. The direct path must build it here.
               const preparedBody = buildBodyWithSignature(body, identity, useHtml, isHtml,
                 skipReview ? includeSignature : false);
+              const reviewSignature = { attachments: [], excluded: false };
               const size = assessComposeSize({ identity, useHtml, body: skipReview ? preparedBody
-                : buildBodyWithSignature(body, identity, useHtml, isHtml),
-              headers: [...Object.values(recipients.headers), args.subject || ""], attachments: descs });
+                : buildBodyWithSignature(body, identity, useHtml, isHtml, true, reviewSignature),
+              headers: [...Object.values(recipients.headers), args.subject || ""], attachments: [...descs, ...reviewSignature.attachments] });
+              if (reviewSignature.excluded) {
+                size.estimatedEncodedBytes = null;
+                size.warning = "The encoded size estimate excludes the identity signature because it could not be safely bounded read-only. Check the signature and message size in Thunderbird's review window.";
+              }
               return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody, size,
                 ...(skipReview && size.warning ? { error: size.warning } : {}) };
             }
