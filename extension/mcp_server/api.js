@@ -12931,6 +12931,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const SAVED_SEARCH_DATABASE_SERVICE = "@mozilla.org/msgDatabase/msgDBService;1";
             const SAVED_SEARCH_CREATE_STORAGE_ERROR = "Existing or unexpected folder storage; saved search not configured";
             const SAVED_SEARCH_STORAGE_ERROR = "Cannot delete a saved search with nonempty, unreadable or unexpected storage";
+            const SAVED_SEARCH_OWNERSHIP_ERROR = "Cannot verify exclusive saved-search storage";
             const SAVED_SEARCH_MBOX_STORE = "mbox";
             const SAVED_SEARCH_MAILDIR_STORE = "maildir";
             // nsMsgMaildirStore uses cur and tmp; Thunderbird does not use new.
@@ -12985,26 +12986,116 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { directory, names, files };
             }
 
-            function assertReadableSavedSearchStorage(file) {
-              if (file.isReadable() !== true || file.isSymlink() !== false) {
-                throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+            function savedSearchStorageKey(path) {
+              if (typeof path !== "string" || !path) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const key = path.replace(/\\/g, "/").normalize().toLowerCase();
+              if (key.split("/").some(part => part === "." || part === "..")) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              return key.replace(/\/+$/, "");
+            }
+
+            function sameSavedSearchStorage(first, second) {
+              return first.equals(second) || savedSearchStorageKey(first.path) === savedSearchStorageKey(second.path);
+            }
+
+            function containsSavedSearchStorage(container, file) {
+              const seen = new Set();
+              for (let ancestor = file.parent; ancestor; ancestor = ancestor.parent) {
+                const key = savedSearchStorageKey(ancestor.path);
+                if (seen.has(key)) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                seen.add(key);
+                if (sameSavedSearchStorage(container, ancestor)) return true;
               }
-              // As in attachment validation, Windows isSymlink misses junctions.
-              // Resolve each existing component before comparing its target.
-              if (Services.appinfo?.OS === "WINNT") {
-                for (let component = file.clone(); component; component = component.parent) {
-                  if (component.isReadable() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
-                  const target = component.target;
-                  if (!target || target.replace(/\\/g, "/").toLowerCase() !==
-                      component.path.replace(/\\/g, "/").toLowerCase()) {
-                    throw new Error(SAVED_SEARCH_STORAGE_ERROR);
-                  }
+              return false;
+            }
+
+            function savedSearchStoragePaths(folder) {
+              const backing = folder.filePath.clone();
+              if (folder.isServer === true) return [backing];
+              if (folder.isServer !== false) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+              const children = backing.clone();
+              children.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+              return [backing, folder.summaryFile.clone(), children];
+            }
+
+            function assertReadableSavedSearchStorage(file, root) {
+              // Check every component down to the account's configured storage
+              // root. An immediate-parent check misses deeper POSIX symlinks.
+              const seen = new Set();
+              let leaf = true;
+              for (let component = file.clone(); component; component = component.parent) {
+                const key = savedSearchStorageKey(component.path);
+                if (seen.has(key) || component.isReadable() !== true || component.isSymlink() !== false ||
+                    (!leaf && component.isDirectory() !== true)) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                seen.add(key);
+                // Windows isSymlink misses junctions; isReadable forces native
+                // resolution before reading target, as in attachment validation.
+                if (Services.appinfo?.OS === "WINNT" &&
+                    savedSearchStorageKey(component.target) !== key) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                // Case-folding is conservative for collision refusals, but
+                // cannot prove positive identity on a case-sensitive volume.
+                if (root && component.equals(root)) return;
+                leaf = false;
+              }
+              if (root) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+            }
+
+            function assertExclusiveSavedSearchStorage(folder) {
+              try {
+                const paths = savedSearchStoragePaths(folder);
+                const root = folder.server.localPath.clone();
+                if (!root.equals(folder.server.rootFolder.filePath) || root.isDirectory() !== true) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                const directory = folder.parent.filePath.clone();
+                if (!folder.parent.isServer) directory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+                if (paths.some(file => !file.parent.equals(directory)) ||
+                    paths[1].leafName !== paths[0].leafName + SAVED_SEARCH_SUMMARY_SUFFIX) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                assertReadableSavedSearchStorage(directory, root);
+
+                // Public accounts/allServers/allFolders omit hidden servers.
+                // Include registered preference keys without applying access
+                // filters; never return another folder's name/path in a refusal.
+                const manager = MailServices.accounts;
+                const servers = new Set(manager.allServers);
+                for (const account of manager.accounts) servers.add(account.incomingServer);
+                for (const key of Services.prefs.getCharPref("mail.accountmanager.accounts", "").split(",").filter(Boolean)) {
+                  servers.add(manager.getAccount(key.trim()).incomingServer);
                 }
+                const serverKeys = new Set();
+                for (const pref of Services.prefs.getChildList("mail.server.")) {
+                  const match = /^mail\.server\.([^.]+)\./.exec(pref);
+                  if (!match) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                  if (match[1] !== "default") serverKeys.add(match[1]);
+                }
+                for (const key of serverKeys) servers.add(manager.getIncomingServer(key));
+                const pending = [...manager.allFolders];
+                for (const server of servers) pending.push(server.rootFolder);
+                const visited = new Set();
+                while (pending.length) {
+                  const other = pending.pop();
+                  if (visited.has(other)) continue;
+                  visited.add(other);
+                  pending.push(...other.subFolders);
+                  if (other === folder) continue;
+                  const otherPaths = savedSearchStoragePaths(other);
+                  // POSIX equals does not resolve symlinks. A different account
+                  // can alias this storage through any of its ancestors too.
+                  for (const path of otherPaths) {
+                    visitSavedSearchStorageDirectory(path.parent, entry => {
+                      if (sameSavedSearchStorage(path, entry)) assertReadableSavedSearchStorage(entry);
+                    });
+                  }
+                  if (paths.some(path => otherPaths.some(otherPath => sameSavedSearchStorage(path, otherPath) || containsSavedSearchStorage(path, otherPath))) ||
+                      (other.isServer === false && other.msgStore.storeType === SAVED_SEARCH_MAILDIR_STORE &&
+                       paths.some(path => containsSavedSearchStorage(otherPaths[0], path)))) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                }
+                if (!visited.has(folder)) throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
+                return root;
+              } catch {
+                throw new Error(SAVED_SEARCH_OWNERSHIP_ERROR);
               }
             }
 
-            function visitSavedSearchStorageDirectory(directory, visit) {
-              assertReadableSavedSearchStorage(directory);
+            function visitSavedSearchStorageDirectory(directory, visit, root) {
+              assertReadableSavedSearchStorage(directory, root);
               if (directory.isDirectory() !== true) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
               const entries = directory.directoryEntries;
               try {
@@ -13014,7 +13105,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function assertEmptySavedSearchStorage(folder) {
+            function assertEmptySavedSearchStorage(folder, root) {
               const storeType = folder.msgStore.storeType;
               if (storeType !== SAVED_SEARCH_MBOX_STORE && storeType !== SAVED_SEARCH_MAILDIR_STORE) {
                 throw new Error(SAVED_SEARCH_STORAGE_ERROR);
@@ -13037,11 +13128,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     found[i] = entry;
                   }
                 }
-              });
+              }, root);
               const refuseEntry = () => { throw new Error(SAVED_SEARCH_STORAGE_ERROR); };
               const [backing, children] = found;
               if (backing) {
-                assertReadableSavedSearchStorage(backing);
+                assertReadableSavedSearchStorage(backing, root);
                 if (storeType === SAVED_SEARCH_MBOX_STORE) {
                   if (backing.isFile() === true) {
                     if (backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
@@ -13050,18 +13141,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // creates an empty backing directory beside a saved search's
                     // .msf. Accept that native placeholder only with no entries,
                     // including no empty subdirectories.
-                    visitSavedSearchStorageDirectory(backing, refuseEntry);
+                    visitSavedSearchStorageDirectory(backing, refuseEntry, root);
                   }
                 } else {
                   visitSavedSearchStorageDirectory(backing, entry => {
                     if (!SAVED_SEARCH_MAILDIR_DIRECTORIES.has(entry.leafName)) {
                       throw new Error(SAVED_SEARCH_STORAGE_ERROR);
                     }
-                    visitSavedSearchStorageDirectory(entry, refuseEntry);
-                  });
+                    visitSavedSearchStorageDirectory(entry, refuseEntry, root);
+                  }, root);
                 }
               }
-              if (children) visitSavedSearchStorageDirectory(children, refuseEntry);
+              if (children) visitSavedSearchStorageDirectory(children, refuseEntry, root);
             }
 
             function getVirtualFolderHelper() {
@@ -13357,6 +13448,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "Cannot delete a saved search with subfolders or unreadable child state" };
                 }
 
+                const storageRoot = assertExclusiveSavedSearchStorage(folder);
+
                 // Counts describe search hits, not the folder's own storage. A
                 // genuine view may have positive counts but must have no headers.
                 let db;
@@ -13380,7 +13473,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // nsMailDatabase::GetSummaryValid bypasses store validation for
                 // Virtual folders. An empty DB alone cannot prove storage empty:
                 // native deletion also removes the backing store and .sbd tree.
-                assertEmptySavedSearchStorage(folder);
+                assertEmptySavedSearchStorage(folder, storageRoot);
                 // Two arguments on every supported version. Never retry a delete
                 // after an exception: native work may already be partly complete.
                 parent.propagateDelete(folder, true);

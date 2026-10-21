@@ -25,6 +25,10 @@ const SUMMARY_SUFFIX = ".msf";
 const MBOX_STORE = "mbox";
 const MAILDIR_STORE = "maildir";
 const WINDOWS_OS = "WINNT";
+const NATIVE_PATHS = [["POSIX", path], ["Windows", windowsPath]];
+const ACCOUNT_KEYS_PREF = "mail.accountmanager.accounts";
+const SERVER_PREF_BRANCH = "mail.server.";
+const UNICODE_STORAGE_NAME = "R\u00e9sum\u00e9";
 const TOOLS = { CREATE: "createVirtualFolder", LIST: "listVirtualFolders", DELETE: "deleteVirtualFolder" };
 const EVENT = {
   FLAGS: "flags", SET_FLAG: "setFlag", ADD: "addSubfolder", NOTIFY: "notifyFolderAdded",
@@ -233,7 +237,10 @@ function makeHarness({ denied = [], addressBooksRestricted = false, pathImpl = p
   const root = folder(null, "Local folders", 0, servers[0]);
   const otherRoot = folder(null, "Other account", 0, servers[1]);
   const hiddenRoot = folder(null, "Unified folders", 0, servers[2]);
-  servers.forEach((server, i) => { server.rootFolder = [root, otherRoot, hiddenRoot][i]; });
+  servers.forEach((server, i) => {
+    server.rootFolder = [root, otherRoot, hiddenRoot][i];
+    server.localPath = server.rootFolder.filePath.clone();
+  });
   const source = folder(root, "Receipts");
   source.headers.push({ messageId: "real-source-mail" });
   const otherSource = folder(otherRoot, "Private receipts");
@@ -300,6 +307,14 @@ function makeHarness({ denied = [], addressBooksRestricted = false, pathImpl = p
       return target.database;
     },
   });
+  runtime.MailServices.accounts.allServers = servers;
+  runtime.MailServices.accounts.getIncomingServer = key => servers.find(server => server.key === key) || null;
+  runtime.Services.prefs.getChildList = prefix => {
+    assert.equal(prefix, SERVER_PREF_BRANCH);
+    return [...servers.map(server => `${prefix}${server.key}.type`), `${prefix}default.type`];
+  };
+  runtime.Services.prefs.getCharPref = (name, fallback) => name === ACCOUNT_KEYS_PREF
+    ? accounts.map(account => account.key).join(",") : fallback;
   if (pathImpl === windowsPath) runtime.Services.appinfo = { OS: WINDOWS_OS };
   function view(parent = root, name = VIEW_NAME, scopes = [source.URI]) {
     const target = folder(parent, name, VIRTUAL_FLAG);
@@ -902,13 +917,328 @@ describe("saved-search deletion is view-only", () => {
   });
 });
 
+describe("saved-search deletion proves exclusive registered storage ownership", () => {
+  const STORAGE_PATHS = [["backing", ""], ["summary", SUMMARY_SUFFIX], ["child directory", SUBFOLDER_SUFFIX]];
+  const INVENTORY_ERROR = "folder inventory unavailable";
+
+  for (const [platform, pathImpl] of NATIVE_PATHS) {
+    for (const [targetKind, targetSuffix] of STORAGE_PATHS) {
+      for (const [ownerKind, ownerSuffix] of STORAGE_PATHS) {
+        it(`refuses ${platform} view ${targetKind} shared with another folder's ${ownerKind}`, () => {
+          const h = makeHarness({ pathImpl });
+          const target = h.view();
+          const ownerPath = `${h.source.filePath.path}${ownerSuffix}`;
+          const targetPath = `${target.filePath.path}${targetSuffix}`;
+          h.fileAliases.set(ownerPath, targetPath);
+          assert.notEqual(ownerPath, targetPath);
+          assert.equal(h.file(ownerPath).equals(h.file(targetPath)), true);
+          assert.deepEqual(h.openDBs, []);
+          assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+          assert.equal(h.source.headers.length, 1);
+          h.assertNoMutation();
+        });
+      }
+    }
+
+    for (const normalization of ["case", "Unicode", "dot segment"]) {
+      it(`refuses ${platform} ownership ambiguity from ${normalization} even when native equals is false`, () => {
+        const h = makeHarness({ pathImpl });
+        const target = h.view();
+        let ownerPath;
+        if (normalization === "Unicode") {
+          const name = UNICODE_STORAGE_NAME;
+          target.filePath = h.file(pathImpl.join(h.root.filePath.path, name));
+          target.summaryFile = h.file(`${target.filePath.path}${SUMMARY_SUFFIX}`);
+          ownerPath = pathImpl.join(h.root.filePath.path, name.normalize("NFD"));
+        } else if (normalization === "dot segment") {
+          ownerPath = `${target.filePath.parent.path}${pathImpl.sep}.${pathImpl.sep}${target.filePath.leafName}`;
+        } else {
+          ownerPath = target.filePath.path.toUpperCase();
+        }
+        h.source.filePath = h.file(ownerPath);
+        assert.equal(h.source.filePath.equals(target.filePath), false);
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    it(`refuses ${platform} view storage containing another registered folder's storage`, () => {
+      const h = makeHarness({ pathImpl });
+      const target = h.view();
+      h.disk.set(target.filePath.path, { directory: true });
+      h.source.filePath = h.file(pathImpl.join(target.filePath.path, "OtherMail"));
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+
+    it(`refuses ${platform} view storage nested within another folder's maildir`, () => {
+      const h = makeHarness({ pathImpl });
+      const target = h.view();
+      h.source.msgStore.storeType = MAILDIR_STORE;
+      h.source.filePath = target.filePath.parent.clone();
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+
+    it(`refuses ${platform} view storage containing another folder through a native ancestor alias`, () => {
+      const h = makeHarness({ pathImpl });
+      const target = h.view();
+      h.disk.set(target.filePath.path, { directory: true });
+      const aliasParent = pathImpl.join(h.root.filePath.path, "VIEWAL~1");
+      h.source.filePath = h.file(pathImpl.join(aliasParent, "OwnedMail"));
+      h.source.summaryFile = h.file(`${h.source.filePath.path}${SUMMARY_SUFFIX}`);
+      h.fileAliases.set(aliasParent, target.filePath.path);
+      assert.equal(h.source.filePath.equals(target.filePath), false);
+      assert.equal(h.source.filePath.parent.equals(target.filePath), true);
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+
+    it(`refuses ${platform} view storage inside a maildir whose native ancestor identity is an alias`, () => {
+      const h = makeHarness({ pathImpl });
+      const parent = h.folder(h.root, "Container");
+      const target = h.view(parent);
+      h.disk.set(target.filePath.parent.path, { directory: true });
+      h.source.msgStore.storeType = MAILDIR_STORE;
+      h.source.filePath = h.file(pathImpl.join(h.root.filePath.path, "MAILDI~1"));
+      h.fileAliases.set(h.source.filePath.path, target.filePath.parent.path);
+      assert.equal(h.source.filePath.equals(target.filePath), false);
+      assert.equal(h.source.filePath.equals(target.filePath.parent), true);
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+
+    for (const [kind, suffix] of STORAGE_PATHS) {
+      it(`refuses a ${platform} alias link in another registered folder's ${kind}`, () => {
+        const h = makeHarness({ pathImpl });
+        const target = h.view();
+        const ownerPath = `${h.otherSource.filePath.path}${suffix}`;
+        const targetPath = `${target.filePath.path}${suffix}`;
+        h.disk.set(ownerPath, {
+          directory: suffix !== SUMMARY_SUFFIX,
+          symlink: pathImpl !== windowsPath,
+          target: targetPath,
+        });
+        assert.equal(h.file(ownerPath).equals(h.file(targetPath)), false);
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    for (const location of ["account root", "above account root"]) {
+      it(`refuses a ${platform} alias link ${location} of another registered account`, () => {
+        const h = makeHarness({ pathImpl });
+        const target = h.view();
+        let linkedPath = h.otherRoot.filePath.path;
+        let targetPath = h.root.filePath.path;
+        if (location === "above account root") {
+          const aliasRoot = pathImpl === windowsPath ? "D:\\linked" : "/linked";
+          const otherRootPath = pathImpl.join(aliasRoot, h.root.filePath.leafName);
+          h.otherRoot.filePath = h.file(otherRootPath);
+          h.otherRoot.server.localPath = h.otherRoot.filePath.clone();
+          h.disk.set(otherRootPath, { directory: true });
+          h.otherSource.filePath = h.file(pathImpl.join(otherRootPath, encodeURIComponent(h.otherSource.name)));
+          h.otherSource.summaryFile = h.file(`${h.otherSource.filePath.path}${SUMMARY_SUFFIX}`);
+          linkedPath = aliasRoot;
+          targetPath = h.root.filePath.parent.path;
+        }
+        const owner = h.folder(h.otherRoot, VIEW_NAME);
+        h.disk.set(linkedPath, { directory: true, symlink: pathImpl !== windowsPath, target: targetPath });
+        assert.equal(owner.filePath.equals(target.filePath), false);
+        assert.equal(owner.summaryFile.equals(target.summaryFile), false);
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    it(`refuses an unreadable ${platform} storage ancestor belonging to another registered folder`, () => {
+      const h = makeHarness({ pathImpl });
+      const target = h.view();
+      const otherParent = h.folder(h.otherRoot, "Unreadable storage");
+      const owner = h.folder(otherParent, VIEW_NAME);
+      h.disk.set(owner.filePath.parent.path, { directory: true });
+      h.fileFailures.set(owner.filePath.parent.path, { isReadable: true });
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+
+    it(`allows distinct ${platform} sibling storage with a common name prefix`, () => {
+      const h = makeHarness({ pathImpl });
+      const target = h.view();
+      h.folder(h.root, `${VIEW_NAME}Suffix`);
+      const result = h.runtime.deleteVirtualFolder(target.URI);
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
+    });
+  }
+
+  it("recognizes alternate Windows separators as the same registered path", () => {
+    const h = makeHarness({ pathImpl: windowsPath });
+    const target = h.view();
+    h.source.filePath = h.file(target.filePath.path.replace(/\\/g, "/"));
+    assert.equal(h.source.filePath.equals(target.filePath), false);
+    assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+    h.assertNoMutation();
+  });
+
+  for (const kind of ["hidden", "restricted", "saved search", "server root"]) {
+    it(`checks storage belonging to another ${kind} without exposing its metadata`, () => {
+      const h = makeHarness({ denied: [DENIED_ACCOUNT] });
+      const target = h.view();
+      const owner = kind === "hidden" ? h.hiddenSource : kind === "restricted" ? h.otherSource
+        : kind === "saved search" ? h.view(h.root, "Other private view") : h.otherRoot;
+      owner.filePath = target.filePath.clone();
+      const result = h.runtime.deleteVirtualFolder(target.URI);
+      assertRefused(result);
+      assert.ok(!result.error.includes(owner.name));
+      assert.ok(!result.error.includes(owner.URI));
+      h.assertNoMutation();
+    });
+  }
+
+  for (const inventory of ["allFolders", "accounts", "allServers", "configured accounts", "configured servers"]) {
+    it(`finds shared storage visible only through ${inventory}`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      h.otherSource.summaryFile = target.summaryFile.clone();
+      const service = h.runtime.MailServices.accounts;
+      service.accounts = [h.accounts[0]];
+      service.allServers = [h.root.server];
+      service.allFolders = [h.root, h.source, target];
+      h.runtime.Services.prefs.getCharPref = (name, fallback) => name === ACCOUNT_KEYS_PREF
+        ? h.accounts[0].key : fallback;
+      h.runtime.Services.prefs.getChildList = () => [`${SERVER_PREF_BRANCH}${h.root.server.key}.type`];
+      if (inventory === "allFolders") service.allFolders.push(h.otherSource);
+      if (inventory === "accounts") service.accounts.push(h.accounts[1]);
+      if (inventory === "allServers") service.allServers.push(h.otherRoot.server);
+      if (inventory === "configured accounts") {
+        h.runtime.Services.prefs.getCharPref = (name, fallback) => name === ACCOUNT_KEYS_PREF
+          ? `${h.accounts[0].key},${h.accounts[1].key}` : fallback;
+      }
+      if (inventory === "configured servers") {
+        h.runtime.Services.prefs.getChildList = () => [`${SERVER_PREF_BRANCH}${h.otherRoot.server.key}.type`];
+      }
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+  }
+
+  for (const failure of ["allFolders", "accounts", "allServers", "account preferences", "server preferences", "missing account", "missing server", "folder backing", "folder summary"]) {
+    it(`refuses when ownership cannot be established because of ${failure}`, () => {
+      const h = makeHarness();
+      const target = h.view();
+      if (["allFolders", "accounts", "allServers"].includes(failure)) {
+        Object.defineProperty(h.runtime.MailServices.accounts, failure, { get() { throw new Error(INVENTORY_ERROR); } });
+      }
+      if (failure === "account preferences") h.runtime.Services.prefs.getCharPref = () => { throw new Error(INVENTORY_ERROR); };
+      if (failure === "server preferences") h.runtime.Services.prefs.getChildList = () => { throw new Error(INVENTORY_ERROR); };
+      if (failure === "missing account") {
+        h.runtime.Services.prefs.getCharPref = (name, fallback) => name === ACCOUNT_KEYS_PREF ? "account404" : fallback;
+      }
+      if (failure === "missing server") h.runtime.Services.prefs.getChildList = () => [`${SERVER_PREF_BRANCH}server404.type`];
+      if (failure === "folder backing") Object.defineProperty(h.otherSource, "filePath", { get() { throw new Error(INVENTORY_ERROR); } });
+      if (failure === "folder summary") Object.defineProperty(h.otherSource, "summaryFile", { get() { throw new Error(INVENTORY_ERROR); } });
+      assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+      h.assertNoMutation();
+    });
+  }
+});
+
+describe("saved-search deletion checks every native storage ancestor", () => {
+  const OUTER_NAME = "Outer";
+  const INNER_NAME = "Inner";
+  const ANCESTORS = ["account root", "outer directory", "immediate parent"];
+
+  for (const [platform, pathImpl] of NATIVE_PATHS) {
+    it(`allows a deeply nested ${platform} view under its native parent storage`, () => {
+      const h = makeHarness({ pathImpl });
+      const outer = h.folder(h.root, OUTER_NAME);
+      const inner = h.folder(outer, INNER_NAME);
+      const target = h.view(inner);
+      h.disk.set(target.filePath.path, { directory: true });
+      const result = h.runtime.deleteVirtualFolder(target.URI);
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
+    });
+
+    for (const ancestor of ANCESTORS) {
+      it(`refuses a ${platform} link at the ${ancestor} of a nested view`, () => {
+        const h = makeHarness({ pathImpl });
+        const outer = h.folder(h.root, OUTER_NAME);
+        const inner = h.folder(outer, INNER_NAME);
+        const target = h.view(inner);
+        h.disk.set(target.filePath.path, { directory: true });
+        const linkedPath = ancestor === "account root" ? h.root.filePath.path
+          : ancestor === "outer directory" ? `${outer.filePath.path}${SUBFOLDER_SUFFIX}` : target.filePath.parent.path;
+        h.disk.set(linkedPath, pathImpl === windowsPath
+          ? { directory: true, target: "D:\\redirected\\account" }
+          : { directory: true, symlink: true });
+        if (pathImpl === windowsPath) assert.equal(h.file(linkedPath).isSymlink(), false);
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    for (const failure of ["isReadable", "isDirectory", "isSymlink"]) {
+      it(`refuses unreadable ${platform} intermediate ancestor ${failure}`, () => {
+        const h = makeHarness({ pathImpl });
+        const outer = h.folder(h.root, OUTER_NAME);
+        const inner = h.folder(outer, INNER_NAME);
+        const target = h.view(inner);
+        h.disk.set(target.filePath.path, { directory: true });
+        h.fileFailures.set(`${outer.filePath.path}${SUBFOLDER_SUFFIX}`, { [failure]: true });
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    for (const problem of ["missing local root", "different local root", "outside account root", "wrong native parent", "dot segment"]) {
+      it(`refuses ${platform} storage with ${problem}`, () => {
+        const h = makeHarness({ pathImpl });
+        const parent = h.folder(h.root, OUTER_NAME);
+        const target = h.view(parent);
+        h.disk.set(target.filePath.path, { directory: true });
+        if (problem === "missing local root") delete target.server.localPath;
+        if (problem === "different local root") target.server.localPath = h.otherRoot.filePath.clone();
+        if (problem === "outside account root") target.filePath = h.file(pathImpl.join(h.otherRoot.filePath.path, VIEW_NAME));
+        if (problem === "wrong native parent") target.filePath = h.file(pathImpl.join(h.root.filePath.path, VIEW_NAME));
+        if (problem === "dot segment") target.filePath = h.file(`${target.filePath.parent.path}${pathImpl.sep}.${pathImpl.sep}${VIEW_NAME}`);
+        target.summaryFile = h.file(`${target.filePath.path}${SUMMARY_SUFFIX}`);
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+
+    for (const normalization of ["case", "Unicode"]) {
+      it(`refuses native-distinct ${platform} configured roots that only match after ${normalization} normalization`, () => {
+        const h = makeHarness({ pathImpl });
+        if (normalization === "Unicode") {
+          const rootPath = pathImpl.join(h.root.filePath.parent.path, UNICODE_STORAGE_NAME);
+          h.root.filePath = h.file(rootPath);
+          h.disk.set(rootPath, { directory: true });
+          h.source.filePath = h.file(pathImpl.join(rootPath, encodeURIComponent(h.source.name)));
+          h.source.summaryFile = h.file(`${h.source.filePath.path}${SUMMARY_SUFFIX}`);
+          h.root.server.localPath = h.file(rootPath.normalize("NFD"));
+        } else {
+          h.root.server.localPath = h.file(h.root.filePath.path.toUpperCase());
+        }
+        const target = h.view();
+        assert.equal(target.server.localPath.equals(target.server.rootFolder.filePath), false);
+        assert.equal(target.server.localPath.path.normalize().toLowerCase(), h.root.filePath.path.normalize().toLowerCase());
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+      });
+    }
+  }
+});
+
 describe("saved-search deletion proves backing storage is empty", () => {
   const STORED_MAIL = "From sender@example.invalid\nMessage-ID: <must-survive>\n\nStored mail\n";
   const MAILDIR_CUR = "cur";
   const MAILDIR_TMP = "tmp";
   const SUMMARY_DEFINITION = "saved-search definition";
 
-  for (const [platform, pathImpl] of [["POSIX", path], ["Windows", windowsPath]]) {
+  for (const [platform, pathImpl] of NATIVE_PATHS) {
     for (const [shape, directory] of [["directory", true], ["file", false]]) {
       for (const nativeThrows of [false, true]) {
         it(`deletes an empty native mbox ${shape} once on ${platform}${nativeThrows ? ", even when native deletion throws" : ""}`, async () => {
@@ -1137,7 +1467,11 @@ describe("saved-search deletion proves backing storage is empty", () => {
       h.fileFailures.set(target.filePath.path, { [failure]: true });
       assertRefused(h.runtime.deleteVirtualFolder(target.URI));
       h.assertNoMutation();
-      assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.parent.path));
+      if (failure === "equals") {
+        assert.equal(wasReleased(h, target), false, "ownership must be established before opening the database");
+      } else {
+        assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.parent.path));
+      }
     });
   }
 
