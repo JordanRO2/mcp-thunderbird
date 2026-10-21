@@ -143,6 +143,37 @@ describe("bounded refresh production lifecycle", () => {
     assert.equal(clock.activeTimers.length, 0);
   });
 
+  it("settles selected callers without ending the operation or carrying later errors back to them", async () => {
+    const { runtime, clock } = loadRefreshRuntime();
+    const inFlight = new Map();
+    let controls;
+    let cleanups = 0;
+    const first = runtime.waitForRefresh(inFlight, KEY, SHORT_WAIT_MS, current => {
+      controls = current;
+      current.addCleanup(() => cleanups++);
+      current.reportError(PROVIDER_ERROR);
+    });
+    const second = runtime.waitForRefresh(inFlight, KEY, LONG_WAIT_MS,
+      () => assert.fail("must join"), { followUp: true });
+    controls.settle({ status: "loaded" }, request => !request.followUp);
+    assert.equal(controls.hasActiveWaiter(request => !request.followUp), false);
+    assert.equal(controls.hasActiveWaiter(request => request.followUp), true);
+    const result = await first;
+    assert.equal(result.status, "loaded");
+    assert.equal(result.warning, PROVIDER_ERROR);
+    assert.equal(result.joinedInFlight, false);
+    assert.equal(cleanups, 0);
+    assert.equal(inFlight.size, 1);
+    assert.equal(clock.activeTimers.length, 2, "only the pending caller and abandonment timers remain");
+    controls.settle({ status: "error", error: "Follow-up failed" });
+    assert.equal((await second).status, "error");
+    assert.equal((await second).joinedInFlight, true);
+    assert.equal(result.status, "loaded");
+    assert.equal(cleanups, 1);
+    assert.equal(inFlight.size, 0);
+    assert.equal(clock.activeTimers.length, 0);
+  });
+
   it("measures a joining caller's timeout from that caller's arrival", async () => {
     const { runtime, clock } = loadRefreshRuntime();
     const inFlight = new Map();

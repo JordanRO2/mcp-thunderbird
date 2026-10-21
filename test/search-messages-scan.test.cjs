@@ -185,7 +185,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
     makeImapFolder({ folder, clock, runtime, session, delay: refreshDelay, exitCode,
       onRefresh(current) { current.stats.refreshes++; },
       onUpdate(current) { current.hooks.update?.(); },
-      onUpdateComplete(current, status) { current.hooks.sync?.(status); },
+      onUpdateComplete(current, status, url) { current.hooks.sync?.(status, url); },
     });
   }
   const keywordStart = source.indexOf("const INTERNAL_KEYWORDS = new Set([");
@@ -397,7 +397,7 @@ describe("searchMessages counts and folder freshness", () => {
     assert.equal(h.listeners.size, 0);
   });
 
-  it("observes an already-running update even when the new URL listener is discarded", async () => {
+  it("waits for a trailing update after an already-running update discards the listener", async () => {
     const folder = makeFolder("Inbox", { count: 3 });
     const h = makeHarness({ roots: [folder], refreshDelay: UPDATE_MS });
     folder.hooks.sync = () => folder.headers.delete(1);
@@ -405,12 +405,68 @@ describe("searchMessages counts and folder freshness", () => {
     const pending = h.search({ countOnly: true });
     assert.equal(folder.urlListener, null);
     await h.clock.advance(UPDATE_MS);
+    assert.equal(folder.stats.snapshots, 0);
+    await h.clock.advance(UPDATE_MS);
     const result = await pending;
     assert.equal(result.count, 2);
     assert.equal(result.folderRefresh.status, "loaded");
-    assert.equal(result.folderRefresh.updateConfirmed, false);
-    assert.equal(h.clock.now, UPDATE_MS);
-    assert.equal(folder.stats.refreshes, 2, "unconfirmed loading keeps the fallback");
+    assert.equal(result.folderRefresh.updateConfirmed, true);
+    assert.equal(h.clock.now, 2 * UPDATE_MS);
+    assert.equal(folder.stats.refreshes, 1, "the confirmed trailing update suppresses the fallback");
+  });
+
+  for (const busy of [false, true]) it(`finds newly delivered mail after ${busy ? "a native busy update" : "synchronous loading"}`, async () => {
+    const folder = makeFolder("Inbox", { messages: [{ mime2DecodedSubject: "Fresh delivery" }] });
+    const delivered = folder.headers.get(1);
+    folder.headers.clear();
+    const h = makeHarness({ roots: [folder], refreshDelay: UPDATE_MS });
+    if (busy) folder.updateFolder();
+    else folder.synchronousLoads = 1;
+    const nativeUrl = folder.updateUrl;
+    // The update already in progress has an older server snapshot. Only a new
+    // SELECT includes the delivery that happened immediately before this call.
+    folder.hooks.sync = (_status, url) => { if (url !== nativeUrl) folder.headers.set(1, delivered); };
+    const count = h.search({ query: "subject:fresh delivery", countOnly: true });
+    const page = h.search({ query: "subject:fresh delivery", offset: 0 });
+    await h.clock.flush();
+    if (busy) await h.clock.advance(UPDATE_MS);
+    assert.equal(folder.stats.snapshots, 0, "neither caller may scan the old snapshot");
+    assert.equal(folder.headers.size, 0);
+    await h.clock.advance(UPDATE_MS);
+    const result = await count;
+    assert.equal(result.count, 1);
+    assert.equal(result.folderRefresh.updateConfirmed, true);
+    assert.equal((await page).messages.length, 1);
+    assert.equal((await page).folderRefresh.joinedInFlight, true);
+    assert.equal(folder.imapUpdateCalls, busy ? 3 : 2);
+    assert.equal(folder.stats.refreshes, busy ? 1 : 0);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("charges the trailing update to the remaining search budget", async () => {
+    const h = makeHarness({ refreshDelay: UPDATE_MS });
+    const remaining = UPDATE_MS + UPDATE_MS / 2;
+    let firstLookup = true;
+    h.runtime.MailServices.folderLookup.getFolderForURL = uri => {
+      if (firstLookup) {
+        firstLookup = false;
+        h.advance(SEARCH_BUDGET_MS - remaining);
+        h.roots[0].updateFolder();
+      }
+      return h.folders.get(uri);
+    };
+    const pending = h.search({ countOnly: true });
+    await h.clock.advance(remaining);
+    const result = await pending;
+    assert.equal(result.folderRefresh.status, "timeout");
+    assert.notEqual(result.folderRefresh.updateConfirmed, true);
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(h.clock.now, SEARCH_BUDGET_MS);
+    assert.equal(h.roots[0].imapUpdateCalls, 3);
+    assert.equal(h.roots[0].stats.snapshots, 0);
+    await h.clock.advance(UPDATE_MS / 2);
+    assert.equal(h.listeners.size, 0);
   });
 
   for (const offline of [false, true]) it(`returns promptly with cached results while ${offline ? "offline" : "busy fetching a body"}`, async () => {
@@ -442,10 +498,12 @@ describe("searchMessages counts and folder freshness", () => {
     await h.clock.flush();
     assert.equal(folder.stats.snapshots, 0);
     await h.clock.advance(UPDATE_MS);
+    assert.equal(folder.stats.snapshots, 0);
+    await h.clock.advance(UPDATE_MS);
     const result = await pending;
     assert.equal(result.folderRefresh.status, "loaded");
-    assert.equal(result.folderRefresh.updateConfirmed, false);
-    assert.equal(folder.stats.refreshes, 1);
+    assert.equal(result.folderRefresh.updateConfirmed, true);
+    assert.equal(folder.stats.refreshes, 0);
   });
 
   it("continues with the cache after synchronous startup failure", async () => {

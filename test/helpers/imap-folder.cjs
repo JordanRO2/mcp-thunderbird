@@ -19,10 +19,10 @@ function makeMailSession() {
 // so the session can be installed in loadRefreshRuntime before it is available.
 // onRefresh/onUpdate receive the folder at updateFolder/updateFolderWithListener
 // entry, including busy/offline calls. onUpdateComplete also receives the exit
-// status and runs before FolderLoaded for successful and failed update URLs.
+// status and URL and runs before FolderLoaded for successful and failed updates.
 function makeImapFolder({
   folder = {}, clock, runtime, session = makeMailSession(), delay = 50, exitCode = 0,
-  onRefresh, onUpdate, onUpdateComplete,
+  onRefresh, onUpdate, onUpdateComplete, synchronousLoads = 0,
 } = {}) {
   const { mailSession, listeners } = session;
   const getClock = typeof clock === "function" ? clock : () => clock;
@@ -31,12 +31,12 @@ function makeImapFolder({
   folder.QueryInterface ??= function () { return this; };
   Object.assign(folder, {
     updateCalls: 0, imapUpdateCalls: 0, urlRunning: false, updatingFolder: false,
-    urlListener: null, updateUrl: null,
+    urlListener: null, updateUrl: null, synchronousLoads,
     finishUrl(url, status = exitCode) {
       this.urlRunning = false;
       this.updatingFolder = false;
       if (url.updatingFolder) {
-        onUpdateComplete?.(this, status);
+        onUpdateComplete?.(this, status, url);
         // The base folder fires loaded for success AND failure, first.
         mailSession.fire(this);
       }
@@ -47,12 +47,18 @@ function makeImapFolder({
     updateFolderWithListener(_window, listener) {
       this.imapUpdateCalls++;
       onUpdate?.(this);
+      if (this.synchronousLoads > 0) {
+        this.synchronousLoads--;
+        mailSession.fire(this);
+        return;
+      }
       if (!this.urlRunning) {
         if (getRuntime().Services.io.offline) { mailSession.fire(this); return; }
         this.urlRunning = this.updatingFolder = true;
         this.urlListener = listener;
-        this.updateUrl = { updatingFolder: true, QueryInterface() { return this; } };
-        if (delay !== null) getClock().schedule(delay, () => this.finishUrl(this.updateUrl));
+        const url = { updatingFolder: true, QueryInterface() { return this; } };
+        this.updateUrl = url;
+        if (delay !== null) getClock().schedule(delay, () => this.finishUrl(url));
       } else if (!this.updatingFolder) {
         // A body fetch is running: no update starts and no listener is saved.
         mailSession.fire(this);
