@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const { loadRefreshRuntime } = require("./helpers/refresh-runtime.cjs");
 const { makeImapFolder, makeMailSession } = require("./helpers/imap-folder.cjs");
 const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
+const recipientRowFixtures = require("./helpers/recipient-row-fixtures.cjs");
 
 const FOLDER_FLAGS = { Virtual: 0x20, ImapNoselect: 0x01000000 };
 const SYNC_WAIT_MS = 5000;
@@ -677,6 +678,27 @@ describe("searchMessages rows cap address lists", () => {
   });
 
   for (const searchBody of [false, true]) {
+    for (const fixture of recipientRowFixtures) {
+      it(`counts only real mailboxes through ${searchBody ? "Gloda" : "ordinary search"}: ${fixture.raw}`, async () => {
+        const { mimeConverter } = loadThunderbirdHeaderParser();
+        const display = mimeConverter.decodeMimeHeader(fixture.raw, null, false, true);
+        const folder = makeFolder("Inbox", { messages: [recipientFields(fixture.raw, display)] });
+        const glodaItems = [{ folderMessage: folder.headers.get(1) }];
+        const h = makeHarness({ roots: [folder], glodaItems });
+        const calls = recordParserCalls(h);
+        for (const fullRecipients of [undefined, false, null, true]) {
+          const args = { query: searchBody ? "body" : "", searchBody };
+          if (fullRecipients !== undefined) args.fullRecipients = fullRecipients;
+          const [row] = await h.search(args);
+          const summary = fullRecipients === true ? undefined : fixture.summary;
+          assert.equal(row.recipients, summary ?? display);
+          assert.equal(row.ccList, summary ?? fixture.raw);
+        }
+        assert.equal(calls.parse.length, 6, "full mode bypasses the parser");
+        assert.equal(calls.render.length, fixture.mailboxes > 3 ? 6 : 0, "short fields are never re-rendered");
+      });
+    }
+
     it(`returns exact full lists without parser work through ${searchBody ? "Gloda completion" : "ordinary search dispatch"}`, async () => {
       const raw = `  ${ENCODED_THREE}, d@x.example, e@x.example  `;
       const display = `  ${DECODED_THREE}, d@x.example, e@x.example  `;

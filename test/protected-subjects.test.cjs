@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
+const recipientRowFixtures = require("./helpers/recipient-row-fixtures.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Same marker assertions and VM loading pattern as privacy-messages.test.cjs.
@@ -118,6 +119,26 @@ function plain(value) {
 describe("getRecentMessages rows cap address lists", () => {
   const longList = "a@x, b@x, c@x, d@x";
   const shortList = "a@x, b@x, c@x (+1 more)";
+
+  for (const fixture of recipientRowFixtures) {
+    it(`counts only real mailboxes in recent rows: ${fixture.raw}`, async () => {
+      const h = loadTools();
+      const display = h.api.MailServices.mimeConverter.decodeMimeHeader(fixture.raw, null, false, true);
+      Object.assign(h.add({ id: "mailboxes" }), {
+        recipients: fixture.raw, mime2DecodedRecipients: display, ccList: fixture.raw,
+      });
+      for (const fullRecipients of [undefined, false, null, true]) {
+        const args = { folderPath: h.folder.URI, daysBack: 36500 };
+        if (fullRecipients !== undefined) args.fullRecipients = fullRecipients;
+        const [row] = await h.api.callTool("getRecentMessages", args);
+        const summary = fullRecipients === true ? undefined : fixture.summary;
+        assert.equal(row.recipients, summary ?? display);
+        assert.equal(row.ccList, summary ?? fixture.raw);
+      }
+      assert.equal(h.stats.parsedHeaders.length, 6, "full mode bypasses the parser");
+      assert.equal(h.stats.renders, fixture.mailboxes > 3 ? 6 : 0, "short fields are never re-rendered");
+    });
+  }
 
   it("preserves 0/1/3-mailbox display values exactly, including encoded punctuation", () => {
     const h = loadTools();

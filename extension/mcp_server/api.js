@@ -3758,10 +3758,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 if (typeof encodedValue !== "string" || !encodedValue) return value;
                 const addresses = MailServices.headerParser.parseEncodedHeaderW(encodedValue);
-                if (!Array.isArray(addresses) || addresses.length <= LIST_ROW_ADDRESS_LIMIT) return value;
-                const shown = MailServices.headerParser.makeMimeHeader(addresses.slice(0, LIST_ROW_ADDRESS_LIMIT));
+                if (!Array.isArray(addresses)) return value;
+                // Empty groups, standalone comments and display names can
+                // produce entries without an address. They do not occupy slots
+                // in the summary, but short lists keep their original display.
+                const mailboxes = addresses.filter(address => typeof address.email === "string" && address.email.trim());
+                if (mailboxes.length <= LIST_ROW_ADDRESS_LIMIT) return value;
+                const shown = MailServices.headerParser.makeMimeHeader(mailboxes.slice(0, LIST_ROW_ADDRESS_LIMIT));
                 return typeof shown === "string" && shown
-                  ? `${shown} (+${addresses.length - LIST_ROW_ADDRESS_LIMIT} more)` : value;
+                  ? `${shown} (+${mailboxes.length - LIST_ROW_ADDRESS_LIMIT} more)` : value;
               } catch {
                 // A display summary must never hide a message, including when
                 // the emitter cannot render an unusually long address token.
