@@ -2509,7 +2509,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an event or recurring series; pass recurrenceId to change one occurrence. Reminders replace only DISPLAY alarms relative to START at or before it; other alarms and modified occurrences keep their alarms. While Block skipReview is on (default), events with attendees other than the calendar user are read-only: all updates, even with attendees omitted, are rejected. Checks the series and selected occurrence, or all exceptions for a series update. Adding attendees also requires disabling the setting; calendar servers may email updates without review.",
+        description: "Update an event or recurring series; pass recurrenceId to change one occurrence. Reminders replace only DISPLAY alarms relative to START at or before it; other alarms are retained. Series reminder changes preserve modified occurrences' own reminders unless recurrence is also replaced or cleared. While Block skipReview is on (default), events with attendees other than the calendar user are read-only: all updates, even with attendees omitted, are rejected. Checks the series and selected occurrence, or all exceptions for a series update. Adding attendees also requires disabling the setting; calendar servers may email updates without review.",
         inputSchema: {
           type: "object",
           properties: {
@@ -6689,7 +6689,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               catch { return dt.icalString || null; }
             }
 
-            // Validate createEvent's `reminders` (minutes before start). Returns
+            // Validate `reminders` (minutes before start). Returns
             // { minutes } (unique, largest first) or { error }.
             function normalizeReminders(reminders) {
               if (reminders === undefined || reminders === null) return { minutes: [] };
