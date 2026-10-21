@@ -17,6 +17,11 @@ const CALENDAR_FILTERS = Object.freeze({
   ITEM_FILTER_TYPE_ALL: (1 << 2) | (1 << 3) | (1 << 4),
   ITEM_FILTER_CLASS_OCCURRENCES: 1 << 16,
 });
+const CALENDAR_ALARM_RELATIONS = Object.freeze({
+  ALARM_RELATED_ABSOLUTE: 0,
+  ALARM_RELATED_START: 1,
+  ALARM_RELATED_END: 2,
+});
 
 // Reuse the production-marker/VM pattern from privacy-access.test.cjs. Only
 // Thunderbird objects are mocked; handlers, schemas and preference gates run
@@ -36,7 +41,7 @@ function constant(name) {
 }
 
 class CalendarDuration {
-  constructor(seconds) { this.inSeconds = seconds; }
+  constructor(seconds = 0) { this.inSeconds = seconds; }
   get isNegative() { return this.inSeconds < 0; }
   set isNegative(value) { this.inSeconds = Math.abs(this.inSeconds) * (value ? -1 : 1); }
   clone() { return new CalendarDuration(this.inSeconds); }
@@ -88,6 +93,31 @@ class CalendarAttendee {
   }
 }
 
+class CalendarAlarm {
+  constructor(fields = {}) {
+    Object.assign(this, {
+      action: null, related: CALENDAR_ALARM_RELATIONS.ALARM_RELATED_ABSOLUTE,
+      description: null, alarmDate: null, properties: new Map(),
+    }, fields);
+  }
+  get offset() { return this._offset ?? null; }
+  set offset(value) {
+    assert.ok(value instanceof CalendarDuration, "alarm offsets require a calIDuration");
+    assert.ok([CALENDAR_ALARM_RELATIONS.ALARM_RELATED_START, CALENDAR_ALARM_RELATIONS.ALARM_RELATED_END].includes(this.related),
+      "set the alarm relation before assigning an offset");
+    this._offset = value;
+  }
+  getProperty(name) { return this.properties.get(name) ?? null; }
+  setProperty(name, value) { this.properties.set(name, value); }
+  clone() {
+    const clone = Object.assign(new CalendarAlarm(), this);
+    clone.properties = new Map(this.properties);
+    if (this.offset) clone.offset = this.offset.clone();
+    if (this.alarmDate) clone.alarmDate = this.alarmDate.clone();
+    return clone;
+  }
+}
+
 class CalendarItem {
   constructor() {
     this.id = "event-1";
@@ -95,6 +125,9 @@ class CalendarItem {
     this.properties = new Map();
     this.attendees = [];
     this.categories = [];
+    // null inherits and caches the parent's alarms on first read; [] is an
+    // explicit empty override.
+    this.alarms = null;
     this.recurrenceInfo = null;
   }
 
@@ -110,18 +143,44 @@ class CalendarItem {
   getAttendees() { return this.attendees.slice(); }
   addAttendee(attendee) { this.attendees.push(attendee); }
   removeAttendee(attendee) { this.attendees = this.attendees.filter(value => value !== attendee); }
+  getAlarms() {
+    if (this.alarms === null && this.parentItem !== this) {
+      this.alarms = this.parentItem.getAlarms();
+    }
+    return (this.alarms ?? []).slice();
+  }
+  addAlarm(alarm) {
+    if (this.alarms === null) this.alarms = this.getAlarms();
+    this.alarms.push(alarm);
+  }
+  clearAlarms() { this.alarms = []; }
 
   clone() {
     const clone = Object.assign(new this.constructor(), this);
     clone.properties = new Map(this.properties);
     clone.attendees = this.attendees.slice();
     clone.categories = this.categories.slice();
+    // CalItemBase snapshots effective alarms when cloning an occurrence proxy.
+    clone.alarms = this.getAlarms().map(alarm => alarm.clone());
     for (const name of ["startDate", "endDate", "entryDate", "dueDate", "completedDate", "recurrenceId"]) {
       if (this[name]) clone[name] = this[name].clone();
     }
     if (this.recurrenceInfo) {
       clone.recurrenceInfo = this.recurrenceInfo.clone();
       clone.recurrenceInfo.item = clone;
+      for (const name of ["occurrences", "exceptions"]) {
+        clone.recurrenceInfo[name] = this.recurrenceInfo[name].map(item => {
+          const copy = item.clone();
+          copy.parentItem = clone;
+          // Re-expanding a cloned series creates fresh unmodified proxies,
+          // even if a previous listing cached their inherited alarms.
+          // Stored exceptions keep their own snapshot, including empty lists.
+          if (name === "occurrences" && !this.recurrenceInfo.getExceptionFor(item.recurrenceId)) {
+            copy.alarms = null;
+          }
+          return copy;
+        });
+      }
     }
     return clone;
   }
@@ -275,12 +334,20 @@ function makeRecurrenceRule(info, fields) {
 
 function plain(value) { return JSON.parse(JSON.stringify(value)); }
 
+function assertNoWrites(runtime) {
+  assert.equal(runtime.calls.adds.length, 0);
+  assert.equal(runtime.calls.modifies.length, 0);
+  assert.equal(runtime.calls.deletes.length, 0);
+  assert.equal(runtime.calls.dialogs.length, 0);
+  assert.equal(runtime.calls.calendarProperties.length, 0);
+}
+
 function loadCalendarRuntime({
   blockSkipReview, unreadableSkipReview = false, allowedAccounts,
   allowAllCalendars = false, parser = "cal", parserFailure,
   identity = { email: "organizer@example.com", fullName: "Organizer" },
   identityKey = "identity-1", unreadableIdentity = false, resolvedIdentity, organizerId,
-  disabled = false,
+  disabled = false, alarmMaxCount, alarmActions,
 } = {}) {
   const prefValues = new Map();
   const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_BOOL: 128 };
@@ -298,7 +365,10 @@ function loadCalendarRuntime({
     },
     getIntPref(_name, fallback) { return fallback; },
   };
-  const calendarProperties = new Map([["imip.identity.key", identityKey], ["disabled", disabled]]);
+  const calendarProperties = new Map([
+    ["imip.identity.key", identityKey], ["disabled", disabled],
+    ["capabilities.alarms.maxCount", alarmMaxCount], ["capabilities.alarms.actionValues", alarmActions],
+  ]);
   if (resolvedIdentity !== undefined) calendarProperties.set("imip.identity", resolvedIdentity);
   if (organizerId !== undefined) calendarProperties.set("organizerId", organizerId);
   const calendar = {
@@ -389,6 +459,7 @@ function loadCalendarRuntime({
       jsDateToDateTime(date, tz) { return new CalendarDate(date, tz); },
     },
     createDateTime() { return new CalendarDate(); },
+    createDuration() { return new CalendarDuration(); },
     createRecurrenceDate() { return { date: null, isNegative: false, isFinite: true }; },
     category: { fromPrefs: () => ["Work", "Personal"] },
     itip: { getInvitedAttendee: item => item.invitedAttendee || null },
@@ -410,8 +481,8 @@ function loadCalendarRuntime({
     },
   };
   const sandbox = {
-    cal, CalEvent: CalendarItem, CalTodo: CalendarTodo, CalAttendee: CalendarAttendee, Cc,
-    Ci: { nsIPrefBranch: prefTypes, calICalendar: CALENDAR_FILTERS },
+    cal, CalEvent: CalendarItem, CalTodo: CalendarTodo, CalAttendee: CalendarAttendee, CalAlarm: CalendarAlarm, Cc,
+    Ci: { nsIPrefBranch: prefTypes, calICalendar: CALENDAR_FILTERS, calIAlarm: CALENDAR_ALARM_RELATIONS },
     Services: { prefs: preferences, wm: { getMostRecentWindow: () => window } },
     MailServices: { accounts: { getIdentity() {
       if (unreadableIdentity) throw new Error("Unreadable calendar identity");
@@ -505,6 +576,11 @@ function loadCalendarRuntime({
   return {
     ...sandbox, calls, items, calendar, prefValues, date, makeEvent, seedEvent, seedTask, seedSeries, seedDenseSeries,
     makeAttendee: fields => new CalendarAttendee(fields),
+    makeAlarm({ seconds = -3600, related = CALENDAR_ALARM_RELATIONS.ALARM_RELATED_START, ...fields } = {}) {
+      const alarm = new CalendarAlarm({ action: "DISPLAY", related, ...fields });
+      if (related !== CALENDAR_ALARM_RELATIONS.ALARM_RELATED_ABSOLUTE) alarm.offset = new CalendarDuration(seconds);
+      return alarm;
+    },
     async invoke(name, args) {
       sandbox.coerceToolArgs(name, args);
       const errors = sandbox.validateToolArgs(name, args);
@@ -514,4 +590,4 @@ function loadCalendarRuntime({
   };
 }
 
-module.exports = { loadCalendarRuntime, plain };
+module.exports = { loadCalendarRuntime, plain, assertNoWrites };
