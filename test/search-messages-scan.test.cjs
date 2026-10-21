@@ -12,6 +12,9 @@ const FOLDER_FLAGS = { Virtual: 0x20, ImapNoselect: 0x01000000 };
 const SYNC_WAIT_MS = 5000;
 const SEARCH_BUDGET_MS = 20000;
 const UPDATE_MS = 40;
+const VALIDATION_CHUNK_SIZE = 250;
+const HEADER_READ_MS = 1000;
+const EXPUNGED = 0x8;
 const FAILURE = 0x80004005;
 const DECRYPTION_OKAY = 0x00020000;
 const CONFIRMED_REFRESH = { status: "loaded", updateConfirmed: true, joinedInFlight: false };
@@ -159,7 +162,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
           },
         },
       },
-      Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsMsgFolderFlags: FOLDER_FLAGS,
+      Ci: { nsMsgMessageFlags: { Expunged: EXPUNGED }, nsMsgFolderFlags: FOLDER_FLAGS,
         nsIFolderListener: { event: 0x80 }, nsIMsgImapMailFolder: "imap", nsIMsgMailNewsUrl: "mail-url" },
       NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
       MailServices: {
@@ -176,6 +179,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
   for (const folder of folders.values()) {
     makeImapFolder({ folder, clock, runtime, session, delay: refreshDelay, exitCode,
       onRefresh(current) { current.stats.refreshes++; },
+      onUpdate(current) { current.hooks.update?.(); },
       onUpdateComplete(current, status) { current.hooks.sync?.(status); },
     });
   }
@@ -275,7 +279,7 @@ describe("searchMessages production scan and pagination", () => {
   });
 
   it("excludes expunged rows returned by listAllKeys without claiming truncation", async () => {
-    const folder = makeFolder("Archive", { messages: [{ flags: 0x8 }, {}, { flags: 0x8 }, {}] });
+    const folder = makeFolder("Archive", { messages: [{ flags: EXPUNGED }, {}, { flags: EXPUNGED }, {}] });
     const h = makeHarness({ roots: [folder] });
     assert.deepEqual(await h.search({ countOnly: true }), { count: 2, folderRefresh: CONFIRMED_REFRESH });
     assert.deepEqual((await h.search()).map(row => row.id), ["m-3@example.com", "m-1@example.com"]);
@@ -486,15 +490,30 @@ describe("searchMessages counts and folder freshness", () => {
   it("charges the wait against the scan budget", async () => {
     const folder = makeFolder("Slow", { count: 100 });
     const h = makeHarness({ roots: [folder], refreshDelay: null });
-    const perHeaderMs = 1000;
-    folder.hooks.header = () => h.advance(perHeaderMs);
+    folder.hooks.header = () => h.advance(HEADER_READ_MS);
     const pending = h.search({ query: "never matches", countOnly: true });
     await h.clock.advance(SYNC_WAIT_MS);
     const result = await pending;
     assert.equal(result.count, 0);
     assert.equal(result.truncated, true);
     assert.equal(h.clock.now, SEARCH_BUDGET_MS);
-    assert.equal(folder.stats.headerReads, (SEARCH_BUDGET_MS - SYNC_WAIT_MS) / perHeaderMs);
+    assert.equal(folder.stats.headerReads, (SEARCH_BUDGET_MS - SYNC_WAIT_MS) / HEADER_READ_MS);
+  });
+
+  it("charges synchronous refresh startup to both wait and search budgets", async () => {
+    const h = makeHarness({ refreshDelay: null });
+    const folder = h.roots[0];
+    const startupMs = SEARCH_BUDGET_MS + UPDATE_MS;
+    folder.hooks.update = () => h.advance(startupMs);
+    const result = await h.search({ countOnly: true });
+    assert.equal(h.clock.now, startupMs, "native work is not interruptible, but adds no further wait");
+    assert.equal(result.folderRefresh.status, "timeout");
+    assert.equal(result.count, 0);
+    assert.equal(result.truncated, true);
+    assert.equal(folder.stats.databaseReads, 0);
+    folder.finishUrl(folder.updateUrl);
+    await h.clock.flush();
+    assert.equal(h.listeners.size, 0);
   });
 
   for (const type of ["none", "pop3", "ews", "graph", "owl"]) it(`does not add a wait to ${type} folders`, async () => {
@@ -573,7 +592,7 @@ describe("searchMessages counts and folder freshness", () => {
 describe("searchMessages production budget, mutations and access", () => {
   for (const mode of ["array", "page", "count"]) {
     it(`preserves the ${mode} response contract when time-limited`, async () => {
-      const h = makeHarness({ roots: [makeFolder("Archive", { count: 700 })], onYield(runtime) { runtime.advance(20000); } });
+      const h = makeHarness({ roots: [makeFolder("Archive", { count: 700 })], onYield(runtime) { runtime.advance(SEARCH_BUDGET_MS); } });
       const result = await h.search({ maxResults: 2, ...(mode === "page" ? { offset: 999 } : {}), ...(mode === "count" ? { countOnly: true } : {}) });
       if (mode === "array") {
         assert.ok(Array.isArray(result));
@@ -587,26 +606,26 @@ describe("searchMessages production budget, mutations and access", () => {
       if (mode === "count") assert.equal(result.count, 0);
       else {
         assert.equal(result.hasMore, false);
-        assert.equal(result.totalMatches, 250);
+        assert.equal(result.totalMatches, VALIDATION_CHUNK_SIZE);
         assert.equal(result.messages.length, 0);
       }
     });
   }
 
   it("terminates pagination through time-limited header results independently of truncation", async () => {
-    const h = makeHarness({ roots: [makeFolder("Archive", { count: 700 })], onYield(runtime) { runtime.advance(20000); } });
+    const h = makeHarness({ roots: [makeFolder("Archive", { count: 700 })], onYield(runtime) { runtime.advance(SEARCH_BUDGET_MS); } });
     let offset = 0;
     let pages = 0;
     let result;
     do {
       result = await h.search({ offset, maxResults: 100, sortOrder: "asc" });
       assert.equal(result.truncated, true);
-      assert.equal(result.totalMatches, 250);
+      assert.equal(result.totalMatches, VALIDATION_CHUNK_SIZE);
       assert.equal(result.hasMore, offset + result.messages.length < result.totalMatches);
       offset += result.messages.length;
       assert.ok(++pages <= 3, "Pagination must stop at the collected total");
     } while (result.hasMore);
-    assert.equal(offset, 250);
+    assert.equal(offset, VALIDATION_CHUNK_SIZE);
     assert.equal(pages, 3);
     const beyond = await h.search({ offset, maxResults: 100 });
     assert.deepEqual(beyond.messages, []);
@@ -688,7 +707,7 @@ describe("searchMessages production budget, mutations and access", () => {
     const result = await h.search({ countOnly: true });
     assert.equal(result.truncated, true);
     assert.equal(result.count, 0);
-    assert.equal(folder.stats.headerReads, 250);
+    assert.equal(folder.stats.headerReads, VALIDATION_CHUNK_SIZE);
   });
 
   it("denies an inaccessible explicit folder before refresh or database access", async () => {
@@ -747,7 +766,7 @@ describe("searchMessages cooperative count finalization", () => {
     const folder = makeFolder("Changing", { count: 751 });
     const h = makeHarness({ roots: [folder], onYield() {
       folder.headers.delete(251);
-      folder.headers.get(252).flags = 0x8;
+      folder.headers.get(252).flags = EXPUNGED;
       folder.headers.get(253).messageId = "new-message@example.com";
     } });
     folder.hooks.header = key => { if (key === 254) throw new Error("Unreadable row"); };
@@ -772,10 +791,9 @@ describe("searchMessages cooperative count finalization", () => {
   it("stops within a validation chunk when native header reads consume the deadline", async () => {
     const folder = makeFolder("Slow", { count: 100 });
     const h = makeHarness({ roots: [folder] });
-    const perHeaderMs = 1000;
-    folder.hooks.header = () => h.advance(perHeaderMs);
+    folder.hooks.header = () => h.advance(HEADER_READ_MS);
     const result = await h.finishCount(collectedRows(folder));
-    assert.equal(result.count, SEARCH_BUDGET_MS / perHeaderMs);
+    assert.equal(result.count, SEARCH_BUDGET_MS / HEADER_READ_MS);
     assert.equal(result.truncated, true);
     assert.match(result.message, /20-second.*partial/);
     assert.equal(h.clock.now, SEARCH_BUDGET_MS);
@@ -786,9 +804,9 @@ describe("searchMessages cooperative count finalization", () => {
     const folder = makeFolder("Large", { count: 751 });
     const h = makeHarness({ roots: [folder], onYield(runtime) { runtime.advance(SEARCH_BUDGET_MS); } });
     const result = await h.finishCount(collectedRows(folder));
-    assert.equal(result.count, 250);
+    assert.equal(result.count, VALIDATION_CHUNK_SIZE);
     assert.equal(result.truncated, true);
-    assert.equal(folder.stats.headerReads, 250);
+    assert.equal(folder.stats.headerReads, VALIDATION_CHUNK_SIZE);
     assert.equal(folder.stats.databaseReads, 1);
   });
 
@@ -817,7 +835,7 @@ describe("searchMessages cooperative count finalization", () => {
     const result = await h.finishCount([...collectedRows(privateFolder), ...collectedRows(safe)]);
     assert.equal(result.count, 1);
     assert.equal(result.truncated, true);
-    assert.equal(privateFolder.stats.headerReads, 250);
+    assert.equal(privateFolder.stats.headerReads, VALIDATION_CHUNK_SIZE);
     assert.equal(privateFolder.stats.databaseReads, 1, "no database is opened after revocation");
   });
 
@@ -863,7 +881,7 @@ describe("searchMessages production Gloda collection", () => {
   it("keeps an empty array when an unpaginated Gloda search times out", async () => {
     const h = makeHarness({ waitForGloda: true });
     const pending = h.search({ query: "body query", searchBody: true });
-    h.advance(20000);
+    h.advance(SEARCH_BUDGET_MS);
     h.timers[0].fire();
     assert.deepEqual(await pending, []);
   });
@@ -936,7 +954,7 @@ describe("searchMessages production Gloda collection", () => {
     const h = makeHarness({ waitForGloda: true });
     const pending = h.search({ query: "body query", searchBody: true, countOnly: true });
     assert.equal(h.timers[0].delay, SEARCH_BUDGET_MS);
-    h.advance(20000);
+    h.advance(SEARCH_BUDGET_MS);
     h.timers[0].fire();
     const result = await pending;
     assert.equal(result.count, 0);
@@ -948,7 +966,7 @@ describe("searchMessages production Gloda collection", () => {
   it("handles timeout during cooperative Gloda processing without a second completion", async () => {
     const folder = makeFolder("Archive", { count: 600 });
     const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
-    const h = makeHarness({ roots: [folder], glodaItems, onYield(runtime) { runtime.advance(20000); runtime.timers[0].fire(); } });
+    const h = makeHarness({ roots: [folder], glodaItems, onYield(runtime) { runtime.advance(SEARCH_BUDGET_MS); runtime.timers[0].fire(); } });
     const result = await h.search({ query: "body query", searchBody: true, countOnly: true });
     assert.equal(result.truncated, true);
     assert.equal(result.count, 0, "the expired budget leaves no time to revalidate Gloda candidates");
@@ -979,9 +997,9 @@ describe("searchMessages production Gloda collection", () => {
     const pending = h.search({ query: "body", searchBody: true, countOnly: true });
     lateListener = h.searchers[0].listener;
     const result = await pending;
-    assert.equal(result.count, 250);
+    assert.equal(result.count, VALIDATION_CHUNK_SIZE);
     assert.equal(result.truncated, true);
-    assert.equal(folder.stats.headerReads, 250);
+    assert.equal(folder.stats.headerReads, VALIDATION_CHUNK_SIZE);
     assert.equal(h.timers[0].canceled, true);
   });
 
@@ -1101,7 +1119,7 @@ describe("searchMessages protects subjects of encrypted mail", () => {
     assert.equal(result.count, 0);
     assert.equal(result.truncated, true);
     assert.equal(folder.rawReads, 0);
-    assert.equal(folder.stats.headerReads, size + 250, "no more protected candidates are read after opt-out");
+    assert.equal(folder.stats.headerReads, size + VALIDATION_CHUNK_SIZE, "no more protected candidates are read after opt-out");
   });
 
   for (const query of ["", "alice", "from:alice"]) it(`preserves permitted metadata counts through opt-out (query ${JSON.stringify(query)})`, async () => {
