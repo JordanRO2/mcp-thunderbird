@@ -90,6 +90,7 @@ Structured MIME extraction keeps the first body's representation outside multipa
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
+| `dryRunCompose` | Read-only preflight for `sendMail`: validates identity, `skipReview` block, recipients and attachments with the same checks and reports what would be sent, without sending, saving, opening a window or writing files. Requires `sendMail` to be enabled |
 | `saveDraft` | Save a new or replacement draft without opening a window; supports threading headers, optional delayed delivery through Send Later (`sendAt`), and reports an accessible Drafts folder |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |

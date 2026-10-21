@@ -852,7 +852,7 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
 // paths like /data/... or the host's /tmp; passing those paths through to the
 // extension fails when file.exists() returns false inside the sandbox. Reading
 // on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
-const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage', 'dryRunCompose']);
 // END BRIDGE ATTACHMENT POLICY
 
 // Minimal MIME map covering common attachment types (documents, images,
@@ -1674,6 +1674,7 @@ module.exports = {
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
+  ATTACHMENT_TOOLS,
   attachmentLimits: {
     MAX_ATTACHMENT_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,

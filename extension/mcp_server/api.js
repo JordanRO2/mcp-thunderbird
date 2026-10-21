@@ -3208,6 +3208,52 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
+      {
+        name: "dryRunCompose",
+        group: "messages", crud: "read",
+        title: "Dry-Run Compose",
+        description: "Read-only preflight for sendMail. Runs the same identity resolution, skipReview block check and attachment validation (deny-list, symlink/junction, size and count limits, base64 shape) that sendMail applies, and reports what WOULD be sent. Nothing is sent, saved or opened, and no files are written; inline attachments are not decoded.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text (length is reported back; content is not echoed)" },
+            cc: { type: "string", description: "CC recipients (comma-separated)" },
+            bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            skipReview: { type: "boolean", description: "Check whether a direct send would be honored (it is blocked unless the user disabled the skipReview safety block). Nothing is sent either way." },
+            includeSignature: { type: "boolean", default: true, description: "Echoed back for a direct send (default: true)" },
+            attachments: {
+              type: "array",
+              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
+              description: "Attachments to validate, same shape as sendMail: file paths (strings) or inline objects ({name, contentType, base64})",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", minLength: 1, description: "Attachment filename" },
+                      contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
+                      base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
+                      content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                    },
+                    required: ["name"],
+                    anyOf: [
+                      { type: "object", required: ["base64"] },
+                      { type: "object", required: ["content"] },
+                    ],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+          required: ["to", "subject", "body"],
+        },
+      },
       ];
     }
     // END TOOL SCHEMA BUILDER
@@ -4066,9 +4112,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Returns { descs: [{url, name, size, contentType?}], failed: [] }.
              * Any refused entry throws before a send/draft/window can proceed,
              * and removes temporary files created by this conversion.
+             *
+             * With { dryRun: true } every validation step runs unchanged, but inline
+             * entries are neither decoded nor written (their decoded size is derived
+             * from the validated base64 length) and the final native-attachment
+             * materialization (descsToMsgAttachments) is skipped, so the call has no
+             * side effects. Descriptors then carry no url for inline entries.
              */
             // BEGIN OUTBOUND ATTACHMENT CONVERSION
-            function filePathsToAttachDescs(filePaths) {
+            function filePathsToAttachDescs(filePaths, { dryRun = false } = {}) {
               const descs = [];
               const failed = [];
               if (filePaths === undefined || filePaths === null) return { descs, failed };
@@ -4222,6 +4274,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
                       continue;
                     }
+                    if (dryRun) {
+                      // Shape was validated above, so decoding cannot fail.
+                      const padding = b64Data.endsWith("==") ? 2 : b64Data.endsWith("=") ? 1 : 0;
+                      const decodedSize = (b64Data.length / 4) * 3 - padding;
+                      if (decodedSize > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+                        failed.push(`${entry.name} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
+                        continue;
+                      }
+                      descs.push({ name: entry.name, size: decodedSize, ...(entry.contentType ? { contentType: entry.contentType } : {}) });
+                      totalAttachmentBytes += decodedSize;
+                      continue;
+                    }
                     // Decode base64 to binary bytes
                     let bytes;
                     try {
@@ -4301,7 +4365,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               // Materialize native attachments before any send/draft/window.
               // The helper caches them on the private descriptors for later use.
-              if (!failed.length) {
+              if (!failed.length && !dryRun) {
                 try { descsToMsgAttachments(descs); } catch (e) { failed.push(e.message || String(e)); }
               }
               if (failed.length) {
@@ -10665,6 +10729,77 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN DRY-RUN COMPOSE TOOL
+            /**
+             * Recipient count of an address header, using the same splitter as the
+             * reply/forward paths (quoted commas are not split). Pure (no I/O).
+             */
+            function countRecipients(header) {
+              return splitAddressHeader(typeof header === "string" ? header : "").filter(a => a.trim()).length;
+            }
+
+            /**
+             * Read-only preflight for composeMail. Runs the same skipReview block
+             * check, identity resolution (setComposeIdentity, against a throwaway
+             * params object), format resolution and attachment validation
+             * (filePathsToAttachDescs in dryRun mode) as the real path, and reports
+             * what would be sent. It never sends, saves, opens a compose window,
+             * writes a file, or mutates audit/state. Gated on sendMail being
+             * enabled, since it probes the same paths sendMail would attach.
+             */
+            function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, includeSignature = true) {
+              if (!isToolEnabled("sendMail")) {
+                return { error: "dryRunCompose requires the sendMail tool to be enabled" };
+              }
+              const blockers = [];
+              const direct = !!skipReview;
+              const recipients = { to: countRecipients(to), cc: countRecipients(cc), bcc: countRecipients(bcc) };
+              const result = {
+                wouldSucceed: false,
+                blockers,
+                mode: direct ? "direct-send" : "review-window",
+                skipReviewBlocked: isSkipReviewBlocked(),
+                resolvedIdentity: null,
+                isHtml: null,
+                subject: typeof subject === "string" ? subject : "",
+                bodyLength: typeof body === "string" ? body.length : 0,
+                includeSignature: direct ? includeSignature !== false : null,
+                recipients,
+                attachments: [],
+              };
+              try {
+                if (direct && result.skipReviewBlocked) {
+                  blockers.push("User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead.");
+                } else if (direct && recipients.to + recipients.cc + recipients.bcc === 0) {
+                  blockers.push("A direct send needs at least one recipient (to, cc or bcc)");
+                }
+                const params = { identity: null };
+                const identityResult = setComposeIdentity(params, from, null);
+                if (identityResult && identityResult.error) {
+                  blockers.push(identityResult.error);
+                } else if (params.identity) {
+                  result.resolvedIdentity = {
+                    key: params.identity.key,
+                    email: params.identity.email,
+                    fullName: params.identity.fullName || null,
+                    isDefault: !from,
+                  };
+                  result.isHtml = resolveComposeFormat(params.identity, isHtml, Ci.nsIMsgCompType.New).useHtml;
+                }
+                try {
+                  const { descs } = filePathsToAttachDescs(attachments, { dryRun: true });
+                  result.attachments = descs.map(d => ({ name: d.name, size: d.size, ...(d.contentType ? { contentType: d.contentType } : {}) }));
+                } catch (e) {
+                  blockers.push(e.message || String(e));
+                }
+              } catch (e) {
+                blockers.push(e.message || String(e));
+              }
+              result.wouldSucceed = blockers.length === 0;
+              return result;
+            }
+            // END DRY-RUN COMPOSE TOOL
+
             // BEGIN DRAFT HELPERS
             function getIdentityDraftFolderURI(identity) {
               // ESR 128 uses draftFolder; newer Thunderbird uses draftsFolderURI.
@@ -12820,6 +12955,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return applyFilters(args.accountId, args.folderPath);
                 case "getAccountAccess":
                   return getAccountAccess();
+                case "dryRunCompose":
+                  return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.includeSignature);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }

@@ -10,6 +10,7 @@ const {
   buildConnectionDiscoveryErrorMessage,
   compactToolResultJsonText,
   clearConnectionCache,
+  ATTACHMENT_TOOLS,
   discoverConnectionInfo,
   inlineAttachmentPaths,
   isSensitiveFilePath,
@@ -203,6 +204,22 @@ describe('Tool result serialization', () => {
     assert.equal(compacted.result.content[0].text, '{"inlineImages":1}');
     assert.strictEqual(compacted.result.content[1], imageBlock);
     assert.strictEqual(response.result.content[1], imageBlock);
+  });
+});
+
+describe('Bridge attachment tool routing', () => {
+  it('routes dryRunCompose through the same attachment handling as sendMail', () => {
+    for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage', 'dryRunCompose']) {
+      assert.ok(ATTACHMENT_TOOLS.has(name), `${name} must be inlined by the bridge`);
+    }
+  });
+
+  it('lists every production tool that accepts attachments', () => {
+    const apiSource = fs.readFileSync(path.join(__dirname, '..', 'extension', 'mcp_server', 'api.js'), 'utf8');
+    const names = new Set();
+    for (const match of apiSource.matchAll(/name: "(\w+)",\s*group:[^\n]*\n(?:(?!\n {6}\{)[\s\S])*?attachments: \{\s*type: "array"/g)) names.add(match[1]);
+    assert.ok(names.has('sendMail') && names.has('dryRunCompose'));
+    for (const name of names) assert.ok(ATTACHMENT_TOOLS.has(name), `${name} accepts attachments but is not in ATTACHMENT_TOOLS`);
   });
 });
 
