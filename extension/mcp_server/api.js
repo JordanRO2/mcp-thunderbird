@@ -2525,6 +2525,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const MAX_REMINDER_MINUTES = 40320;
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
+      const fullRecipientsDescription = 'If true, return complete recipients and ccList. By default, each list shows the first 3 addresses plus "(+N more)". Matching uses full headers; getMessage and the header readers always return full lists.';
       const attendeeSchema = {
         type: "object",
         properties: {
@@ -2635,7 +2636,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             countOnly: { type: "boolean", description: "If true, return a best-effort count of currently resolvable, non-expunged collected candidates, respecting dedupByMessageId and including candidates beyond the requested page. Rechecks yield without hydrating result content. If the search deadline interrupts validation, only validated rows count and truncated:true is returned; this count can be zero." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing. Gloda supplies relevance-limited candidates without a completeness indicator; object responses report truncated:true. Without offset, message results remain a plain array without completeness information. Narrow the text query; use header search when header/preview matching is sufficient." },
             dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
-            fullRecipients: { type: "boolean", description: "If true, return complete recipients/ccList in each row. Default: false, which shows the first 3 addresses plus \"(+N more)\"; getMessage always returns the full lists." },
+            fullRecipients: { type: "boolean", description: fullRecipientsDescription },
           },
           required: ["query"],
         },
@@ -3162,7 +3163,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
-            fullRecipients: { type: "boolean", description: "If true, return complete recipients/ccList in each row. Default: false, which shows the first 3 addresses plus \"(+N more)\"; getMessage always returns the full lists." },
+            fullRecipients: { type: "boolean", description: fullRecipientsDescription },
           },
           required: [],
         },
@@ -3748,19 +3749,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * serve to decide which message to read; one newsletter search
              * answer weighed 44 KB because each row carried 60-80 recipients.
              * getMessage keeps the full lists; fullRecipients keeps them here.
-             * A value that does not parse as an address list is left as is.
+             * Parse the original encoded header: decoding a display name can
+             * introduce commas that must not become address separators. Short
+             * lists and failures preserve the existing display value verbatim.
              */
-            function capAddressList(value, fullRecipients) {
+            function capAddressList(encodedValue, value, fullRecipients) {
               if (fullRecipients === true || typeof value !== "string" || !value) return value;
-              let addresses;
               try {
-                addresses = MailServices.headerParser.parseDecodedHeader(value, false);
+                if (typeof encodedValue !== "string" || !encodedValue) return value;
+                const addresses = MailServices.headerParser.parseEncodedHeaderW(encodedValue);
+                if (!Array.isArray(addresses) || addresses.length <= LIST_ROW_ADDRESS_LIMIT) return value;
+                const shown = MailServices.headerParser.makeMimeHeader(addresses.slice(0, LIST_ROW_ADDRESS_LIMIT));
+                return typeof shown === "string" && shown
+                  ? `${shown} (+${addresses.length - LIST_ROW_ADDRESS_LIMIT} more)` : value;
               } catch {
+                // A display summary must never hide a message, including when
+                // the emitter cannot render an unusually long address token.
                 return value;
               }
-              if (!Array.isArray(addresses) || addresses.length <= LIST_ROW_ADDRESS_LIMIT) return value;
-              const shown = MailServices.headerParser.makeMimeHeader(addresses.slice(0, LIST_ROW_ADDRESS_LIMIT));
-              return `${shown} (+${addresses.length - LIST_ROW_ADDRESS_LIMIT} more)`;
             }
 
             /**
@@ -3984,8 +3990,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       threadId: msgHdr.threadId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                      recipients: capAddressList(msgHdr.mime2DecodedRecipients || msgHdr.recipients, fullRecipients),
-                      ccList: capAddressList(msgHdr.ccList, fullRecipients),
+                      recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       folder: folder.prettyName,
                       folderPath: folder.URI,
@@ -3993,6 +3999,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       flagged: msgHdr.isFlagged,
                       tags: getUserTags(msgHdr),
                     };
+                    if (fullRecipients !== true) {
+                      try {
+                        message.recipients = capAddressList(msgHdr.recipients, message.recipients, fullRecipients);
+                      } catch { /* Optional raw-header access failed; keep the full display value. */ }
+                      message.ccList = capAddressList(message.ccList, message.ccList, fullRecipients);
+                    }
                     if (preview) message.preview = preview;
                     if (!allowEncrypted && hasRecordedEncryption(msgHdr)) withholdProtectedSubject(message, msgHdr);
                     if (row.dupLocations) message.dupLocations = row.dupLocations;
@@ -12274,8 +12286,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       threadId: msgHdr.threadId, // folder-local, use with folderPath for grouping
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                      recipients: capAddressList(msgHdr.mime2DecodedRecipients || msgHdr.recipients, fullRecipients),
-                      ccList: capAddressList(msgHdr.ccList, fullRecipients),
+                      recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       folder: folder.prettyName,
                       folderPath: folder.URI,
@@ -12284,6 +12296,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
+                    if (fullRecipients !== true) {
+                      try {
+                        // Retain only the original string, not another native
+                        // header handle. Formatting waits for the returned page.
+                        Object.defineProperty(result, "_rawRecipients", { value: msgHdr.recipients, configurable: true });
+                      } catch { /* Keep the full display value if the raw header is unavailable. */ }
+                    }
                     if (!allowEncrypted && hasRecordedEncryption(msgHdr)) {
                       result.subject = WITHHELD_SUBJECT;
                       result.encryptedContentWithheld = true;
@@ -12329,6 +12348,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const response = paginate(results, offset, effectiveLimit);
               for (const row of Array.isArray(response) ? response : response.messages) {
+                row.recipients = capAddressList(row._rawRecipients, row.recipients, fullRecipients);
+                row.ccList = capAddressList(row.ccList, row.ccList, fullRecipients);
+                delete row._rawRecipients;
                 if (!row._protectedHdr) continue;
                 withholdProtectedSubject(row, row._protectedHdr);
                 delete row._protectedHdr;

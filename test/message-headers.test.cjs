@@ -6,6 +6,7 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 
@@ -150,9 +151,7 @@ function makeHarness({ rows, direct = true, allowEncrypted = false, msPerYield =
     Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
-      mimeConverter: {
-        decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")),
-      },
+      ...loadThunderbirdHeaderParser(),
       folderLookup: { getFolderForURL: uri => (uri === folder.URI ? folder : null) },
       accounts: { accounts: [account], findAccountForServer: () => (accessible ? account : null) },
     },
@@ -234,6 +233,22 @@ describe("header object shape", () => {
     assert.equal(second.ccList, "");
   });
 
+  it("single and batch explicit reads keep complete recipient and decoded Cc lists", async () => {
+    const raw = "=?UTF-8?Q?Doe=2C_John?= <j@x>, b@x, c@x, d@x";
+    const decoded = "Doe, John <j@x>, b@x, c@x, d@x";
+    const h = makeHarness({ rows: [{ hdr: {
+      recipients: raw, mime2DecodedRecipients: decoded, ccList: raw,
+    } }] });
+    const single = await h.call("getMessageHeaders", { messageId: "m-0@example.com", folderPath: h.folder.URI });
+    const batch = await h.call("batchGetMessageHeaders", { messageIds: ["m-0@example.com"], folderPath: h.folder.URI });
+    for (const row of [single, batch.headers["m-0@example.com"]]) {
+      assert.equal(row.recipients, decoded);
+      assert.equal(row.ccList, decoded);
+      assert.doesNotMatch(row.recipients, /\(\+\d+ more\)/);
+      assert.doesNotMatch(row.ccList, /\(\+\d+ more\)/);
+    }
+  });
+
   it("falls back to the raw ccList when decoding throws", async () => {
     const h = makeHarness({ rows: [{ hdr: { ccList: "a@example.com" } }] });
     h.runtime.MailServices.mimeConverter.decodeMimeHeader = () => { throw new Error("bad charset"); };
@@ -286,13 +301,16 @@ describe("header object shape", () => {
     const hidden = "vis\u200Bible\u{E0061}";
     const h = makeHarness({ rows: [{ hdr: {
       messageId: "rawSource", mime2DecodedSubject: hidden, mime2DecodedAuthor: hidden,
-      mime2DecodedRecipients: hidden, ccList: hidden,
+      mime2DecodedRecipients: hidden, ccList: `=?UTF-8?B?${Buffer.from(hidden).toString("base64")}?=`,
     } }] });
     const result = await h.call("batchGetMessageHeaders", { messageIds: ["rawSource"], folderPath: h.folder.URI });
     assert.equal(result.headers.rawSource.id, "rawSource");
-    for (const field of ["subject", "author", "recipients", "ccList"]) {
+    for (const field of ["subject", "author", "recipients"]) {
       assert.equal(result.headers.rawSource[field], "visible", field);
     }
+    // Thunderbird's real MIME converter replaces these characters with spaces
+    // while decoding Cc, before the response sanitizer runs.
+    assert.equal(result.headers.rawSource.ccList, "vis ible ");
     assert.equal(result.failed, 0);
   });
 });
