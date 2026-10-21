@@ -1299,12 +1299,20 @@ async function handleMessage(line) {
 // BEGIN BRIDGE HTTP REQUEST HELPERS
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
+// The extension streams an uncached IMAP message from the server for up to
+// 120 s (RAW_SERVER_FETCH_TIMEOUT_MS) before getMessage(rawSource) answers.
+const RAW_SOURCE_TIMEOUT = 150000;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;
+  let timeoutMs = REQUEST_TIMEOUT;
   if (message?.method === 'tools/call') {
     const name = message.params?.name;
     const args = message.params?.arguments;
+    const rawSource = args?.rawSource === true || args?.rawSource === 'true';
+    if ((name === 'getMessage' || name === 'getMessages') && rawSource) {
+      timeoutMs = RAW_SOURCE_TIMEOUT;
+    }
     // Match coerceToolArgs in the extension: only the exact string "true"
     // becomes true before validation and dispatch.
     const saveAsDraft = args?.saveAsDraft === true || args?.saveAsDraft === 'true';
@@ -1315,10 +1323,8 @@ function getThunderbirdRequestPolicy(message) {
       checkFolders = 'the Sent folder and the Outbox';
     }
   }
-  return {
-    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
-    checkFolders,
-  };
+  if (checkFolders) timeoutMs = MAIL_OPERATION_TIMEOUT;
+  return { timeoutMs, checkFolders };
 }
 
 function tryRequest(hostname, postData, port, token, policy) {

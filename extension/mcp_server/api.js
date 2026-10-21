@@ -2322,7 +2322,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
             includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Images referenced by the rendered body are attempted first in document order, followed by remaining inline images in MIME order. Ignored when rawSource is true." },
             bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default; HTML conversion allows only http/https/mailto links and replaces images with alt text; plain-text bodies only escape image openers, preserving other Markdown/HTML), 'text' (plain text), 'html' (unchanged, untrusted HTML). HTML input over 2 MiB is truncated before markdown/text conversion, with a notice." },
-            rawSource: { type: "boolean", description: "If true, return untrusted raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
+            rawSource: { type: "boolean", description: "If true, return untrusted raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. IMAP messages without a complete offline copy are fetched from the server." },
           },
           required: ["messageId", "folderPath"],
         },
@@ -8336,6 +8336,88 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            const RAW_SERVER_FETCH_TIMEOUT_MS = 120000;
+
+            /**
+             * Reads a message's complete raw source. An IMAP message's local copy
+             * is complete only once Thunderbird flags it Offline; before that the
+             * store can hold a prefix of it (observed: a 15.2 MB message read back
+             * as 7.9 MB without any error), so such messages are streamed from the
+             * server, the way the direct-send preflight retrieves uncached
+             * originals. Rejects on failure, timeout, or more than
+             * RAW_MESSAGE_MAX_BYTES.
+             */
+            function readCompleteRawMessage(msgHdr) {
+              const isImap = msgHdr.folder?.server?.type === "imap";
+              if (!isImap || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
+                let stream = null;
+                try {
+                  // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
+                  stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
+                  return Promise.resolve(readMessageStreamFully(stream));
+                } catch (e) {
+                  return Promise.reject(e);
+                } finally {
+                  if (stream) try { stream.close(); } catch { /* ignore */ }
+                }
+              }
+              return new Promise((resolve, reject) => {
+                let settled = false;
+                let request = null;
+                let raw = "";
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const settle = (error) => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  if (error) {
+                    try { request?.cancel(Cr.NS_BINDING_ABORTED); } catch { /* finished */ }
+                    reject(error);
+                  } else {
+                    resolve(raw);
+                  }
+                };
+                timer.initWithCallback({
+                  notify() { settle(new Error("raw message fetch from the server timed out")); },
+                }, RAW_SERVER_FETCH_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                try {
+                  const msgURI = msgHdr.folder.getUriForMsg(msgHdr);
+                  MailServices.messageServiceFromURI(msgURI).streamMessage(msgURI, {
+                    QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+                    onStartRequest(startedRequest) { request = startedRequest; },
+                    onDataAvailable(_request, stream, _offset, count) {
+                      if (settled) return;
+                      try {
+                        if (count > RAW_MESSAGE_MAX_BYTES - raw.length) {
+                          settle(new Error(`message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`));
+                          return;
+                        }
+                        while (count > 0) {
+                          const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
+                          const bytes = NetUtil.readInputStreamToString(stream, length);
+                          if (bytes.length !== length) throw new Error("message stream read made no progress");
+                          raw += bytes;
+                          count -= length;
+                        }
+                      } catch (e) {
+                        settle(e);
+                      }
+                    },
+                    onStopRequest(_request, status) {
+                      request = null;
+                      if (!Components.isSuccessCode(status)) {
+                        settle(new Error(`raw message fetch failed (status 0x${status.toString(16)})`));
+                        return;
+                      }
+                      settle(null);
+                    },
+                  }, null, null, false, "", false);
+                } catch (e) {
+                  settle(e);
+                }
+              });
+            }
+
             // True when a direct forward built from the raw message would drop
             // content: an attached message, or any leaf other than the first body
             // candidate that has an attachment disposition, a filename, or a
@@ -9054,12 +9136,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     // Raw source mode: return full RFC 2822 message
                     if (rawSource) {
-                      let stream = null;
-                      try {
-                        const folder = msgHdr.folder;
-                        stream = folder.getMsgInputStream(msgHdr, {});
-                        // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
-                        const raw = readMessageStreamFully(stream);
+                      readCompleteRawMessage(msgHdr).then(raw => {
                         if (!allowEncrypted) {
                           const state = classifyRawMessageEncryption(raw, 0, {
                             signedRaw: useRawContent || isRawTopLevelMultipartSigned(raw),
@@ -9078,12 +9155,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                           rawSource: raw,
                         });
-                      } catch (e) {
+                      }).catch(e => {
                         console.error("thunderbird-mcp: raw source read failed:", e);
                         resolve({ error: "Failed to read raw source" });
-                      } finally {
-                        if (stream) try { stream.close(); } catch { /* ignore */ }
-                      }
+                      });
                       return;
                     }
 

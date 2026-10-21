@@ -17,15 +17,16 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, imap = null } = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
     options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
     attachments: attachments.calls,
+    serverStreams: 0,
   };
   const folder = {
-    server: {},
+    server: imap ? { type: "imap" } : {},
     getUriForMsg: () => "message-uri",
     getMsgInputStream() {
       calls.streams++;
@@ -37,6 +38,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
   const hdr = {
     messageId: "message-1", subject: "protected subject", author: "sender@example.test",
     recipients: "reader@example.test", folder, date: 0,
+    flags: imap?.offline ? 0x80 : 0,
   };
   const sandbox = {
     console: { error: (...args) => calls.logs.push(args), warn: (...args) => calls.logs.push(args) },
@@ -104,6 +106,29 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     },
     async openComposeWindowWithCustomizations() { calls.reviews++; return { success: true }; },
   };
+  if (imap) {
+    // An IMAP message service streaming the server's copy in two chunks.
+    Object.assign(sandbox.Ci, { nsMsgMessageFlags: { Offline: 0x80 } });
+    sandbox.Cr = { NS_BINDING_ABORTED: 0x804b0002 };
+    sandbox.Components = { isSuccessCode: status => status === 0 };
+    sandbox.NetUtil = { readInputStreamToString: (stream, count) => stream.read(count) };
+    sandbox.ChromeUtils.generateQI = () => () => {};
+    sandbox.MailServices = {
+      messageServiceFromURI: () => ({
+        streamMessage(_uri, listener) {
+          calls.serverStreams++;
+          const data = imap.serverRaw;
+          let offset = 0;
+          const stream = { read(count) { const chunk = data.slice(offset, offset + count); offset += chunk.length; return chunk; } };
+          listener.onStartRequest({ cancel() {} });
+          const half = Math.floor(data.length / 2);
+          listener.onDataAvailable(null, stream, 0, half);
+          listener.onDataAvailable(null, stream, half, data.length - half);
+          listener.onStopRequest(null, imap.status ?? 0);
+        },
+      }),
+    };
+  }
   vm.createContext(sandbox);
   vm.runInContext([
     source.match(/^const PREF_\w+ = .+;$/gm).join("\n"),
@@ -2516,5 +2541,33 @@ describe("Attachment and forward handling of external attachment links", () => {
       assert.deepEqual(Array.from(calls.sends[0].attachments.slice(0, MAIL_STORE_URLS.length), desc => desc.url), MAIL_STORE_URLS);
       assert.equal(calls.sends[0].attachments.length, MAIL_STORE_URLS.length + 2);
     });
+  });
+});
+
+describe("getMessage rawSource reads the complete message", () => {
+  const FULL = "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b--\r\n";
+  const PREFIX = FULL.slice(0, 60);
+
+  it("streams an IMAP message that is not fully offline from the server, not its partial local copy", async () => {
+    const { api, calls } = loadMessageTools({ raw: PREFIX, imap: { offline: false, serverRaw: FULL } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.serverStreams, 1);
+    assert.equal(calls.streams, 0, "the local store is not read for an incomplete copy");
+  });
+
+  it("reads the local copy of an IMAP message flagged Offline", async () => {
+    const { api, calls } = loadMessageTools({ raw: FULL, imap: { offline: true, serverRaw: "unused" } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.serverStreams, 0);
+    assert.equal(calls.streams, 1);
+  });
+
+  it("reports a failed server fetch as an error, never as a partial source", async () => {
+    const { api } = loadMessageTools({ raw: PREFIX, imap: { offline: false, serverRaw: FULL.slice(0, 30), status: 0x80004005 } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, undefined);
+    assert.equal(result.error, "Failed to read raw source");
   });
 });
