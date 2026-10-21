@@ -10,7 +10,7 @@ const httpdSource = fs.readFileSync(path.resolve(__dirname, "../../extension/htt
 
 // The Host snippet tests and exploratory httpd probes do not serialize replies
 // or preserve body bytes. Load the whole module; fake only XPCOM I/O/scheduling.
-function createHttpdHarness({ mode = "loopback", xpcomFactories = {} } = {}) {
+function createHttpdHarness({ mode = "loopback" } = {}) {
   const jobs = [];
   const logs = [];
   const requests = [];
@@ -86,7 +86,6 @@ function createHttpdHarness({ mode = "loopback", xpcomFactories = {} } = {}) {
       writeByteArray(bytes) { return stream.write(Buffer.from(bytes), bytes.length); },
     }),
     "@mozilla.org/supports-string;1": () => ({ QueryInterface() { return this; } }),
-    ...xpcomFactories,
   };
   const sandbox = vm.createContext({
     Cr, Ci, Cc: {}, TextEncoder,
