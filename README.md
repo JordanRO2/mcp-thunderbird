@@ -153,8 +153,8 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with disabled, read-only, event, and task support flags |
-| `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
-| `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
+| `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence and display `reminders`. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
+| `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, reminders, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
 | `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
 | `deleteEvent` | Delete an event or series; `recurrenceId` excludes one occurrence. Meetings with other attendees cannot be deleted while **Block `skipReview`** is on. |
 | `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
@@ -162,6 +162,8 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
 
 `recurrence` accepts a single RRULE, such as `FREQ=WEEKLY;BYDAY=MO,TU` or `RRULE:FREQ=DAILY;COUNT=10`. The optional prefix is case-insensitive. Control characters (including CR/LF), malformed rules, `SECONDLY`/`MINUTELY`, and `HOURLY` on all-day events are rejected; Thunderbird's recurrence parser validates the rule before saving. On update, `recurrence: ""` or `null` clears the rule. Replacing a rule discards existing EXDATEs and modified occurrences.
+
+`reminders` is an array of whole minutes before the event starts (`0` is at the start), for example `[1440, 0]` for one reminder a day before and one at the start. Each entry is one display alarm. Duplicates are ignored, at most 10 entries are accepted, and each value must be between 0 and 40320 (four weeks, the longest Google Calendar accepts); anything else is rejected before anything is changed. On `createEvent`, omit it, or pass `null` or `[]`, to add no alarms. On `updateEvent` it replaces every existing alarm on the series, or on the occurrence selected by `recurrenceId`, with display alarms (the same convention as `categories` and `attendees`): `[]` removes them all, and omitting it or passing `null` leaves them unchanged. `listEvents` returns each event's `reminders` in the same form, for the event's own alarms that are relative to its start. Alarms tied to the end or to an absolute time are not listed, and a calendar's default reminders are not stored on the event, so they do not appear.
 
 Thunderbird creates the initial **Home** calendar disabled. Check `listCalendars[].disabled` and enable the calendar in Thunderbird's calendar properties before using it. Event and task tools report an error for an explicitly selected disabled calendar; listings and default direct creation use enabled calendars, and report an error if all calendars are disabled. MCP leaves the enabled/disabled setting unchanged.
 
