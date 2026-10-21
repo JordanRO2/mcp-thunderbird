@@ -31,6 +31,7 @@ function getConstantDeclaration(name) {
 function loadPrivacyRuntime({
   initial = {}, unreadable = [], legacyAddonManager = false, legacy = false, initialize = true,
   values = new Map(), writeErrors = new Set(), beforeWrite = () => {},
+  defaults = new Map(), locked = new Set(), exposeLocks = true,
   policyTransform = code => code, schemaTransform = code => code,
 } = {}) {
   const readErrors = new Set();
@@ -48,33 +49,36 @@ function loadPrivacyRuntime({
     beforeWrite(name, value);
     if (writeErrors.has(name)) throw new Error("Preference write failed");
   }
+  // Searched preference mocks for locks/read-back overrides: none model Gecko's
+  // accepted user writes hidden by locked defaults. Keep both stores separate.
+  function getEffectiveValue(name) {
+    if (readErrors.has(name)) throw new Error("Preference is unreadable");
+    return locked.has(name) || !values.has(name) ? defaults.get(name) : values.get(name);
+  }
   const prefs = {
+    prefIsLocked: exposeLocks ? name => locked.has(name) : undefined,
     getPrefType(name) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      if (!values.has(name)) return prefTypes.PREF_INVALID;
-      const value = values.get(name);
+      const value = getEffectiveValue(name);
+      if (value === undefined) return prefTypes.PREF_INVALID;
       if (typeof value === "string") return prefTypes.PREF_STRING;
       if (typeof value === "boolean") return prefTypes.PREF_BOOL;
       if (Number.isInteger(value)) return prefTypes.PREF_INT;
       throw new Error("Unsupported preference value");
     },
     getStringPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
+      const value = getEffectiveValue(name);
       if (typeof value === "string") return value;
       if (arguments.length > 1) return fallback;
       throw new Error("Preference is not a string");
     },
     getBoolPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
+      const value = getEffectiveValue(name);
       if (typeof value === "boolean") return value;
       if (arguments.length > 1) return fallback;
       throw new Error("Preference is not a boolean");
     },
     getIntPref(name, fallback) {
-      if (readErrors.has(name)) throw new Error("Preference is unreadable");
-      const value = values.get(name);
+      const value = getEffectiveValue(name);
       if (Number.isInteger(value)) return value;
       if (arguments.length > 1) return fallback;
       throw new Error("Preference is not an integer");
@@ -228,7 +232,7 @@ function loadPrivacyRuntime({
     };
   }
   return {
-    ...sandbox, values, writes, writeErrors, readErrors, calls, handlerResults, addonListeners,
+    ...sandbox, values, defaults, locked, writes, writeErrors, readErrors, calls, handlerResults, addonListeners,
     addedListeners, removedListeners, warnings,
     http(method, params) {
       // Reuse validation.test.cjs's complete production HTTP boundary.

@@ -36,6 +36,7 @@ let getMessagesLimitStatus = null;
 let currentAccountError = "";
 let accountAccessChanged = false;
 let currentToolError = "";
+let currentToolNote = "";
 let currentToolRevision = "";
 let currentGetMessagesLimit = "";
 let toolAccessChanged = false;
@@ -389,7 +390,8 @@ async function loadToolAccess() {
     currentToolError = data.mode === "error"
       ? (data.error || "Invalid tool access configuration.") + " Optional tools are blocked. Change tool access and save to replace this setting."
       : "";
-    saveToolsStatus.textContent = currentToolError;
+    currentToolNote = data.note || "";
+    saveToolsStatus.textContent = currentToolError || currentToolNote;
     saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
 
     if (currentTools.length === 0) {
@@ -543,7 +545,7 @@ function onToolChange() {
   const limitChanged = getMessagesLimitInput && getMessagesLimitInput.value !== currentGetMessagesLimit;
   toolSettingsChanged = toolAccessChanged || (!currentToolError && !!limitChanged);
   saveToolsBtn.disabled = !toolSettingsChanged;
-  saveToolsStatus.textContent = currentToolError;
+  saveToolsStatus.textContent = currentToolError || currentToolNote;
   saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
 }
 

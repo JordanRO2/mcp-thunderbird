@@ -263,6 +263,8 @@ Account and tool access are configured via the extension settings page (Tools > 
 
 Starting with 0.10.0, updates respect customized **Tool Access**: if you have disabled at least one tool, newly introduced tools start unchecked and cannot be called until you enable them in Options and save. Fresh installations and profiles that have never restricted tools keep all tools enabled. Once recorded, customization remains remembered even if you later enable every tool; only tools first encountered in a later update start disabled. A tool you explicitly enable stays enabled across restarts and updates.
 
+If policy prevents saving the new restrictions, Options shows a note that Tool Access is managed by policy. Newly encountered tools stay disabled while existing tools keep following the policy's list. Migration completes after the preference is unlocked and its effective value can be updated. An untouched profile with a locked empty list keeps all tools enabled.
+
 Two compatibility limits apply. A 0.9.x profile that disabled tools and then re-enabled everything looks identical to an untouched profile, so its first upgrade keeps all tools enabled. Downgrading to 0.9.3 and saving Tool Access there can rewrite the disabled list and discard restrictions for newer tools; review those choices after upgrading again.
 
 `dryRunCompose` also requires `sendMail` to be enabled: disabling its parent hides it from `tools/list` and refuses calls. Options reflects this dependency immediately, including unsaved parent changes, while preserving the child's separate enabled/disabled choice.

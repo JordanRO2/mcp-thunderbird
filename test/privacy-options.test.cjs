@@ -572,6 +572,45 @@ describe("Options dependencies with the production preference API", () => {
 });
 
 describe("Options Tool Access upgrades with the production preference API", () => {
+  for (const exposeLocks of [true, false]) {
+    it(`shows a policy note without disabling existing allowed tools, lock API=${exposeLocks}`, async () => {
+      const pref = "extensions.thunderbird-mcp.disabledTools";
+      const runtime = loadPrivacyRuntime({ legacy: true, exposeLocks,
+        defaults: new Map([[pref, '["getMessage"]']]), locked: new Set([pref]),
+      });
+      const ui = loadOptions({ accessApi: runtime.options });
+      await ui.loadToolAccess();
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy.*new tools stay disabled/i);
+      assert.equal(ui.saveToolsStatus.className, "save-status");
+      assert.equal(ui.document.getElementById("tool-getMessage").checked, false);
+      assert.equal(ui.document.getElementById("tool-getMessages").checked, true);
+      for (const name of Object.keys(runtime.policy.introducedIn)) {
+        assert.equal(ui.document.getElementById("tool-" + name).checked, false, name);
+      }
+      const newTool = ui.document.getElementById("tool-refreshFolder");
+      newTool.checked = true;
+      await newTool.fire("change");
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy/i);
+      await ui.saveToolsBtn.fire("click");
+      assert.match(ui.saveToolsStatus.textContent, /managed by policy/i);
+      assert.equal(ui.saveToolsStatus.className, "save-status error");
+      assert.equal(runtime.values.has(runtime.prefNames.PREF_TOOL_ACCESS_STATE), false);
+      assert.equal(runtime.isToolEnabled("refreshFolder"), false);
+      runtime.locked.clear();
+      await ui.saveToolsBtn.fire("click");
+      assert.match(ui.saveToolsStatus.textContent, /Reload/);
+      await ui.loadToolAccess();
+      assert.equal(ui.saveToolsStatus.textContent, "");
+      assert.equal(ui.document.getElementById("tool-refreshFolder").checked, false);
+      const enabled = ui.document.getElementById("tool-refreshFolder");
+      enabled.checked = true;
+      await enabled.fire("change");
+      await ui.saveToolsBtn.fire("click");
+      assert.equal(ui.saveToolsStatus.className, "save-status");
+      assert.equal(runtime.isToolEnabled("refreshFolder"), true);
+    });
+  }
+
   it("shows migrated tools unchecked and keeps an explicit enable across Options and runtime reloads", async () => {
     const runtime = loadPrivacyRuntime({ legacy: true, initial: { PREF_DISABLED_TOOLS: '["getMessage"]' } });
     const ui = loadOptions({ accessApi: runtime.options });

@@ -3594,30 +3594,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
     // BEGIN TOOL ACCESS STATE
     const TOOL_ACCESS_ERROR = "Tool access preferences are corrupt, unreadable, or could not be saved. All non-infrastructure tools are blocked. Change tool selections explicitly to repair them.";
+    const TOOL_ACCESS_POLICY = "Tool Access is managed by policy.";
     // Searched readAccessListPref/setToolAccess and migration/revision helpers.
     // Reuse the deny-list parser; there was no tracking record or stale-save guard.
     function ensureToolAccessState() {
       const { values: disabled, corrupt } = readAccessListPref(PREF_DISABLED_TOOLS);
       let state = null;
+      let locked = false;
       try {
+        locked = Services.prefs.prefIsLocked?.(PREF_DISABLED_TOOLS) || false;
         const type = Services.prefs.getPrefType(PREF_TOOL_ACCESS_STATE);
         if (type !== Ci.nsIPrefBranch.PREF_INVALID) {
           if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Invalid tracking preference type");
           state = toolAccess.parseState(Services.prefs.getStringPref(PREF_TOOL_ACCESS_STATE));
         }
-        if (corrupt || disabled.includes("__all__")) throw new Error("Invalid disabled tools preference");
+        if (corrupt || disabled.includes("__all__")) throw new Error(TOOL_ACCESS_ERROR);
         const next = toolAccess.considerTools(disabled, state, ALL_TOOL_NAMES);
         // No await between reading and committing. An interrupted migration may
         // repeat additions, but must never mark an unwritten denial considered.
         if (JSON.stringify(next.disabled) !== JSON.stringify(disabled)) {
-          Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(next.disabled));
+          const additions = next.disabled.filter(name => !disabled.includes(name));
+          let effective = disabled;
+          if (!locked) {
+            Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(next.disabled));
+            // Gecko can accept a user write while a locked default still wins.
+            // Verify effective reads even when prefIsLocked is unavailable/false.
+            const readBack = readAccessListPref(PREF_DISABLED_TOOLS);
+            if (readBack.corrupt || readBack.values.includes("__all__")) throw new Error(TOOL_ACCESS_ERROR);
+            effective = readBack.values;
+          }
+          if (!next.disabled.every(name => effective.includes(name))) {
+            return {
+              disabled: [...new Set([...effective, ...additions])], state, error: "",
+              note: `${TOOL_ACCESS_POLICY} New tools stay disabled until the settings can be saved.`,
+            };
+          }
+          next.disabled = effective;
         }
         if (JSON.stringify(next.state) !== JSON.stringify(state)) {
           Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(next.state));
         }
-        return { ...next, error: "" };
+        return { ...next, error: "", note: locked ? TOOL_ACCESS_POLICY : "" };
       } catch {
-        return { disabled, state, error: TOOL_ACCESS_ERROR };
+        return { disabled, state, error: TOOL_ACCESS_ERROR, note: locked ? TOOL_ACCESS_POLICY : "" };
       }
     }
 
@@ -3635,7 +3654,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       });
       const snapshot = JSON.stringify([
-        preferences, access.error, ALL_TOOL_NAMES,
+        preferences, access.error, access.note, ALL_TOOL_NAMES,
       ]);
       // Shared by getAPI contexts; a new token after reload cannot accept a page
       // from an older catalog. UUIDs are opaque revisions, not auth credentials.
@@ -3648,6 +3667,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     function writeDisabledTools(disabled) {
       if (disabled.length) Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabled));
       else Services.prefs.clearUserPref(PREF_DISABLED_TOOLS);
+      // Explicit repairs must also prove their staging denials (including
+      // __all__) are effective before replacing corrupt tracking information.
+      const effective = readAccessListPref(PREF_DISABLED_TOOLS);
+      if (effective.corrupt || !disabled.every(name => effective.values.includes(name))) {
+        throw new Error("Disabled tools preference did not accept the requested denials");
+      }
     }
 
     // Options can load before start(), or after a failed start(). Initialize in
@@ -14959,6 +14984,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (corrupt) {
             result.error = access.error;
           }
+          if (access.note) result.note = access.note;
           return result;
         },
 
@@ -14995,6 +15021,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (typeof revision !== "string" || revision !== getToolAccessRevision(access)) {
             return { error: "Tool Access changed. Reload the Options page before saving." };
           }
+          // A pending policy migration must not be bypassed by an Options save
+          // that would mark its temporary denials considered without storing them.
+          if (access.note) return { error: access.note };
           if (access.error && ALL_TOOL_NAMES.every(name => UNDISABLEABLE_TOOLS.has(name) || disabledTools.includes(name))) {
             return { error: access.error };
           }
