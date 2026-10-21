@@ -3,7 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { Buffer } = require("node:buffer");
-const path = require("node:path").posix;
+const { posix: path, win32: windowsPath } = require("node:path");
 const { loadFolderTools } = require("./helpers/folder-tools.cjs");
 
 const VIRTUAL_FLAG = 0x20;
@@ -24,6 +24,7 @@ const SUBFOLDER_SUFFIX = ".sbd";
 const SUMMARY_SUFFIX = ".msf";
 const MBOX_STORE = "mbox";
 const MAILDIR_STORE = "maildir";
+const WINDOWS_OS = "WINNT";
 const TOOLS = { CREATE: "createVirtualFolder", LIST: "listVirtualFolders", DELETE: "deleteVirtualFolder" };
 const EVENT = {
   FLAGS: "flags", SET_FLAG: "setFlag", ADD: "addSubfolder", NOTIFY: "notifyFolderAdded",
@@ -34,7 +35,7 @@ const EVENT = {
 
 // Native services only: production folder lookup, access control, terms,
 // schemas, handlers, dispatch and sanitization run in the folder-tools VM.
-function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
+function makeHarness({ denied = [], addressBooksRestricted = false, pathImpl = path } = {}) {
   const events = [];
   const mutations = [];
   const folders = [];
@@ -58,7 +59,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
   function diskEntry(filePath) {
     filePath = fileAliases.get(filePath) || filePath;
     if (disk.has(filePath)) return disk.get(filePath);
-    const prefix = filePath.endsWith("/") ? filePath : `${filePath}/`;
+    const prefix = filePath.endsWith(pathImpl.sep) ? filePath : `${filePath}${pathImpl.sep}`;
     return [...disk.keys()].some(entry => entry.startsWith(prefix))
       ? { directory: true } : undefined;
   }
@@ -68,7 +69,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
     return {
       get path() { return currentPath; },
       get parent() {
-        const parentPath = path.dirname(currentPath);
+        const parentPath = pathImpl.dirname(currentPath);
         return parentPath === currentPath ? null : file(parentPath);
       },
       get target() {
@@ -78,9 +79,9 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
       },
       get leafName() {
         if (fileFailures.get(currentPath)?.leafName) throw new Error("directory entry unreadable");
-        return path.basename(currentPath);
+        return pathImpl.basename(currentPath);
       },
-      set leafName(value) { currentPath = path.join(path.dirname(currentPath), value); },
+      set leafName(value) { currentPath = pathImpl.join(pathImpl.dirname(currentPath), value); },
       clone: () => file(currentPath),
       equals(other) {
         if (fileFailures.get(currentPath)?.equals) throw new Error("storage identity unreadable");
@@ -122,11 +123,11 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
           *[Symbol.iterator]() {
             if (fileFailures.get(currentPath)?.iterate) throw new Error("directory iteration failed");
             const children = new Set();
-            const prefix = currentPath.endsWith("/") ? currentPath : `${currentPath}/`;
+            const prefix = currentPath.endsWith(pathImpl.sep) ? currentPath : `${currentPath}${pathImpl.sep}`;
             for (const entry of disk.keys()) {
               if (!entry.startsWith(prefix)) continue;
-              const child = entry.slice(prefix.length).split("/")[0];
-              children.add(path.join(currentPath, child));
+              const child = entry.slice(prefix.length).split(pathImpl.sep)[0];
+              children.add(pathImpl.join(currentPath, child));
             }
             for (const child of children) {
               const entry = file(child);
@@ -150,8 +151,8 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
     const headers = [];
     const state = { flags };
     const storagePath = parent
-      ? path.join(parent.isServer ? parent.filePath.path : `${parent.filePath.path}${SUBFOLDER_SUFFIX}`, encodeURIComponent(name))
-      : `/fixture/${server.key}`;
+      ? pathImpl.join(parent.isServer ? parent.filePath.path : `${parent.filePath.path}${SUBFOLDER_SUFFIX}`, encodeURIComponent(name))
+      : pathImpl.join(pathImpl === windowsPath ? "C:\\fixture" : "/fixture", server.key);
     if (!parent) disk.set(storagePath, { directory: true });
     const result = {
       name, prettyName: name, parent, server,
@@ -299,6 +300,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
       return target.database;
     },
   });
+  if (pathImpl === windowsPath) runtime.Services.appinfo = { OS: WINDOWS_OS };
   function view(parent = root, name = VIEW_NAME, scopes = [source.URI]) {
     const target = folder(parent, name, VIRTUAL_FLAG);
     target.definition = { scope: scopes.join("|"), terms: Array.from(runtime.buildSearchTerms(CONDITIONS)), online: false };
@@ -577,7 +579,7 @@ describe("saved-search creation refuses filesystem aliases", () => {
   const ORIGINAL_DEFINITION = "original-definition";
   const ORIGINAL_STORAGE = "stored real mail";
 
-  for (const platform of [undefined, "Linux", "Darwin", "WINNT"]) {
+  for (const platform of [undefined, "Linux", "Darwin", WINDOWS_OS]) {
     it(`refuses tilde followed by a digit before allocation on ${platform || "unspecified OS"}`, async () => {
       for (const name of [SHORT_NAME, "prefix~0suffix", "~9first", "embedded~123alias"]) {
         const h = makeHarness();
@@ -904,6 +906,71 @@ describe("saved-search deletion proves backing storage is empty", () => {
   const STORED_MAIL = "From sender@example.invalid\nMessage-ID: <must-survive>\n\nStored mail\n";
   const MAILDIR_CUR = "cur";
   const MAILDIR_TMP = "tmp";
+  const SUMMARY_DEFINITION = "saved-search definition";
+
+  for (const [platform, pathImpl] of [["POSIX", path], ["Windows", windowsPath]]) {
+    for (const [shape, directory] of [["directory", true], ["file", false]]) {
+      for (const nativeThrows of [false, true]) {
+        it(`deletes an empty native mbox ${shape} once on ${platform}${nativeThrows ? ", even when native deletion throws" : ""}`, async () => {
+          const h = makeHarness({ pathImpl });
+          const target = h.view();
+          h.disk.set(target.filePath.path, { directory, size: 0 });
+          h.disk.set(target.summaryFile.path, { directory: false, content: SUMMARY_DEFINITION });
+          h.root.failures.delete = nativeThrows;
+          assert.match(target.filePath.path, pathImpl === windowsPath ? /^[A-Z]:\\/ : /^\//);
+          const result = await h.runtime.callTool(TOOLS.DELETE, { folderPath: target.URI });
+          if (nativeThrows) assertRefused(result, /native delete failed/);
+          else assert.equal(result.success, true, result.error);
+          assert.deepEqual(h.mutations, [[EVENT.DELETE, target.URI, true]]);
+          assert.ok(h.events.some(([event, uri]) => event === EVENT.ENUMERATE && uri === target.URI));
+          assert.ok(wasReleased(h, target));
+          if (directory) {
+            assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.path));
+          }
+        });
+      }
+    }
+
+    for (const [kind, arrange] of [
+      ["nonempty directory", (h, target) => h.disk.set(pathImpl.join(target.filePath.path, "message"), { directory: false, content: STORED_MAIL })],
+      ["directory containing an empty subdirectory", (h, target) => h.disk.set(pathImpl.join(target.filePath.path, MAILDIR_CUR), { directory: true })],
+      ["symlink directory", (h, target) => h.disk.set(target.filePath.path, { directory: true, symlink: true })],
+    ]) {
+      it(`refuses mbox backing that is a ${kind} on ${platform}`, () => {
+        const h = makeHarness({ pathImpl });
+        const target = h.view();
+        h.disk.set(target.filePath.path, { directory: true });
+        arrange(h, target);
+        const before = Array.from(h.disk.entries());
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        assert.deepEqual(Array.from(h.disk.entries()), before);
+        h.assertNoMutation();
+      });
+    }
+
+    for (const failure of ["directoryEntries", "iterate", "close"]) {
+      it(`refuses an unreadable mbox backing directory (${failure}) on ${platform}`, () => {
+        const h = makeHarness({ pathImpl });
+        const target = h.view();
+        h.disk.set(target.filePath.path, { directory: true });
+        h.fileFailures.set(target.filePath.path, { [failure]: true });
+        assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+        h.assertNoMutation();
+        if (failure !== "directoryEntries") {
+          assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === target.filePath.path));
+        }
+      });
+    }
+  }
+
+  it("refuses an empty Windows reparse backing directory even when isSymlink reports false", () => {
+    const h = makeHarness({ pathImpl: windowsPath });
+    const target = h.view();
+    h.disk.set(target.filePath.path, { directory: true, target: "D:\\redirected\\mail" });
+    assert.equal(target.filePath.isSymlink(), false);
+    assertRefused(h.runtime.deleteVirtualFolder(target.URI));
+    h.assertNoMutation();
+  });
 
   for (const kind of [MBOX_STORE, MAILDIR_STORE, "orphan child directory"]) {
     it(`preserves unindexed ${kind} mail despite a valid empty database and no registered children`, async () => {
@@ -956,7 +1023,7 @@ describe("saved-search deletion proves backing storage is empty", () => {
       h.disk.set(`${target.filePath.path}/${MAILDIR_TMP}`, { directory: true });
     }],
     ["empty orphan child directory", (h, target) => h.disk.set(`${target.filePath.path}${SUBFOLDER_SUFFIX}`, { directory: true })],
-    ["nonempty summary with absent backing", (h, target) => h.disk.set(target.summaryFile.path, { directory: false, content: "saved-search definition" })],
+    ["nonempty summary with absent backing", (h, target) => h.disk.set(target.summaryFile.path, { directory: false, content: SUMMARY_DEFINITION })],
   ]) {
     it(`allows view-only deletion with ${kind}, retaining the own-header check`, async () => {
       const h = makeHarness();
@@ -975,7 +1042,6 @@ describe("saved-search deletion proves backing storage is empty", () => {
     ["unreadable backing directory", (h, target) => h.disk.set(target.filePath.path, { directory: true, readable: false })],
     ["nonregular backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, regular: false })],
     ["unknown backing type", (h, target) => h.disk.set(target.filePath.path, {})],
-    ["directory backing for mbox", (h, target) => h.disk.set(target.filePath.path, { directory: true })],
     ["regular backing for maildir", (h, target) => h.disk.set(target.filePath.path, { directory: false })],
     ["symlink backing file", (h, target) => h.disk.set(target.filePath.path, { directory: false, symlink: true })],
     ["symlink backing directory", (h, target) => h.disk.set(target.filePath.path, { directory: true, symlink: true })],
@@ -1037,7 +1103,7 @@ describe("saved-search deletion proves backing storage is empty", () => {
   it("allows readable Windows storage whose resolved ancestor targets are unchanged", () => {
     const h = makeHarness();
     const target = h.view();
-    h.runtime.Services.appinfo = { OS: "WINNT" };
+    h.runtime.Services.appinfo = { OS: WINDOWS_OS };
     h.disk.set(target.filePath.path, { directory: false });
     const result = h.runtime.deleteVirtualFolder(target.URI);
     assert.equal(result.success, true, result.error);
@@ -1053,7 +1119,7 @@ describe("saved-search deletion proves backing storage is empty", () => {
     it(`refuses a Windows ${kind} even when isSymlink reports false`, () => {
       const h = makeHarness();
       const target = h.view();
-      h.runtime.Services.appinfo = { OS: "WINNT" };
+      h.runtime.Services.appinfo = { OS: WINDOWS_OS };
       h.disk.set(target.filePath.path, { directory: false });
       arrange(h, target);
       assert.equal(target.filePath.isSymlink(), false);

@@ -13043,7 +13043,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (backing) {
                 assertReadableSavedSearchStorage(backing);
                 if (storeType === SAVED_SEARCH_MBOX_STORE) {
-                  if (backing.isFile() !== true || backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  if (backing.isFile() === true) {
+                    if (backing.fileSize !== 0) throw new Error(SAVED_SEARCH_STORAGE_ERROR);
+                  } else {
+                    // nsMsgBrkMBoxStore::DiscoverSubFolders (TB 128/140/153/158)
+                    // creates an empty backing directory beside a saved search's
+                    // .msf. Accept that native placeholder only with no entries,
+                    // including no empty subdirectories.
+                    visitSavedSearchStorageDirectory(backing, refuseEntry);
+                  }
                 } else {
                   visitSavedSearchStorageDirectory(backing, entry => {
                     if (!SAVED_SEARCH_MAILDIR_DIRECTORIES.has(entry.leafName)) {
