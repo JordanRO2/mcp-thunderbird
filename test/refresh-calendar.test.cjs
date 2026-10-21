@@ -49,10 +49,18 @@ function makeCalendar({ id, name = id, type = "caldav", disabled = false, canRef
 function loadRefresh(calendars) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
-  const start = source.indexOf("const CAL_REFRESH_DEFAULT_TIMEOUT_MS");
-  const end = source.indexOf("// END refreshCalendar", start);
+  const start = source.indexOf("// BEGIN REFRESH CALENDAR TOOL");
+  const end = source.indexOf("// END REFRESH CALENDAR TOOL", start);
   assert.ok(start >= 0, "refreshCalendar start marker missing");
   assert.ok(end > start, "refreshCalendar end marker missing");
+  const sharedStart = source.indexOf("// BEGIN BOUNDED REFRESH HELPERS");
+  const sharedEnd = source.indexOf("// END BOUNDED REFRESH HELPERS", sharedStart);
+  assert.ok(sharedStart >= 0 && sharedEnd > sharedStart);
+  let shared = source.slice(sharedStart, sharedEnd);
+  const enabledStart = source.indexOf("// BEGIN ENABLED CALENDARS HELPER");
+  const enabledEnd = source.indexOf("// END ENABLED CALENDARS HELPER", enabledStart);
+  assert.ok(enabledStart >= 0 && enabledEnd > enabledStart);
+  shared += source.slice(enabledStart, enabledEnd);
   const sandbox = {
     Cc: makeCc(),
     Ci: { nsITimer: { TYPE_ONE_SHOT: 0 } },
@@ -61,7 +69,7 @@ function loadRefresh(calendars) {
     Promise, Date, Map, Number, Math, String, setTimeout, clearTimeout,
   };
   vm.createContext(sandbox);
-  vm.runInContext(source.slice(start, end) + "\nthis.refreshCalendar = refreshCalendar;", sandbox);
+  vm.runInContext(shared + source.slice(start, end) + "\nthis.refreshCalendar = refreshCalendar;", sandbox);
   return sandbox.refreshCalendar;
 }
 

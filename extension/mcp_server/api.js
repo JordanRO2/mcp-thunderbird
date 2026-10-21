@@ -1319,6 +1319,100 @@ const INTERNAL_KEYWORDS = new Set([
 ]);
 
 
+// BEGIN BOUNDED REFRESH HELPERS
+const REFRESH_DEFAULT_TIMEOUT_MS = 15000;
+const REFRESH_MIN_TIMEOUT_MS = 1000;
+const REFRESH_MAX_TIMEOUT_MS = 25000;
+const REFRESH_ABANDON_MS = 60000;
+const REFRESH_TIMEOUT_DESCRIPTION = `Maximum wait in ms (default ${REFRESH_DEFAULT_TIMEOUT_MS}); clamped to ${REFRESH_MIN_TIMEOUT_MS}-${REFRESH_MAX_TIMEOUT_MS}.`;
+
+function clampRefreshTimeout(timeoutMs) {
+  const n = Number(timeoutMs);
+  if (!Number.isFinite(n) || n <= 0) return REFRESH_DEFAULT_TIMEOUT_MS;
+  return Math.min(Math.max(Math.floor(n), REFRESH_MIN_TIMEOUT_MS), REFRESH_MAX_TIMEOUT_MS);
+}
+
+function refreshTimer(ms, callback) {
+  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+  timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+  return timer;
+}
+
+// The caller supplies its own wait budget; the operation has a separate age.
+// start observes before starting work, registers cleanup, and calls settle only
+// on a completion signal. A fulfilled start promise is not such a signal.
+// Returns { status, error?, warning?, joinedInFlight, ...providerOutcome };
+// it neither formats a tool result nor cancels Thunderbird's underlying work.
+async function waitForRefresh(inFlight, key, timeoutMs, start) {
+  const started = Date.now();
+  let entry = inFlight.get(key);
+  if (entry && started - entry.startedAt >= REFRESH_MAX_TIMEOUT_MS) {
+    entry.settle(entry.unconfirmed());
+    entry = null;
+  }
+  const joinedInFlight = !!entry;
+  if (!entry) {
+    let resolveCompletion;
+    let settled = false;
+    let lastError = null;
+    const cleanups = [];
+    entry = {
+      startedAt: started,
+      completion: new Promise(resolve => { resolveCompletion = resolve; }),
+      unconfirmed: () => lastError
+        ? { status: "error", error: lastError }
+        : { status: "timeout", error: "Refresh completion was not confirmed; Thunderbird may still be working." },
+      settle(outcome) {
+        if (settled) return;
+        settled = true;
+        for (const cleanup of cleanups) {
+          try { cleanup(); } catch { /* The other resources still need cleanup. */ }
+        }
+        cleanups.length = 0;
+        // A late callback must never remove a replacement for this operation.
+        if (inFlight.get(key) === entry) inFlight.delete(key);
+        if (lastError && outcome.status === "loaded") {
+          outcome = { ...outcome, warning: outcome.warning ? `${outcome.warning}; ${lastError}` : lastError };
+        }
+        resolveCompletion(outcome);
+      },
+    };
+    inFlight.set(key, entry);
+    const lifecycle = {
+      settle: entry.settle,
+      reportError(message) { if (!settled) lastError = message; },
+      addCleanup(cleanup) {
+        if (settled) {
+          try { cleanup(); } catch { /* Synchronous completion already won. */ }
+        } else {
+          cleanups.push(cleanup);
+        }
+      },
+    };
+    const fail = error => entry.settle({ status: "error", error: String(error?.message || error) });
+    try {
+      const abandonTimer = refreshTimer(REFRESH_ABANDON_MS, () => entry.settle(entry.unconfirmed()));
+      lifecycle.addCleanup(() => abandonTimer.cancel());
+      const pending = start(lifecycle);
+      if (pending && typeof pending.then === "function") Promise.resolve(pending).catch(fail);
+    } catch (error) {
+      fail(error);
+    }
+  }
+  let waitTimer;
+  try {
+    const timedOut = new Promise(resolve => {
+      // Account for synchronous provider work, which no timer can interrupt.
+      const remaining = Math.max(0, timeoutMs - (Date.now() - started));
+      waitTimer = refreshTimer(remaining, () => resolve(entry.unconfirmed()));
+    });
+    return { ...await Promise.race([entry.completion, timedOut]), joinedInFlight };
+  } finally {
+    waitTimer?.cancel();
+  }
+}
+// END BOUNDED REFRESH HELPERS
+
 // BEGIN FILTER SEARCH TERM HELPERS
 const PREF_ALLOW_FILTER_SEND_ACTIONS = "extensions.thunderbird-mcp.allowFilterSendActions";
 const FILTER_SEND_OPTION = '"Allow automatic Forward/Reply filter actions" in Thunderbird MCP Options';
@@ -2468,7 +2562,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             calendarId: { type: "string", description: "Calendar ID (from listCalendars). If omitted, refreshes all enabled calendars that support refresh." },
-            timeoutMs: { type: "integer", minimum: 1000, maximum: 25000, description: "Max ms to wait for the sync to complete (default 15000). Clamped to 1000-25000 to stay below the stdio bridge's HTTP request timeout (30000ms)." },
+            timeoutMs: { type: "integer", minimum: REFRESH_MIN_TIMEOUT_MS, maximum: REFRESH_MAX_TIMEOUT_MS, description: REFRESH_TIMEOUT_DESCRIPTION },
           },
           required: [],
         },
@@ -2859,7 +2953,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh, or an account root URI to refresh that account's Inbox and check-new folders. Saved-search and IMAP no-select folders are rejected." },
-            timeoutMs: { type: "integer", minimum: 1000, maximum: 25000, description: "Max ms to wait for the sync to complete (default 15000). Clamped to 1000-25000 to stay below the stdio bridge's HTTP request timeout (30000ms)." },
+            timeoutMs: { type: "integer", minimum: REFRESH_MIN_TIMEOUT_MS, maximum: REFRESH_MAX_TIMEOUT_MS, description: REFRESH_TIMEOUT_DESCRIPTION },
           },
           required: ["folderPath"],
         },
@@ -6369,156 +6463,78 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // refreshCalendar: the Synchronize button for calendars. Calls the
-            // calendar's own refresh() -- Thunderbird's generic sync entry
-            // point, used by its Synchronize command and refresh timer for
-            // every provider (Owl/Exchange, CalDAV, Google) -- and waits for the
-            // onLoad notification that ends the sync. For a cached calendar,
-            // onLoad fires only after the offline cache is re-synchronised, so
-            // listEvents sees the result as soon as this returns.
-            //
-            // As in Thunderbird, only enabled calendars with canRefresh are
-            // refreshed; local storage calendars have no server and are skipped.
-            //
-            // One sync per calendar at a time: a second call joins the running
-            // one. The timeout bounds the wait, not the work -- the slot stays
-            // taken until the sync really ends (or CAL_REFRESH_ABANDON_MS passes).
-            const CAL_REFRESH_DEFAULT_TIMEOUT_MS = 15000;
-            const CAL_REFRESH_MAX_TIMEOUT_MS = 25000;
-            const CAL_REFRESH_MIN_TIMEOUT_MS = 1000;
-            const CAL_REFRESH_ABANDON_MS = 300000;
-            const calendarRefreshInFlight = new Map(); // calendar id -> completion Promise
+            // BEGIN REFRESH CALENDAR TOOL
+            const calendarRefreshInFlight = new Map();
 
-            function clampCalendarRefreshTimeout(timeoutMs) {
-              const n = Number(timeoutMs);
-              if (!Number.isFinite(n) || n <= 0) return CAL_REFRESH_DEFAULT_TIMEOUT_MS;
-              return Math.min(Math.max(Math.floor(n), CAL_REFRESH_MIN_TIMEOUT_MS), CAL_REFRESH_MAX_TIMEOUT_MS);
-            }
-
-            function calendarRefreshTimer(ms, callback) {
-              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-              timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
-              return timer;
-            }
-
-            // Start a sync. Returns a Promise that settles with
-            // { status: "loaded" | "error" | "abandoned", error?, warning? }.
-            function startCalendarSync(calendar) {
-              const id = calendar.id;
-              const completion = new Promise(resolve => {
-                let settled = false;
-                let abandonTimer = null;
-                let observer = null;
-                // Providers can report non-fatal errors mid-sync and still
-                // finish with onLoad; keep the last one rather than stopping.
-                let lastError = null;
-                const settle = (outcome) => {
-                  if (settled) return;
-                  settled = true;
-                  if (abandonTimer) abandonTimer.cancel();
-                  if (observer) {
-                    try { calendar.removeObserver(observer); } catch {}
+            function startCalendarSync(calendar, { settle, reportError, addCleanup }) {
+              const isThisCalendar = c => !c || c.id === calendar.id;
+              const observer = {
+                QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
+                onStartBatch() {},
+                onEndBatch() {},
+                onLoad(aCalendar) {
+                  if (isThisCalendar(aCalendar)) settle({ status: "loaded" });
+                },
+                onAddItem() {},
+                onModifyItem() {},
+                onDeleteItem() {},
+                onError(aCalendar, errNo, message) {
+                  if (isThisCalendar(aCalendar)) {
+                    // Errors may be nonfatal. A later load preserves the last
+                    // error as a warning; no completion makes the wait an error.
+                    reportError(message || `calendar error 0x${(Number(errNo) >>> 0).toString(16)}`);
                   }
-                  if (lastError && outcome.status === "loaded") outcome.warning = lastError;
-                  if (lastError && !outcome.error && outcome.status !== "loaded") outcome.error = lastError;
-                  resolve(outcome);
-                };
-                const isThisCalendar = (c) => !c || c.id === id;
-                abandonTimer = calendarRefreshTimer(CAL_REFRESH_ABANDON_MS, () => settle({ status: "abandoned" }));
-                observer = {
-                  QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
-                  onStartBatch() {},
-                  onEndBatch() {},
-                  onLoad(aCalendar) {
-                    if (isThisCalendar(aCalendar)) settle({ status: "loaded" });
-                  },
-                  onAddItem() {},
-                  onModifyItem() {},
-                  onDeleteItem() {},
-                  onError(aCalendar, errNo, message) {
-                    if (isThisCalendar(aCalendar)) {
-                      lastError = message || `calendar error 0x${(Number(errNo) >>> 0).toString(16)}`;
-                    }
-                  },
-                  onPropertyChanged() {},
-                  onPropertyDeleting() {},
-                };
-                try {
-                  // Observe before starting: a fast sync can report onLoad
-                  // before refresh() returns.
-                  calendar.addObserver(observer);
-                  const pending = calendar.refresh();
-                  if (pending && typeof pending.then === "function") {
-                    pending.catch(e => settle({ status: "error", error: String((e && e.message) || e) }));
-                  }
-                } catch (e) {
-                  settle({ status: "error", error: String((e && e.message) || e) });
-                }
-              });
-              calendarRefreshInFlight.set(id, completion);
-              // completion never rejects (every path settles via resolve).
-              completion.then(() => calendarRefreshInFlight.delete(id)).catch(() => {});
-              return completion;
+                },
+                onPropertyChanged() {},
+                onPropertyDeleting() {},
+              };
+              addCleanup(() => calendar.removeObserver(observer));
+              // Cached providers can load synchronously inside refresh().
+              calendar.addObserver(observer);
+              return calendar.refresh();
             }
 
             async function syncOneCalendar(calendar, timeoutMs) {
-              const id = calendar.id;
               const started = Date.now();
-              const joinedInFlight = calendarRefreshInFlight.has(id);
-              const completion = joinedInFlight ? calendarRefreshInFlight.get(id) : startCalendarSync(calendar);
-              let waitTimer = null;
-              const timedOut = new Promise(resolve => {
-                waitTimer = calendarRefreshTimer(timeoutMs, () => resolve({
-                  status: "timeout",
-                  error: `refreshCalendar timed out after ${timeoutMs}ms; the sync keeps running in the background`,
-                }));
-              });
-              const outcome = await Promise.race([completion, timedOut]);
-              waitTimer.cancel();
+              const outcome = await waitForRefresh(calendarRefreshInFlight, calendar.id, timeoutMs,
+                lifecycle => startCalendarSync(calendar, lifecycle));
               const result = {
                 success: outcome.status === "loaded",
-                calendarId: id,
+                calendarId: calendar.id,
                 name: calendar.name,
                 type: calendar.type,
                 status: outcome.status,
                 elapsedMs: Date.now() - started,
               };
-              if (joinedInFlight) result.joinedInFlight = true;
+              if (outcome.joinedInFlight) result.joinedInFlight = true;
               if (outcome.error) result.error = outcome.error;
               if (outcome.warning) result.warning = outcome.warning;
               return result;
             }
 
             async function refreshCalendar(calendarId, timeoutMs) {
-              if (!cal) {
-                return { error: "Calendar not available" };
-              }
+              if (!cal) return { error: "Calendar not available" };
               try {
-                const timeout = clampCalendarRefreshTimeout(timeoutMs);
-                const calendars = cal.manager.getCalendars();
+                const timeout = clampRefreshTimeout(timeoutMs);
+                const calendars = getEnabledCalendars(calendarId);
                 if (calendarId) {
-                  const calendar = calendars.find(c => c.id === calendarId);
-                  if (!calendar) return { error: `Calendar not found: ${calendarId}` };
-                  if (calendar.getProperty("disabled")) {
-                    return { error: `Calendar "${calendar.name}" is disabled. Enable it in Thunderbird's calendar properties and retry.` };
-                  }
+                  const calendar = calendars[0];
                   if (!calendar.canRefresh) {
                     return { success: true, calendarId: calendar.id, name: calendar.name, type: calendar.type, skipped: "calendar has no server to sync" };
                   }
                   return await syncOneCalendar(calendar, timeout);
                 }
-                const targets = calendars.filter(c => !c.getProperty("disabled") && c.canRefresh);
-                if (targets.length === 0) {
-                  return { error: "No enabled calendars that support refresh" };
-                }
+                const targets = calendars.filter(c => c.canRefresh);
+                if (targets.length === 0) return { error: "No enabled calendars that support refresh" };
                 const results = await Promise.all(targets.map(c => syncOneCalendar(c, timeout)));
                 return { success: results.every(r => r.success), scope: "all", results };
               } catch (e) {
                 return { error: e.toString() };
               }
             }
-            // END refreshCalendar
+            // END REFRESH CALENDAR TOOL
 
+            // BEGIN ENABLED CALENDARS HELPER
             function getEnabledCalendars(calendarId) {
               const calendars = cal.manager.getCalendars();
               if (calendarId) {
@@ -6538,6 +6554,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return enabled;
             }
+
+            // END ENABLED CALENDARS HELPER
 
             // Calendar IDs are single cal-address values, unlike mail display
             // headers. Do not use extractAddressEmail or event-supplied identity hints.
@@ -11744,43 +11762,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // refreshFolder: sync one folder with its server and wait until
-            // Thunderbird reports the pass done.
-            //
-            // IMAP drives nsIMsgImapMailFolder.updateFolderWithListener -- the
-            // targeted, waitable per-folder update. (folder.getNewMessages is
-            // the account-level Get Mail path: it updates the Inbox, so for any
-            // other folder the listener waits on the wrong work.)
-            //
-            // Add-on account types that implement their own folders (Owl for
-            // Exchange/Office 365, and similar) sync in folder.updateFolder --
-            // the call Thunderbird makes when you click a folder -- and signal
-            // the end with the folder's "FolderLoaded" event, which is what we
-            // wait for. Local-store types have no server to sync and are skipped.
-            //
-            // An account root refreshes the Inbox plus any folder opted into
-            // new-mail checks, as the Get Messages button does.
-            //
-            // One sync per folder at a time: a second call joins the running
-            // one. The timeout bounds the wait, not the work -- the slot stays
-            // taken until the sync really ends (or REFRESH_ABANDON_MS passes),
-            // so repeated calls on a slow server don't stack syncs.
-            const REFRESH_DEFAULT_TIMEOUT_MS = 15000;
-            // Kept under the stdio bridge's 30000ms request timeout (5s safety
-            // margin) so a structured timeout result is returned rather than
-            // the bridge hard-failing.
-            const REFRESH_MAX_TIMEOUT_MS = 25000;
-            const REFRESH_MIN_TIMEOUT_MS = 1000;
-            const REFRESH_ABANDON_MS = 300000;
-            const refreshInFlight = new Map(); // folder URI -> completion Promise
-            // Built-in types whose folders have no server-side copy to sync.
+            // BEGIN REFRESH FOLDER TOOL
+            const refreshInFlight = new Map();
             const REFRESH_LOCAL_SERVER_TYPES = new Set(["none", "pop3", "rss", "nntp"]);
-
-            function clampRefreshTimeout(timeoutMs) {
-              const n = Number(timeoutMs);
-              if (!Number.isFinite(n) || n <= 0) return REFRESH_DEFAULT_TIMEOUT_MS;
-              return Math.min(Math.max(Math.floor(n), REFRESH_MIN_TIMEOUT_MS), REFRESH_MAX_TIMEOUT_MS);
-            }
 
             function refreshFolderCounts(folder) {
               try {
@@ -11790,82 +11774,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function oneShotTimer(ms, callback) {
-              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-              timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
-              return timer;
+            function startFolderSync(folder, { settle, addCleanup }) {
+              if (folder.server.type === "imap") {
+                folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
+                  QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                  OnStartRunningUrl() {},
+                  OnStopRunningUrl(url, exitCode) {
+                    settle(Components.isSuccessCode(exitCode)
+                      ? { status: "loaded" }
+                      : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
+                  },
+                });
+              } else {
+                const listener = {
+                  QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                  onFolderEvent(eventFolder, event) {
+                    if (event === "FolderLoaded" && eventFolder?.URI === folder.URI) settle({ status: "loaded" });
+                  },
+                };
+                addCleanup(() => MailServices.mailSession.RemoveFolderListener(listener));
+                MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
+                folder.updateFolder(null);
+              }
             }
 
-            // Start a sync. Returns a Promise that settles with
-            // { status: "loaded" | "error" | "abandoned", error? } when it ends.
-            function startFolderSync(folder) {
-              const uri = folder.URI;
-              const completion = new Promise(resolve => {
-                let settled = false;
-                let abandonTimer = null;
-                let folderListener = null;
-                const settle = (outcome) => {
-                  if (settled) return;
-                  settled = true;
-                  if (abandonTimer) abandonTimer.cancel();
-                  if (folderListener) {
-                    try { MailServices.mailSession.RemoveFolderListener(folderListener); } catch {}
-                  }
-                  resolve(outcome);
-                };
-                abandonTimer = oneShotTimer(REFRESH_ABANDON_MS, () => settle({ status: "abandoned" }));
-                try {
-                  if (folder.server.type === "imap") {
-                    folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
-                      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                      OnStartRunningUrl() {},
-                      OnStopRunningUrl(url, exitCode) {
-                        // >>> 0 coerces the (negative, signed 32-bit) nsresult to
-                        // its unsigned form so the hex reads e.g. 0x80004005.
-                        settle(Components.isSuccessCode(exitCode)
-                          ? { status: "loaded" }
-                          : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
-                      },
-                    });
-                  } else {
-                    folderListener = {
-                      QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
-                      onFolderEvent(eventFolder, event) {
-                        if (event === "FolderLoaded" && eventFolder && eventFolder.URI === uri) {
-                          settle({ status: "loaded" });
-                        }
-                      },
-                    };
-                    // Listen before starting: a fast or cached update can
-                    // report FolderLoaded before updateFolder returns.
-                    MailServices.mailSession.AddFolderListener(folderListener, Ci.nsIFolderListener.event);
-                    folder.updateFolder(null);
-                  }
-                } catch (e) {
-                  settle({ status: "error", error: String((e && e.message) || e) });
-                }
-              });
-              refreshInFlight.set(uri, completion);
-              // completion never rejects (every path settles via resolve).
-              completion.then(() => refreshInFlight.delete(uri)).catch(() => {});
-              return completion;
+            // Internal adapter: callers choose their wait budget and receive an
+            // outcome without tool metadata or message-count reads.
+            function waitForFolderRefresh(folder, timeoutMs) {
+              return waitForRefresh(refreshInFlight, folder.URI, timeoutMs,
+                lifecycle => startFolderSync(folder, lifecycle));
             }
 
             async function syncOneFolder(folder, timeoutMs) {
               const uri = folder.URI;
               const started = Date.now();
               const before = refreshFolderCounts(folder);
-              const joinedInFlight = refreshInFlight.has(uri);
-              const completion = joinedInFlight ? refreshInFlight.get(uri) : startFolderSync(folder);
-              let waitTimer = null;
-              const timedOut = new Promise(resolve => {
-                waitTimer = oneShotTimer(timeoutMs, () => resolve({
-                  status: "timeout",
-                  error: `refreshFolder timed out after ${timeoutMs}ms; the sync keeps running in the background`,
-                }));
-              });
-              const outcome = await Promise.race([completion, timedOut]);
-              waitTimer.cancel();
+              const outcome = await waitForFolderRefresh(folder, timeoutMs);
               const after = refreshFolderCounts(folder);
               const result = {
                 success: outcome.status === "loaded",
@@ -11880,7 +11824,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // move can cancel out new mail.
                 netMessageDelta: (before.total !== null && after.total !== null) ? after.total - before.total : null,
               };
-              if (joinedInFlight) result.joinedInFlight = true;
+              if (outcome.joinedInFlight) result.joinedInFlight = true;
               if (outcome.error) result.error = outcome.error;
               return result;
             }
@@ -11921,6 +11865,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: e.toString() };
               }
             }
+
+            // END REFRESH FOLDER TOOL
 
             // BEGIN FILTER TOOL HANDLERS
             function getFilterListForAccount(accountId) {

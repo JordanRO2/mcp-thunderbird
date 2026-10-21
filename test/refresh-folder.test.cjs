@@ -42,10 +42,14 @@ function makeMailSession() {
 function loadRefresh({ folders, mailSession = makeMailSession() }) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
-  const start = source.indexOf("const REFRESH_DEFAULT_TIMEOUT_MS");
-  const end = source.indexOf("// BEGIN FILTER TOOL HANDLERS", start);
+  const start = source.indexOf("// BEGIN REFRESH FOLDER TOOL");
+  const end = source.indexOf("// END REFRESH FOLDER TOOL", start);
   assert.ok(start >= 0, "refreshFolder start marker missing");
   assert.ok(end > start, "refreshFolder end marker missing");
+  const sharedStart = source.indexOf("// BEGIN BOUNDED REFRESH HELPERS");
+  const sharedEnd = source.indexOf("// END BOUNDED REFRESH HELPERS", sharedStart);
+  assert.ok(sharedStart >= 0 && sharedEnd > sharedStart);
+  let shared = source.slice(sharedStart, sharedEnd);
   const sandbox = {
     Cc: makeCc(),
     Ci: {
@@ -60,7 +64,8 @@ function loadRefresh({ folders, mailSession = makeMailSession() }) {
     getAccessibleFolder: (uri) => folders[uri] ? { folder: folders[uri] } : { error: `Folder not found: ${uri}` },
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${source.slice(start, end)}
+  vm.runInContext(`${shared}
+${source.slice(start, end)}
 this.refreshFolder = refreshFolder;
 this.clampRefreshTimeout = clampRefreshTimeout;`, sandbox);
   return sandbox;
@@ -136,7 +141,7 @@ describe("refreshFolder", () => {
     const first = await refreshFolder(f.URI, 1000);
     assert.equal(first.success, false);
     assert.equal(first.status, "timeout");
-    assert.match(first.error, /background/);
+    assert.match(first.error, /not confirmed/);
 
     const secondP = refreshFolder(f.URI, 5000);
     setTimeout(() => { f.complete(); f.pendingListener.OnStopRunningUrl(null, 0); }, 20);
