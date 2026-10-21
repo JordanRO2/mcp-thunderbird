@@ -68,7 +68,7 @@ class FakeVCardProperties {
 
   getAllEntriesSorted(name) {
     // Native VCardProperties uses the parameter as-is, not parseInt. This is
-    // independent of production sortContactEmailEntries, which is under test.
+    // the same ordering that AddrBookCard's primaryEmail getter uses.
     let nextPref = 101;
     return this.getAllEntries(name)
       .map(entry => ({ entry, pref: entry.params.pref || nextPref++ }))

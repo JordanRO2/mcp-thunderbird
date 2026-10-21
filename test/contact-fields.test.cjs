@@ -3,7 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  loadContactRuntime, FakeVCardPropertyEntry, FakeVCardProperties, FakeFlatCard,
+  loadContactRuntime, FakeVCardPropertyEntry, FakeVCardProperties, FakeFlatCard, FakeAddrBookCard,
 } = require("./helpers/contact-runtime.cjs");
 
 const helpers = loadContactRuntime();
@@ -538,6 +538,87 @@ describe("contact email addresses", () => {
       { type: "home", address: "home@example.com" },
     ]);
   });
+
+  for (const pref of ["0", "2junk", "invalid"]) {
+    it(`uses native ordering even for PREF=${pref}`, () => {
+      const first = new FakeVCardPropertyEntry("email", { pref }, "text", "native-first@example.com");
+      const second = new FakeVCardPropertyEntry("email", { pref: "1" }, "text", "second@example.com");
+      const card = new FakeAddrBookCard({}, new FakeVCardProperties([first, second]));
+      const details = helpers.readContactFields(card);
+      assert.equal(details.email, "native-first@example.com");
+      assert.deepEqual(plain(details.emails), [
+        { address: "native-first@example.com" }, { address: "second@example.com" },
+      ]);
+    });
+  }
+
+  for (const primary of ["", " primary@example.com "]) {
+    it(`preserves the native primary ${JSON.stringify(primary)} when formatting trims or omits it`, () => {
+      const first = new FakeVCardPropertyEntry("email", { pref: "1" }, "text", primary);
+      const second = new FakeVCardPropertyEntry("email", {}, "text", "second@example.com");
+      const card = new FakeAddrBookCard({}, new FakeVCardProperties([first, second]));
+      const details = helpers.readContactFields(card);
+      assert.equal(details.email, primary);
+      assert.deepEqual(plain(details.emails), [
+        ...(primary ? [{ address: primary.trim() }] : []), { address: "second@example.com" },
+      ]);
+      assert.equal(card.primaryEmail, primary);
+      assert.deepEqual(card.vCardProperties.getAllEntries("email"), [first, second]);
+      assert.equal(first.value, primary);
+      assert.deepEqual(first.params, { pref: "1" });
+    });
+  }
+
+  for (const requestedType of [undefined, "home"]) {
+    it(`keeps the address's group when its type becomes ${requestedType || "untyped"}`, () => {
+      const work = new FakeVCardPropertyEntry("email", { type: ["WORK", "internet"], group: "work-label" }, "text", "Ada@Work.Example");
+      const other = new FakeVCardPropertyEntry("email", { group: "other-label" }, "text", "other@example.com");
+      const label = new FakeVCardPropertyEntry("x-ablabel", { group: "work-label" }, "text", "Research");
+      const properties = new FakeVCardProperties([other, work, label]);
+      const params = work.params;
+      helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+        emails: [{ address: " ada@work.example ", ...(requestedType ? { type: requestedType } : {}) }],
+      }, FakeVCardPropertyEntry);
+      assert.deepEqual(properties.getAllEntries("email"), [work]);
+      assert.strictEqual(work.params, params);
+      assert.equal(work.value, "ada@work.example");
+      assert.deepEqual(plain(work.params), {
+        type: requestedType ? ["internet", requestedType] : "internet", group: "work-label", pref: "1",
+      });
+      assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
+    });
+  }
+
+  it("reserves all address matches before reusing a type bucket for a new address", () => {
+    const retained = new FakeVCardPropertyEntry("email", { type: "work", group: "retained-label" }, "text", "kept@example.com");
+    const replaced = new FakeVCardPropertyEntry("email", { type: "work", group: "replaced-label" }, "text", "old@example.com");
+    const properties = new FakeVCardProperties([retained, replaced]);
+    helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+      emails: [{ type: "work", address: "new@example.com" }, { address: "KEPT@example.com" }],
+    }, FakeVCardPropertyEntry);
+    assert.deepEqual(properties.getAllEntries("email"), [replaced, retained]);
+    assert.equal(replaced.value, "new@example.com");
+    assert.equal(replaced.params.group, "replaced-label");
+    assert.equal(retained.value, "KEPT@example.com");
+    assert.equal(retained.params.group, "retained-label");
+    assert.equal(retained.params.type, undefined);
+  });
+
+  for (const type of ["PREF", ["WORK", "pReF", "internet"]]) {
+    it(`removes legacy TYPE=PREF from a demoted address with TYPE=${JSON.stringify(type)}`, () => {
+      const oldPrimary = new FakeVCardPropertyEntry("email", { type, pref: "1", group: "item1" }, "text", "old@example.com");
+      const newPrimary = new FakeVCardPropertyEntry("email", {}, "text", "new@example.com");
+      const properties = new FakeVCardProperties([oldPrimary, newPrimary]);
+      helpers.applyContactFields({ supportsVCard: true, vCardProperties: properties }, {
+        emails: [{ address: "new@example.com" }, { type: "home", address: "old@example.com" }],
+      }, FakeVCardPropertyEntry);
+      assert.deepEqual(properties.getAllEntries("email"), [newPrimary, oldPrimary]);
+      assert.equal(newPrimary.params.pref, "1");
+      assert.deepEqual(plain(oldPrimary.params), {
+        type: Array.isArray(type) ? ["internet", "home"] : "home", group: "item1",
+      });
+    });
+  }
 
   it("replaces the vCard collection and makes the first address the only preferred one", () => {
     const oldPrimary = new FakeVCardPropertyEntry("email", { type: "work", pref: "1" }, "text", "old@example.com");

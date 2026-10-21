@@ -231,6 +231,70 @@ describe("contact production module imports", () => {
 });
 
 describe("contact get/update/delete handler wiring", () => {
+  for (const [name, dirType] of [
+    ["vCard", DIRECTORY_TYPES.JS_DIRECTORY_TYPE], ["flat", DIRECTORY_TYPES.LDAP_DIRECTORY_TYPE],
+  ]) {
+    it(`rejects control characters before constructing or modifying ${name} cards`, () => {
+      const book = new FakeAddressBook({ dirType });
+      const runtime = loadContactRuntime({ books: [book] });
+      const created = runtime.create({ displayName: "Unchanged", emails: emails.slice(0, 2) });
+      const before = structuredClone(runtime.getContact(created.id));
+      // C0, DEL and C1 are forbidden, including whitespace that trim() would remove.
+      for (const control of ["\0", "\t", "\n", "\r", "\x1f", "\x7f", "\x85", "\x9f"]) {
+        for (const fields of [
+          { email: `ada${control}@example.com` },
+          { emails: [{ address: `ada@example.com${control}` }] },
+        ]) {
+          assert.match(runtime.create(fields).error, /must not contain control characters/);
+          assert.match(runtime.update(created.id, { displayName: "Must not change", ...fields }).error, /must not contain control characters/);
+          assert.deepEqual(structuredClone(runtime.getContact(created.id)), before);
+        }
+      }
+      assert.equal(runtime.calls.vCardCards.length + runtime.calls.flatCards.length, 1);
+      assert.equal(book.calls.add.length, 1);
+      assert.deepEqual(book.calls.modify, []);
+    });
+
+    it(`accepts non-ASCII and quoted punctuation in ${name} addresses`, () => {
+      const runtime = loadContactRuntime({ books: [new FakeAddressBook({ dirType })] });
+      const address = '"é;x:y"@例え.example';
+      const created = runtime.create({ email: address, emails: [{ address }] });
+      assert.equal(created.success, true, created.error);
+      assert.equal(runtime.getContact(created.id).email, address);
+    });
+
+    it(`documents scalar empty-email clearing through the ${name} handler`, () => {
+      const book = new FakeAddressBook({ dirType });
+      const runtime = loadContactRuntime({ books: [book] });
+      const created = runtime.create({ emails: emails.slice(0, 2) });
+      assert.equal(runtime.update(created.id, { email: "" }).success, true);
+      book.reloadCard(created.id);
+      const read = runtime.getContact(created.id);
+      assert.equal(read.email, "");
+      assert.deepEqual(structuredClone(read.emails), name === "vCard" ? [] : [{ address: emails[1].address }]);
+      assert.equal(runtime.update(created.id, { emails: [] }).success, true);
+      book.reloadCard(created.id);
+      assert.deepEqual(structuredClone(runtime.getContact(created.id).emails), []);
+    });
+  }
+
+  it("reads duplicates without deduplication and refuses their write-back before mutation", () => {
+    const card = new FakeAddrBookCard({ UID: "duplicates" }, new FakeVCardProperties([
+      new FakeVCardPropertyEntry("fn", {}, "text", "Unchanged"),
+      new FakeVCardPropertyEntry("email", { pref: "1", type: "work" }, "text", "same@example.com"),
+      new FakeVCardPropertyEntry("email", { type: "home" }, "text", "SAME@example.com"),
+    ]));
+    const book = new FakeAddressBook({ cards: [card] });
+    const runtime = loadContactRuntime({ books: [book] });
+    const before = structuredClone(runtime.getContact(card.UID));
+    assert.deepEqual(before.emails, [
+      { type: "work", address: "same@example.com" }, { type: "home", address: "SAME@example.com" },
+    ]);
+    assert.match(runtime.update(card.UID, { displayName: "Must not change", emails: before.emails }).error, /repeats an earlier address/);
+    assert.deepEqual(structuredClone(runtime.getContact(card.UID)), before);
+    assert.deepEqual(book.calls.modify, []);
+  });
+
   it("finds a UID across books, skips mailing lists, and preserves native entries and metadata on update", () => {
     const primary = new FakeVCardPropertyEntry("email", { type: ["WORK", "internet"], pref: "1", group: "item1" }, "text", "first@example.com");
     const second = new FakeVCardPropertyEntry("email", { type: "home", pref: "2" }, "text", "second@example.com");

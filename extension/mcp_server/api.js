@@ -245,6 +245,7 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
 const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_EMAIL_TYPES = ["work", "home"];
+const CONTACT_EMAIL_CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f]/;
 const CONTACT_CACHED_FIELDS = {
   displayName: "DisplayName",
   firstName: "FirstName",
@@ -340,19 +341,6 @@ function getContactAddressType(entry) {
 // untyped instead of defaulting to "work".
 function getContactEmailType(entry) {
   return getContactVCardTypes(entry).find(type => CONTACT_EMAIL_TYPES.includes(type)) || "";
-}
-
-/**
- * EMAIL entries in Thunderbird's order of preference: PREF first (1 is the
- * primary address), then the position of the entries, as in
- * VCardProperties.getAllEntriesSorted(), which AddrBookCard.primaryEmail uses.
- */
-function sortContactEmailEntries(entries) {
-  let nextPref = 101;
-  return entries
-    .map(entry => ({ entry, pref: parseInt(entry.params?.pref, 10) || nextPref++ }))
-    .sort((a, b) => a.pref - b.pref)
-    .map(item => item.entry);
 }
 
 /**
@@ -468,7 +456,7 @@ function getContactCardProperty(card, name) {
 
 function readVCardContactFields(card) {
   const vCardProperties = card.vCardProperties;
-  const emails = sortContactEmailEntries(vCardProperties.getAllEntries("email"))
+  const emails = vCardProperties.getAllEntriesSorted("email")
     .map(entry => {
       const address = contactValueToString(entry.value).trim();
       const type = getContactEmailType(entry);
@@ -618,6 +606,10 @@ function validateContactFields(fields, requireContent = false) {
     }
   }
 
+  if (fields.email !== undefined && CONTACT_EMAIL_CONTROL_CHARACTERS.test(fields.email)) {
+    return "email must not contain control characters";
+  }
+
   if (fields.emails !== undefined) {
     if (!Array.isArray(fields.emails)) return "emails must be an array";
     const seenAddresses = new Set();
@@ -633,6 +625,9 @@ function validateContactFields(fields, requireContent = false) {
       }
       if (typeof email.address !== "string" || !email.address.trim()) {
         return `emails[${i}].address must be a non-empty string`;
+      }
+      if (CONTACT_EMAIL_CONTROL_CHARACTERS.test(email.address)) {
+        return `emails[${i}].address must not contain control characters`;
       }
       const key = email.address.trim().toLowerCase();
       if (seenAddresses.has(key)) return `emails[${i}].address repeats an earlier address`;
@@ -730,19 +725,20 @@ function reconcileVCardContactEntries(vCardProperties, name, items, config) {
   const matchedEntries = new Array(items.length).fill(null);
   const retainedEntries = new Set();
 
-  // Prefer an exact normalized type/value match. Besides avoiding unnecessary
-  // writes, this keeps URI-backed TEL values and structured ADR values exactly
-  // as Thunderbird parsed them.
+  // Emails identify entries by address even if their requested type changed.
+  // Other collections prefer exact type/value matches, keeping URI-backed TEL
+  // and structured ADR values exactly as Thunderbird parsed them.
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const entry = existingEntries.find(candidate =>
       !retainedEntries.has(candidate) &&
-      config.getEntryType(candidate) === config.getItemType(item) &&
+      (config.matchByValue || config.getEntryType(candidate) === config.getItemType(item)) &&
       config.getEntryValue(candidate) === config.getItemValue(item)
     );
     if (entry) {
       matchedEntries[i] = entry;
       retainedEntries.add(entry);
+      if (config.matchByValue) config.updateEntry(entry, item);
     }
   }
 
@@ -838,10 +834,11 @@ function applyVCardContactFields(card, fields, VCardPropertyEntry) {
 
   if (fields.emails !== undefined) {
     const entries = reconcileVCardContactEntries(vCardProperties, "email", fields.emails, {
+      matchByValue: true,
       getEntryType: getContactEmailType,
       getItemType: email => email.type || "",
-      getEntryValue: entry => contactValueToString(entry.value).trim(),
-      getItemValue: email => email.address.trim(),
+      getEntryValue: entry => contactValueToString(entry.value).trim().toLowerCase(),
+      getItemValue: email => email.address.trim().toLowerCase(),
       updateEntry: (entry, email) => {
         entry.value = email.address.trim();
       },
@@ -858,6 +855,23 @@ function applyVCardContactFields(card, fields, VCardPropertyEntry) {
     entries.forEach((entry, index) => {
       if (index === 0) entry.params.pref = "1";
       else delete entry.params.pref;
+      const previousTypes = Array.isArray(entry.params.type)
+        ? entry.params.type : entry.params.type ? [entry.params.type] : [];
+      const requestedType = fields.emails[index].type;
+      const types = previousTypes.filter(type => {
+        const normalized = typeof type === "string" ? type.toLowerCase() : "";
+        return (!CONTACT_EMAIL_TYPES.includes(normalized) || normalized === requestedType) &&
+          (index === 0 || normalized !== "pref");
+      });
+      if (requestedType && !types.some(type => typeof type === "string" && type.toLowerCase() === requestedType)) {
+        types.push(requestedType);
+      }
+      // Preserve unrelated TYPE values, groups and the original parameter
+      // object; only change work/home and non-primary vCard-3 TYPE=PREF.
+      if (types.length !== previousTypes.length || types.some((type, i) => type !== previousTypes[i])) {
+        if (types.length) entry.params.type = types.length === 1 ? types[0] : types;
+        else delete entry.params.type;
+      }
       vCardProperties.addEntry(entry);
     });
   }
