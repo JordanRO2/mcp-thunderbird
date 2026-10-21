@@ -74,8 +74,10 @@ function loadFolderTools({
   });
   vm.runInContext([
     snippet("// BEGIN FILTER SEARCH TERM HELPERS", "// END FILTER SEARCH TERM HELPERS"),
-    snippet("const CONTACT_PHONE_TYPES =", "const CONTACT_ADDRESS_FIELDS ="),
+    snippet("// BEGIN CONTACT FIELD CONSTANTS", "// END CONTACT FIELD CONSTANTS"),
     snippet("// BEGIN OUTBOUND ATTACHMENT LIMITS", "// END OUTBOUND ATTACHMENT LIMITS"),
+    snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
+    snippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
     snippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER"),
     snippet("function isFolderAccessible(", "function toColumnarTable("),
     snippet("function toColumnarTable(", "function listFolders("),
