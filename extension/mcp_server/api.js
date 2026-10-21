@@ -2851,6 +2851,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "createVirtualFolder",
+        group: "folders", crud: "create",
+        title: "Create Saved Search",
+        description: "Create a virtual folder (saved search) that shows messages matching search conditions across one or more folders. Nothing is moved or copied -- the saved search is a live view, so it always reflects the current mail. Use this instead of moving mail when the goal is retrieval rather than filing.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Name for the saved search" },
+            parentFolderPath: { type: "string", description: "URI of the folder to create it under (from listFolders) -- typically an account root" },
+            searchFolderPaths: { type: "array", items: { type: "string" }, description: "Folder URIs to search across (from listFolders)" },
+            conditions: {
+              type: "array",
+              minItems: 1,
+              description: "Search conditions. Same attrib/op/value vocabulary as createFilter.",
+              items: {
+                type: "object",
+                properties: {
+                  attrib: { type: "string", description: FILTER_ATTRIB_DESCRIPTION },
+                  op: { type: "string", description: FILTER_OP_DESCRIPTION },
+                  value: { type: "string", description: FILTER_VALUE_DESCRIPTION },
+                  booleanAnd: { type: "boolean", description: "true=AND with the other terms, false=OR (default: true). Thunderbird applies one boolean to the whole saved search." },
+                  header: { type: "string", description: FILTER_HEADER_DESCRIPTION },
+                },
+                required: ["attrib", "op"],
+                additionalProperties: false,
+              },
+            },
+            searchOnline: { type: "boolean", description: "Search on the server rather than locally (IMAP only, slower). Default false." },
+          },
+          required: ["name", "parentFolderPath", "searchFolderPaths", "conditions"],
+        },
+      },
+      {
+        name: "listVirtualFolders",
+        group: "folders", crud: "read",
+        title: "List Saved Searches",
+        description: "List virtual folders (saved searches) with the folders they search and their conditions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to one account" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "deleteVirtualFolder",
+        group: "folders", crud: "delete",
+        title: "Delete Saved Search",
+        description: "Delete a virtual folder (saved search). Only the view is removed -- no messages are deleted. Refuses to act on real folders; use deleteFolder for those.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the saved search to delete (from listVirtualFolders)" },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
         name: "renameFolder",
         group: "folders", crud: "update",
         title: "Rename Folder",
@@ -11339,6 +11398,147 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN VIRTUAL FOLDER (SAVED SEARCH) HELPERS
+            function getVirtualFolderHelper() {
+              return ChromeUtils.importESModule(
+                "resource:///modules/VirtualFolderWrapper.sys.mjs"
+              ).VirtualFolderHelper;
+            }
+
+            // Build nsIMsgSearchTerm objects outside of a filter. A saved search has
+            // no nsIMsgFilter to mint terms from, so a throwaway search session
+            // stands in: it exposes the same createTerm/appendTerm pair, which lets
+            // buildTerms apply its allow-lists, header handling and typed search
+            // values unchanged.
+            function buildSearchTerms(conditions) {
+              const session = Cc["@mozilla.org/messenger/searchSession;1"]
+                .createInstance(Ci.nsIMsgSearchSession);
+              buildTerms(session, conditions);
+              return session.searchTerms;
+            }
+
+            function createVirtualFolder(name, parentFolderPath, searchFolderPaths, conditions, searchOnline) {
+              try {
+                if (typeof name !== "string" || !name) {
+                  return { error: "name must be a non-empty string" };
+                }
+                if (typeof parentFolderPath !== "string" || !parentFolderPath) {
+                  return { error: "parentFolderPath must be a non-empty string" };
+                }
+                if (!Array.isArray(searchFolderPaths) || searchFolderPaths.length === 0) {
+                  return { error: "searchFolderPaths must be a non-empty array of folder URIs" };
+                }
+                if (!Array.isArray(conditions) || conditions.length === 0) {
+                  return { error: "conditions must be a non-empty array" };
+                }
+
+                const parentResult = getAccessibleFolder(parentFolderPath);
+                if (parentResult.error) return parentResult;
+
+                // Every searched folder goes through the same access check as the
+                // parent -- otherwise a saved search would be a way to read mail
+                // from an account the user excluded in settings.
+                const searchFolders = [];
+                for (const p of searchFolderPaths) {
+                  const r = getAccessibleFolder(p);
+                  if (r.error) return { error: `searchFolderPaths: ${p}: ${r.error}` };
+                  searchFolders.push(r.folder);
+                }
+
+                const terms = buildSearchTerms(conditions);
+                const wrapper = getVirtualFolderHelper().createNewVirtualFolder(
+                  name,
+                  parentResult.folder,
+                  searchFolders,
+                  terms,
+                  searchOnline === true
+                );
+
+                let newPath = null;
+                try {
+                  if (wrapper && wrapper.virtualFolder) newPath = wrapper.virtualFolder.URI;
+                } catch { /* wrapper shape varies across versions */ }
+
+                return {
+                  success: true,
+                  message: `Saved search "${name}" created`,
+                  path: newPath,
+                  searchFolders: searchFolders.map((f) => f.URI),
+                };
+              } catch (e) {
+                const msg = e.toString();
+                if (msg.includes("NS_MSG_FOLDER_EXISTS")) {
+                  return { error: `A folder named "${name}" already exists under this parent` };
+                }
+                return { error: msg };
+              }
+            }
+
+            function listVirtualFolders(accountId) {
+              try {
+                const helper = getVirtualFolderHelper();
+                const out = [];
+                for (const folder of MailServices.accounts.allFolders) {
+                  if (!(folder.flags & Ci.nsMsgFolderFlags.Virtual)) continue;
+                  if (getAccessibleFolder(folder.URI).error) continue;
+                  const serverKey = folder.server ? folder.server.key : null;
+                  if (accountId && serverKey !== accountId) continue;
+
+                  let searchFolders = [];
+                  let terms = [];
+                  let onlineSearch = false;
+                  try {
+                    const w = helper.wrapVirtualFolder(folder);
+                    searchFolders = (w.searchFolders || []).map((f) => f.URI);
+                    onlineSearch = !!w.onlineSearch;
+                    terms = (w.searchTerms || []).map(serializeSearchTerm);
+                  } catch { /* unreadable wrapper -- still report the folder */ }
+
+                  out.push({
+                    name: folder.prettyName || folder.name,
+                    path: folder.URI,
+                    accountId: serverKey,
+                    searchFolders,
+                    onlineSearch,
+                    terms,
+                  });
+                }
+                return out;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteVirtualFolder(folderPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                const r = getAccessibleFolder(folderPath);
+                if (r.error) return r;
+                const folder = r.folder;
+
+                // Guard: deleting a real folder here would destroy mail, whereas
+                // deleting a saved search only removes a view.
+                if (!(folder.flags & Ci.nsMsgFolderFlags.Virtual)) {
+                  return { error: "Not a saved search (virtual folder). Use deleteFolder for real folders." };
+                }
+                const parent = folder.parent;
+                if (!parent) return { error: "Saved search has no parent folder" };
+
+                const label = folder.prettyName || folder.name;
+                try {
+                  parent.propagateDelete(folder, true);
+                } catch {
+                  parent.propagateDelete(folder, true, null);
+                }
+                return { success: true, message: `Saved search "${label}" deleted` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+            // END VIRTUAL FOLDER (SAVED SEARCH) HELPERS
+
             function renameFolder(folderPath, newName) {
               try {
                 if (typeof folderPath !== "string" || !folderPath) {
@@ -12244,6 +12444,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
+                case "createVirtualFolder":
+                  return createVirtualFolder(args.name, args.parentFolderPath, args.searchFolderPaths, args.conditions, args.searchOnline);
+                case "listVirtualFolders":
+                  return listVirtualFolders(args.accountId);
+                case "deleteVirtualFolder":
+                  return deleteVirtualFolder(args.folderPath);
                 case "renameFolder":
                   return renameFolder(args.folderPath, args.newName);
                 case "deleteFolder":
