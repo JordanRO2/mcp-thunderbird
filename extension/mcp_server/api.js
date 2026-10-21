@@ -3578,7 +3578,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
               searchTimeExpired(scan);
-              if (Array.isArray(response) || !scan.truncated) return response;
+              if (Array.isArray(response)) return response;
+              if (scan.folderRefresh) response.folderRefresh = scan.folderRefresh;
+              if (!scan.truncated) return response;
               const message = scan.timedOut
                 ? "Search reached its 20-second time budget; results, counts and date ordering are partial. Narrow the query with folderPath, includeSubfolders:false, or dates."
                 : scan.glodaLimited
@@ -3838,40 +3840,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
             }
-
-            // BEGIN FOLDER SYNC HELPER
-            /**
-             * Brings an IMAP folder's database up to date with the server.
-             * Resolves true once Thunderbird reports the update done, false on
-             * failure or timeout. Same listener as MailUtils.updateFolderAsync
-             * (not available on every supported Thunderbird), plus a timeout so
-             * an update that never reports back cannot hang the tool call.
-             * Local folders resolve at once: their database is the store.
-             */
-            function syncFolderDatabase(folder, timeoutMs) {
-              if (folder?.server?.type !== "imap") return Promise.resolve(true);
-              return new Promise((resolve) => {
-                let settled = false;
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                const settle = (ok) => {
-                  if (settled) return;
-                  settled = true;
-                  try { timer.cancel(); } catch { /* already fired */ }
-                  resolve(ok);
-                };
-                timer.initWithCallback({ notify: () => settle(false) }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
-                try {
-                  folder.updateFolderWithListener(null, {
-                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                    OnStartRunningUrl() {},
-                    OnStopRunningUrl(_url, status) { settle(Components.isSuccessCode(status)); },
-                  });
-                } catch {
-                  settle(false);
-                }
-              });
-            }
-            // END FOLDER SYNC HELPER
 
             function toColumnarTable(items, keys) {
               const columns = Array.from(keys).sort();
@@ -6120,7 +6088,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
 	              }
 	              const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
-	              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -6178,7 +6145,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (hasQuery) {
                   // Search decoded headers, preserving field operators and AND tokens.
                   // Cached subjects and previews of encrypted mail are not matched.
-                  const protectedText = !allowEncrypted && hasRecordedEncryption(msgHdr);
+                  const protectedText = !isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasRecordedEncryption(msgHdr);
                   const subject = protectedText ? "" : (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                   const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                   const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
@@ -6257,10 +6224,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (folderPath) {
                 const result = getAccessibleFolder(folderPath);
                 if (result.error) return result;
-                // A started refresh lands after the scan, so a count taken right
-                // after a change could still see the old folder. Wait for the
-                // named folder's sync (bounded); subfolders keep the cheap refresh.
-                if (await syncFolderDatabase(result.folder, SEARCH_SYNC_TIMEOUT_MS)) syncedFolder = result.folder;
+                // Only the named, selectable IMAP folder waits. This consumes
+                // the search budget; descendants retain their background refresh.
+                const folder = result.folder;
+                if (!searchTimeExpired(scan) && folder.server?.type === "imap" && !folder.isServer &&
+                    !(folder.flags & (Ci.nsMsgFolderFlags.Virtual | Ci.nsMsgFolderFlags.ImapNoselect))) {
+                  const remaining = scan.deadline - Date.now();
+                  if (remaining > 0) {
+                    scan.folderRefresh = await waitForFolderRefresh(folder, Math.min(SEARCH_SYNC_TIMEOUT_MS, remaining));
+                    if (scan.folderRefresh.updateConfirmed === true) syncedFolder = folder;
+                  }
+                }
                 await searchFolder(result.folder);
               } else {
                 for (const account of getAccessibleAccounts()) {
