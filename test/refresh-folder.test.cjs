@@ -3,6 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadRefreshRuntime } = require("./helpers/refresh-runtime.cjs");
+const { makeImapFolder } = require("./helpers/imap-folder.cjs");
 
 const WAIT_MS = 1000;
 const UPDATE_MS = 50;
@@ -13,59 +14,23 @@ const FAILURE = 0x80004005;
 const FLAGS = { Virtual: 0x20, ImapNoselect: 0x01000000 };
 const FOLDER_URI = "imap://account/Inbox";
 
-// Reuse the original folder/count fixture, now modelling Thunderbird's single
-// stashed URL listener and FolderLoaded-before-OnStopRunningUrl ordering.
+// Keep the original count fixture on the shared IMAP event-order model.
 function loadRefresh({ type = "imap", offline = false, denied = false, delay = UPDATE_MS, exitCode = 0 } = {}) {
-  const listeners = new Set();
-  const mailSession = {
-    AddFolderListener(listener) { listeners.add(listener); },
-    RemoveFolderListener(listener) { listeners.delete(listener); },
-    fire(folder, event = "FolderLoaded") {
-      for (const listener of [...listeners]) listener.onFolderEvent(folder, event);
-    },
-  };
   let harness;
   const folder = {
     URI: FOLDER_URI, server: { type }, flags: 0, isServer: false,
     total: 10, unread: 2, arrivals: 2, countReads: 0,
-    updateCalls: 0, imapUpdateCalls: 0, urlRunning: false, updatingFolder: false,
-    urlListener: null, updateUrl: null,
     getTotalMessages() { this.countReads++; return this.total; },
     getNumUnread() { this.countReads++; return this.unread; },
     QueryInterface() { return this; },
     getNewMessages() { assert.fail("account-level Get Mail must not be used"); },
-    finishUrl(url, status = exitCode) {
-      this.urlRunning = false;
-      this.updatingFolder = false;
-      if (url.updatingFolder) {
-        if (status === 0) { this.total += this.arrivals; this.unread += this.arrivals; }
-        // The base folder fires loaded for success AND failure, first.
-        mailSession.fire(this);
-      }
-      const listener = this.urlListener;
-      this.urlListener = null; // Whichever URL ends first consumes this slot.
-      listener?.OnStopRunningUrl(url, status);
-    },
-    updateFolderWithListener(_window, listener) {
-      this.imapUpdateCalls++;
-      if (!this.urlRunning) {
-        if (harness.runtime.Services.io.offline) { mailSession.fire(this); return; }
-        this.urlRunning = this.updatingFolder = true;
-        this.urlListener = listener;
-        this.updateUrl = { updatingFolder: true, QueryInterface() { return this; } };
-        if (delay !== null) harness.clock.schedule(delay, () => this.finishUrl(this.updateUrl));
-      } else if (!this.updatingFolder) {
-        // A body fetch is running: no update starts and no listener is saved.
-        mailSession.fire(this);
-      }
-      // A running update will send FolderLoaded later; the new listener is lost.
-    },
-    updateFolder() {
-      this.updateCalls++;
-      if (type === "imap") this.updateFolderWithListener(null, null);
-      else if (delay !== null) harness.clock.schedule(delay, () => mailSession.fire(this));
-    },
   };
+  const { listeners, mailSession } = makeImapFolder({
+    folder, clock: () => harness.clock, runtime: () => harness.runtime, delay, exitCode,
+    onUpdateComplete(current, status) {
+      if (status === 0) { current.total += current.arrivals; current.unread += current.arrivals; }
+    },
+  });
   harness = loadRefreshRuntime({
     blocks: ["REFRESH FOLDER TOOL"],
     expose: ["refreshFolder", "waitForFolderRefresh"],

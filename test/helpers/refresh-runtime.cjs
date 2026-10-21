@@ -15,7 +15,7 @@ const SHARED_EXPORTS = [
 // The calendar/folder loaders supply the production-marker pattern; the search
 // scan tests supply a controllable Date and nsITimer. Refresh tests additionally
 // need independent deadlines and a separate main-thread queue for URL ordering.
-function loadRefreshRuntime({ blocks = [], globals = {}, expose = [] } = {}) {
+function loadRefreshRuntime({ blocks = [], globals = {}, expose = [], onMainThreadTurn } = {}) {
   const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8");
   const timers = [];
   const mainThread = [];
@@ -68,6 +68,8 @@ function loadRefreshRuntime({ blocks = [], globals = {}, expose = [] } = {}) {
       await new Promise(setImmediate);
       while (mainThread.length) {
         const callback = mainThread.shift();
+        // Invalidate search database generations before a queued turn resumes.
+        onMainThreadTurn?.();
         if (typeof callback === "function") callback();
         else callback.run();
         await new Promise(setImmediate);
