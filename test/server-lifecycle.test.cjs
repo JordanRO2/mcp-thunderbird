@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { HTTPD_PORT, createHttpdHarness } = require("./helpers/httpd.cjs");
 const { loadPrivacyRuntime, getConstantDeclaration } = require("./helpers/privacy-access.cjs");
+const { createResourceLoader } = require("./helpers/resource-loader.cjs");
 const REFRESH_TIMER_TYPE = 1;
 const HTTP_ACTIVITY = { ACTIVITY_TYPE_HTTP_TRANSACTION: 2, ACTIVITY_SUBTYPE_RESPONSE_HEADER: 0x5004 };
 
@@ -322,6 +323,44 @@ function loadServerLifecycle(overrides = {}) {
       state.connection = null;
     },
   };
+  if (state.extensionRoot) {
+    // Execute the entire Experiment, including getAPI's import order. The
+    // ordinary lifecycle fixtures below intentionally load smaller snippets.
+    const rootURI = { resolve: name => state.extensionRoot + name };
+    state.resources = createResourceLoader(new Map([[
+      rootURI.resolve("tool-access.js"),
+      fs.readFileSync(path.resolve(__dirname, "../extension/tool-access.js"), "utf8"),
+    ]]));
+    sandbox.Cu = { importGlobalProperties() {} };
+    sandbox.ExtensionCommon = { ExtensionAPI: class {} };
+    sandbox.context = { extension: { id: "thunderbird-mcp@tkasperczyk.dev", rootURI } };
+    sandbox.Services.scriptloader = state.resources.scriptloader;
+    sandbox.Services.obs = { notifyObservers() {} };
+    sandbox.Cc["@mozilla.org/network/protocol;1?name=resource"] = {
+      getService: () => state.resources.protocol,
+    };
+    sandbox.Cc["@mozilla.org/security/random-generator;1"] = {
+      createInstance: () => ({ generateRandomBytes: count => new Uint8Array(count).fill(++state.nonce) }),
+    };
+    const importESModule = sandbox.ChromeUtils.importESModule;
+    sandbox.ChromeUtils.importESModule = uri => {
+      if (uri === "resource://gre/modules/AddonManager.sys.mjs") {
+        return { AddonManager: { addAddonListener() {}, removeAddonListener() {} } };
+      }
+      if (uri.startsWith("resource://thunderbird-mcp/httpd.sys.mjs")) {
+        assert.ok(state.resources.substitutions.has("thunderbird-mcp"));
+        assert.equal(state.resources.loads.length, 1, "load Tool Access before starting the listener");
+      }
+      return importESModule(uri);
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(source + `
+      this.experiment = new mcpServer();
+      this.api = this.experiment.getAPI(context).mcpServer;
+      this.shutdown = () => this.experiment.onShutdown(false);
+    `, sandbox, { filename: "api.js" });
+    return { api: sandbox.api, sandbox, state, NetUtil, access };
+  }
   vm.createContext(sandbox);
   vm.runInContext([
     ...["DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "MAX_REQUEST_BODY",
@@ -381,6 +420,31 @@ function loadServerStatus(api) {
     "\nthis.loadServerInfo = loadServerInfo;", ui);
   return ui;
 }
+
+describe("Experiment startup with trusted script URIs", () => {
+  for (const extensionRoot of [
+    "jar:file:///mock-profile/extensions/thunderbird-mcp.xpi!/",
+    "jar:file:///C:/mock-profile/extensions/thunderbird-mcp.xpi!/",
+    "file:///mock-unpacked-extension/",
+  ]) {
+    it(`starts the production getAPI path from ${extensionRoot}`, async () => {
+      const { api, sandbox, state, access } = loadServerLifecycle({ extensionRoot });
+      assert.throws(() => state.resources.scriptloader.loadSubScript(extensionRoot + "tool-access.js", {}),
+        /Trying to load untrusted URI/);
+      const result = await api.start();
+      assert.equal(result.success, true, result.error);
+      assert.equal(state.servers.length, 1);
+      assert.equal(state.connectionWrites.length, 1);
+      assert.deepEqual(state.resources.loads.map(load => load.uri), ["resource://thunderbird-mcp/tool-access.js"]);
+      const config = await api.getToolAccessConfig();
+      assert.ok(config.tools.some(tool => tool.name === "dryRunCompose"));
+      assert.ok(config.tools.some(tool => tool.name === "sendMail"));
+      assert.ok(access.writes.every(write => write.name.startsWith("extensions.thunderbird-mcp.")));
+      sandbox.shutdown();
+      assert.equal(state.resources.substitutions.size, 0, "unload releases the resource mapping");
+    });
+  }
+});
 
 describe("Tool Access initialization and server startup", () => {
   it("writes migrated restrictions before tracking and before the listener binds", async () => {
