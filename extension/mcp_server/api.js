@@ -1466,6 +1466,7 @@ let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
+const PREF_TOOL_ACCESS_STATE = "extensions.thunderbird-mcp.toolAccessState";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
@@ -3591,6 +3592,69 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // Derive ALL_TOOL_NAMES from the tools array (single source of truth)
     const ALL_TOOL_NAMES = tools.map(t => t.name);
 
+    // BEGIN TOOL ACCESS STATE
+    const TOOL_ACCESS_ERROR = "Tool access preferences are corrupt, unreadable, or could not be saved. All non-infrastructure tools are blocked. Change tool selections explicitly to repair them.";
+    // Searched readAccessListPref/setToolAccess and migration/revision helpers.
+    // Reuse the deny-list parser; there was no tracking record or stale-save guard.
+    function ensureToolAccessState() {
+      const { values: disabled, corrupt } = readAccessListPref(PREF_DISABLED_TOOLS);
+      let state = null;
+      try {
+        const type = Services.prefs.getPrefType(PREF_TOOL_ACCESS_STATE);
+        if (type !== Ci.nsIPrefBranch.PREF_INVALID) {
+          if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Invalid tracking preference type");
+          state = toolAccess.parseState(Services.prefs.getStringPref(PREF_TOOL_ACCESS_STATE));
+        }
+        if (corrupt || disabled.includes("__all__")) throw new Error("Invalid disabled tools preference");
+        const next = toolAccess.considerTools(disabled, state, ALL_TOOL_NAMES);
+        // No await between reading and committing. An interrupted migration may
+        // repeat additions, but must never mark an unwritten denial considered.
+        if (JSON.stringify(next.disabled) !== JSON.stringify(disabled)) {
+          Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(next.disabled));
+        }
+        if (JSON.stringify(next.state) !== JSON.stringify(state)) {
+          Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(next.state));
+        }
+        return { ...next, error: "" };
+      } catch {
+        return { disabled, state, error: TOOL_ACCESS_ERROR };
+      }
+    }
+
+    function getToolAccessRevision(access) {
+      const preferences = [PREF_DISABLED_TOOLS, PREF_TOOL_ACCESS_STATE, PREF_GET_MESSAGES_LIMIT].map(name => {
+        try {
+          const type = Services.prefs.getPrefType(name);
+          let value = null;
+          if (type === Ci.nsIPrefBranch.PREF_STRING) value = Services.prefs.getStringPref(name);
+          else if (type === Ci.nsIPrefBranch.PREF_BOOL) value = Services.prefs.getBoolPref(name);
+          else if (type === Ci.nsIPrefBranch.PREF_INT) value = Services.prefs.getIntPref(name);
+          return [type, value];
+        } catch {
+          return ["unreadable"];
+        }
+      });
+      const snapshot = JSON.stringify([
+        preferences, access.error, ALL_TOOL_NAMES,
+      ]);
+      // Shared by getAPI contexts; a new token after reload cannot accept a page
+      // from an older catalog. UUIDs are opaque revisions, not auth credentials.
+      if (globalThis.__tbMcpToolAccessRevision?.snapshot !== snapshot) {
+        globalThis.__tbMcpToolAccessRevision = { snapshot, token: Services.uuid.generateUUID().toString() };
+      }
+      return globalThis.__tbMcpToolAccessRevision.token;
+    }
+
+    function writeDisabledTools(disabled) {
+      if (disabled.length) Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabled));
+      else Services.prefs.clearUserPref(PREF_DISABLED_TOOLS);
+    }
+
+    // Options can load before start(), or after a failed start(). Initialize in
+    // getAPI's scope before returning either API, hence before any listener binds.
+    ensureToolAccessState();
+    // END TOOL ACCESS STATE
+
     // Group display order for settings UI
     const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar: 4, filters: 5 };
     // Group display labels
@@ -4247,8 +4311,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Fails closed: corrupt pref disables all tools.
              */
             function getDisabledTools() {
-              const { values, corrupt } = readAccessListPref(PREF_DISABLED_TOOLS);
-              return corrupt ? ["__all__"] : values;
+              const access = ensureToolAccessState();
+              return access.error ? ["__all__"] : access.disabled;
             }
 
             /**
@@ -14855,8 +14919,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getToolAccessConfig: async function() {
-          const { values: disabled, corrupt: invalid } = readAccessListPref(PREF_DISABLED_TOOLS);
-          const corrupt = invalid || disabled.includes("__all__");
+          const access = ensureToolAccessState();
+          const { disabled } = access;
+          const corrupt = !!access.error;
 
           // Build tool list with group/crud metadata, sorted by group then CRUD order
           const getMessagesLimit = getConfiguredGetMessagesLimit();
@@ -14883,6 +14948,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             });
           const result = {
             mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
+            revision: getToolAccessRevision(access),
             disabledTools: disabled,
             groups: GROUP_LABELS,
             getMessagesLimit,
@@ -14891,12 +14957,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             tools: toolList,
           };
           if (corrupt) {
-            result.error = "Disabled tools preference is corrupt. All non-infrastructure tools are blocked. Change tool selections explicitly to repair it.";
+            result.error = access.error;
           }
           return result;
         },
 
-        setToolAccess: async function(disabledTools, getMessagesLimit) {
+        setToolAccess: async function(disabledTools, getMessagesLimit, revision) {
           if (!Array.isArray(disabledTools)) {
             return { error: "disabledTools must be an array" };
           }
@@ -14925,17 +14991,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
           }
 
-          if (disabledTools.length === 0) {
-            try { Services.prefs.clearUserPref(PREF_DISABLED_TOOLS); } catch { /* ignore */ }
-          } else {
-            Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabledTools));
+          const access = ensureToolAccessState();
+          if (typeof revision !== "string" || revision !== getToolAccessRevision(access)) {
+            return { error: "Tool Access changed. Reload the Options page before saving." };
           }
-          if (requestedLimit !== null) {
-            if (requestedLimit === DEFAULT_GET_MESSAGES_LIMIT) {
-              try { Services.prefs.clearUserPref(PREF_GET_MESSAGES_LIMIT); } catch { /* ignore */ }
-            } else {
-              Services.prefs.setIntPref(PREF_GET_MESSAGES_LIMIT, requestedLimit);
+          if (access.error && ALL_TOOL_NAMES.every(name => UNDISABLEABLE_TOOLS.has(name) || disabledTools.includes(name))) {
+            return { error: access.error };
+          }
+          // An older catalog cannot express choices for newer tools. Preserve
+          // those denials even when its page saves all of its own tools enabled.
+          disabledTools = [...new Set([
+            ...access.disabled.filter(name => name !== "__all__" && !ALL_TOOL_NAMES.includes(name)),
+            ...disabledTools,
+          ])];
+          try {
+            // Explicit repair chooses the current tools itself; do not reapply
+            // upgrade defaults over those choices. Retain valid future history.
+            const { state } = toolAccess.considerTools([], access.state, ALL_TOOL_NAMES);
+            state.customized ||= disabledTools.length > 0 || !!access.error;
+            delete globalThis.__tbMcpToolAccessRevision;
+            // During repair keep a durable fail-closed value until the tracking
+            // write succeeds. A crash/write failure must not turn corruption into
+            // an apparently untouched profile, especially for an enable-all save.
+            // Retain absent-catalog denials in that staging value across restarts.
+            writeDisabledTools(access.error ? ["__all__", ...disabledTools] : disabledTools);
+            if (JSON.stringify(state) !== JSON.stringify(access.state)) {
+              Services.prefs.setStringPref(PREF_TOOL_ACCESS_STATE, JSON.stringify(state));
             }
+            if (access.error) writeDisabledTools(disabledTools);
+            if (requestedLimit !== null) {
+              if (requestedLimit === DEFAULT_GET_MESSAGES_LIMIT) {
+                Services.prefs.clearUserPref(PREF_GET_MESSAGES_LIMIT);
+              } else {
+                Services.prefs.setIntPref(PREF_GET_MESSAGES_LIMIT, requestedLimit);
+              }
+            }
+          } catch {
+            return { error: "Could not save Tool Access. Reload the Options page and check the selections before retrying." };
           }
           return {
             success: true,

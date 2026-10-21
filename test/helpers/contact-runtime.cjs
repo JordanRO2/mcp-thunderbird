@@ -481,7 +481,7 @@ function loadContactRuntime({
     MailServices: { ab: { get directories() { calls.directories++; return books; } } },
   });
   const prefConstants = [
-    "PREF_ALLOW_CONTACT_WRITES", "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS",
+    "PREF_ALLOW_CONTACT_WRITES", "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_TOOL_ACCESS_STATE",
     "PREF_ALLOW_ALL_ADDRESS_BOOKS", "PREF_ALLOW_ALL_CALENDARS", "PREF_ALLOW_ENCRYPTED_MESSAGES",
     "PREF_GET_MESSAGES_LIMIT",
   ];
@@ -524,6 +524,8 @@ function loadContactRuntime({
       snippet("FILTER SEARCH TERM HELPERS"),
       snippet("BOUNDED REFRESH HELPERS"),
       snippet("TOOL SCHEMA BUILDER"),
+      "const ALL_TOOL_NAMES = buildTools().map(tool => tool.name);",
+      snippet("TOOL ACCESS STATE"),
       snippet("TOOL SCHEMA VALIDATOR"),
       snippet("SERVER ACCESS HELPERS"),
       snippet("MCP TEXT SANITIZATION"),

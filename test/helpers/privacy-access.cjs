@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { randomUUID } = require("node:crypto");
 
 const apiSource = fs.readFileSync(
   path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8"
@@ -27,8 +28,11 @@ function getConstantDeclaration(name) {
   return declaration[0];
 }
 
-function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager = false, policyTransform = code => code } = {}) {
-  const values = new Map();
+function loadPrivacyRuntime({
+  initial = {}, unreadable = [], legacyAddonManager = false, legacy = false, initialize = true,
+  values = new Map(), writeErrors = new Set(), beforeWrite = () => {},
+  policyTransform = code => code, schemaTransform = code => code,
+} = {}) {
   const readErrors = new Set();
   const writes = [];
   const calls = [];
@@ -38,6 +42,12 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
   const removedListeners = [];
   const warnings = [];
   const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_INT: 64, PREF_BOOL: 128 };
+  // Reuse the existing memory preference boundary; allow restarts over the same
+  // store and failures before individual writes, without touching real profiles.
+  function checkWrite(name, value) {
+    beforeWrite(name, value);
+    if (writeErrors.has(name)) throw new Error("Preference write failed");
+  }
   const prefs = {
     getPrefType(name) {
       if (readErrors.has(name)) throw new Error("Preference is unreadable");
@@ -70,18 +80,22 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
       throw new Error("Preference is not an integer");
     },
     setStringPref(name, value) {
+      checkWrite(name, value);
       writes.push({ name, value });
       values.set(name, value);
     },
     setBoolPref(name, value) {
+      checkWrite(name, value);
       writes.push({ name, value });
       values.set(name, value);
     },
     setIntPref(name, value) {
+      checkWrite(name, value);
       writes.push({ name, value });
       values.set(name, value);
     },
     clearUserPref(name) {
+      checkWrite(name);
       writes.push({ name });
       values.delete(name);
     },
@@ -109,7 +123,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
       assert.equal(name, "tool-access.js");
       return "resource://fixture/" + name;
     } },
-    Services: { prefs, scriptloader: { loadSubScript(url, scope) {
+    Services: { prefs, uuid: { generateUUID: randomUUID }, scriptloader: { loadSubScript(url, scope) {
       assert.equal(url, "resource://fixture/tool-access.js");
       vm.runInNewContext(policyTransform(fs.readFileSync(path.resolve(__dirname, "../../extension/tool-access.js"), "utf8")), scope);
     } } },
@@ -131,7 +145,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     console: { warn: (...args) => warnings.push(args), error() {} },
   };
   const prefConstants = [
-    "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_BLOCK_SKIPREVIEW",
+    "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_TOOL_ACCESS_STATE", "PREF_BLOCK_SKIPREVIEW",
     "PREF_STABLE_AUTH_TOKEN", "PREF_GET_MESSAGES_LIMIT", "PREF_ALLOW_ENCRYPTED_MESSAGES",
     "PREF_ALLOW_ALL_CALENDARS", "PREF_ALLOW_ALL_ADDRESS_BOOKS",
   ];
@@ -152,7 +166,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     getMarkedApiSnippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
     getMarkedApiSnippet("// BEGIN FILTER SEARCH TERM HELPERS", "// END FILTER SEARCH TERM HELPERS"),
     getMarkedApiSnippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
-    getMarkedApiSnippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER"),
+    schemaTransform(getMarkedApiSnippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER")),
     getMarkedApiSnippet("// BEGIN INLINE ATTACHMENT BASE64 HELPERS", "// END INLINE ATTACHMENT BASE64 HELPERS"),
     getMarkedApiSnippet("// BEGIN INLINE IMAGE CONTENT HELPERS", "// END INLINE IMAGE CONTENT HELPERS"),
     getMarkedApiSnippet("// BEGIN TOOL SCHEMA VALIDATOR", "// END TOOL SCHEMA VALIDATOR"),
@@ -164,6 +178,9 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     "};",
     `this.prefNames = { ${prefConstants.join(", ")} };`,
     "this.tools = buildTools();",
+    "this.buildTools = buildTools;",
+    "this.getConfiguredGetMessagesLimit = getConfiguredGetMessagesLimit;",
+    "this.policy = toolAccess;",
     "this.readAccessListPref = readAccessListPref;",
     "this.isAccountAllowed = isAccountAllowed;",
     "this.isToolEnabled = isToolEnabled;",
@@ -188,6 +205,20 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     assert.ok(sandbox.prefNames[name], `Unknown preference constant: ${name}`);
     readErrors.add(sandbox.prefNames[name]);
   }
+  // Ordinary access/dependency fixtures describe existing choices. Migration
+  // cases opt into legacy:true; seed before executing the real initialization.
+  if (!legacy && !values.has(sandbox.prefNames.PREF_TOOL_ACCESS_STATE)) {
+    const { state } = sandbox.policy.considerTools([], null, sandbox.tools.map(tool => tool.name));
+    state.customized = sandbox.readAccessListPref(sandbox.prefNames.PREF_DISABLED_TOOLS).values.length > 0;
+    values.set(sandbox.prefNames.PREF_TOOL_ACCESS_STATE, JSON.stringify(state));
+  }
+  vm.runInContext([
+    getConstantDeclaration("ALL_TOOL_NAMES").replace("tools.map", "this.tools.map"),
+    initialize
+      ? getMarkedApiSnippet("// BEGIN TOOL ACCESS STATE", "// END TOOL ACCESS STATE")
+      : getMarkedApiSnippet("// BEGIN TOOL ACCESS STATE", "// END TOOL ACCESS STATE").replace("    ensureToolAccessState();", ""),
+    "this.ensureToolAccessState = ensureToolAccessState;",
+  ].join("\n"), sandbox);
   for (const tool of sandbox.tools) {
     const handler = tool.name === "sendMail" ? "composeMail" : tool.name;
     sandbox[handler] = (...args) => {
@@ -197,7 +228,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     };
   }
   return {
-    ...sandbox, values, writes, calls, handlerResults, addonListeners,
+    ...sandbox, values, writes, writeErrors, readErrors, calls, handlerResults, addonListeners,
     addedListeners, removedListeners, warnings,
     http(method, params) {
       // Reuse validation.test.cjs's complete production HTTP boundary.
@@ -215,4 +246,4 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
   };
 }
 
-module.exports = { loadPrivacyRuntime, manifest };
+module.exports = { loadPrivacyRuntime, manifest, getConstantDeclaration };

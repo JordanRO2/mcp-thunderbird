@@ -36,6 +36,7 @@ let getMessagesLimitStatus = null;
 let currentAccountError = "";
 let accountAccessChanged = false;
 let currentToolError = "";
+let currentToolRevision = "";
 let currentGetMessagesLimit = "";
 let toolAccessChanged = false;
 let toolSettingsChanged = false;
@@ -381,6 +382,7 @@ async function loadToolAccess() {
   toolSettingsChanged = false;
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
+    currentToolRevision = data.revision;
     currentTools = data.tools || [];
     toolChoices = new Map(currentTools.map(tool => [tool.name, tool.configuredEnabled ?? tool.enabled]));
     const groupLabels = data.groups || {};
@@ -564,7 +566,7 @@ saveToolsBtn.addEventListener("click", async () => {
   }
 
   try {
-    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit);
+    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit, currentToolRevision);
     if (result.error) {
       saveToolsStatus.textContent = result.error;
       saveToolsStatus.className = "save-status error";

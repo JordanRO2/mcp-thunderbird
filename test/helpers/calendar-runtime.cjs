@@ -359,6 +359,7 @@ function loadCalendarRuntime({
       return typeof prefValues.get(name) === "string" ? prefTypes.PREF_STRING : prefTypes.PREF_BOOL;
     },
     getStringPref(name, fallback = "") { return prefValues.get(name) ?? fallback; },
+    setStringPref(name, value) { prefValues.set(name, value); },
     getBoolPref(name, fallback) {
       if (unreadableSkipReview && name.endsWith(".blockSkipReview")) throw new Error("Unreadable preference");
       return prefValues.has(name) ? prefValues.get(name) : fallback;
@@ -491,7 +492,7 @@ function loadCalendarRuntime({
     console: { warn() {}, error() {} },
   };
   const names = [
-    "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_BLOCK_SKIPREVIEW",
+    "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS", "PREF_TOOL_ACCESS_STATE", "PREF_BLOCK_SKIPREVIEW",
     "PREF_ALLOW_ALL_CALENDARS", "PREF_ALLOW_ALL_ADDRESS_BOOKS", "PREF_GET_MESSAGES_LIMIT",
     "DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "UNDISABLEABLE_TOOLS",
   ];
@@ -510,6 +511,8 @@ function loadCalendarRuntime({
     snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
     snippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
     snippet("// BEGIN TOOL SCHEMA BUILDER", "// END TOOL SCHEMA BUILDER"),
+    "const ALL_TOOL_NAMES = buildTools().map(tool => tool.name);",
+    snippet("// BEGIN TOOL ACCESS STATE", "// END TOOL ACCESS STATE"),
     snippet("// BEGIN TOOL SCHEMA VALIDATOR", "// END TOOL SCHEMA VALIDATOR"),
     snippet("// BEGIN CALENDAR TOOLS", "// END CALENDAR TOOLS"),
     snippet("// BEGIN TOOL CALL DISPATCH", "// END TOOL CALL DISPATCH"),
