@@ -41,6 +41,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
   const aliases = new Map();
   const disk = new Map();
   const fileFailures = new Map();
+  const fileAliases = new Map();
   const openDBs = [];
   const cachedDatabases = new Map();
   const servers = [1, 2, 9].map(index => ({
@@ -55,6 +56,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
   // A sparse map still implies intermediate directories, as a real filesystem
   // does: backing/cur/message must be visible when enumerating backing.
   function diskEntry(filePath) {
+    filePath = fileAliases.get(filePath) || filePath;
     if (disk.has(filePath)) return disk.get(filePath);
     const prefix = filePath.endsWith("/") ? filePath : `${filePath}/`;
     return [...disk.keys()].some(entry => entry.startsWith(prefix))
@@ -82,7 +84,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
       clone: () => file(currentPath),
       equals(other) {
         if (fileFailures.get(currentPath)?.equals) throw new Error("storage identity unreadable");
-        return other.path === currentPath;
+        return (fileAliases.get(other.path) || other.path) === (fileAliases.get(currentPath) || currentPath);
       },
       exists() {
         if (fileFailures.get(currentPath)?.exists) throw new Error("storage existence unreadable");
@@ -115,6 +117,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
       },
       get directoryEntries() {
         if (fileFailures.get(currentPath)?.directoryEntries) throw new Error("directory unreadable");
+        const borrowedEntries = [];
         return {
           *[Symbol.iterator]() {
             if (fileFailures.get(currentPath)?.iterate) throw new Error("directory iteration failed");
@@ -125,10 +128,17 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
               const child = entry.slice(prefix.length).split("/")[0];
               children.add(path.join(currentPath, child));
             }
-            for (const child of children) yield file(child);
+            for (const child of children) {
+              const entry = file(child);
+              borrowedEntries.push(entry);
+              yield entry;
+            }
           },
           close() {
             events.push([EVENT.DIRECTORY_CLOSE, currentPath]);
+            if (fileFailures.get(currentPath)?.invalidateEntriesOnClose) {
+              for (const entry of borrowedEntries) entry.leafName += "-closed";
+            }
             if (fileFailures.get(currentPath)?.close) throw new Error("directory close failed");
           },
         };
@@ -314,7 +324,7 @@ function makeHarness({ denied = [], addressBooksRestricted = false } = {}) {
     return target;
   }
   function assertNoMutation() { assert.deepEqual(mutations, []); }
-  return { runtime, accounts, folders, events, mutations, aliases, disk, fileFailures, file, openDBs, cachedDatabases, virtualFolderHelper, root, otherRoot, hiddenRoot, source, otherSource, hiddenSource, folder, view, create, dangling, assertNoMutation };
+  return { runtime, accounts, folders, events, mutations, aliases, disk, fileFailures, fileAliases, file, openDBs, cachedDatabases, virtualFolderHelper, root, otherRoot, hiddenRoot, source, otherSource, hiddenSource, folder, view, create, dangling, assertNoMutation };
 }
 
 function assertRefused(result, pattern) {
@@ -558,6 +568,126 @@ describe("saved-search allocation proves storage was not already present", () =>
       if (mustClose) assert.ok(h.events.some(([event]) => event === EVENT.DIRECTORY_CLOSE));
     });
   }
+});
+
+describe("saved-search creation refuses filesystem aliases", () => {
+  const SHORT_NAME = "RECEIP~1";
+  const ORIGINAL_NAME = "Receipts2025";
+  const SAFE_ALIAS_NAME = "New visible view";
+  const ORIGINAL_DEFINITION = "original-definition";
+  const ORIGINAL_STORAGE = "stored real mail";
+
+  for (const platform of [undefined, "Linux", "Darwin", "WINNT"]) {
+    it(`refuses tilde followed by a digit before allocation on ${platform || "unspecified OS"}`, async () => {
+      for (const name of [SHORT_NAME, "prefix~0suffix", "~9first", "embedded~123alias"]) {
+        const h = makeHarness();
+        if (platform) h.runtime.Services.appinfo = { OS: platform };
+        assertRefused(await h.create({ name }), /~.*digit|alias|short.?name/i);
+        h.assertNoMutation();
+      }
+    });
+  }
+
+  it("refuses the closed-original-database RECEIP~1 alias without calling addSubfolder", async () => {
+    const h = makeHarness();
+    const original = h.folder(h.root, ORIGINAL_NAME);
+    const storage = { directory: false, content: ORIGINAL_STORAGE };
+    h.disk.set(original.filePath.path, storage);
+    h.disk.set(original.summaryFile.path, { directory: false });
+    original.definition.scope = ORIGINAL_DEFINITION;
+    assert.deepEqual(h.openDBs, []);
+    let allocated;
+    h.root.addSubfolder = name => {
+      h.mutations.push([EVENT.ADD]);
+      allocated = h.folder(h.root, name);
+      allocated.URI = `${h.root.URI}/RECEIP%7E1`;
+      h.fileAliases.set(allocated.filePath.path, original.filePath.path);
+      h.fileAliases.set(allocated.summaryFile.path, original.summaryFile.path);
+      allocated.definition = original.definition;
+      return allocated;
+    };
+    assertRefused(await h.create({ name: SHORT_NAME }), /~.*digit|alias|short.?name/i);
+    assert.equal(allocated, undefined);
+    assert.equal(original.flags, 0);
+    assert.equal(original.definition.scope, ORIGINAL_DEFINITION);
+    assert.equal(h.disk.get(original.filePath.path), storage);
+    h.assertNoMutation();
+    assert.ok(!h.events.some(([event]) => [EVENT.CLOSE, EVENT.RELEASE, EVENT.ENUMERATE].includes(event)));
+  });
+
+  for (const [kind, suffix, directory] of [
+    ["backing", "", false], ["summary", SUMMARY_SUFFIX, false], ["child directory", SUBFOLDER_SUFFIX, true],
+  ]) {
+    it(`refuses an allowed visible name whose returned ${kind} aliases existing closed-database storage`, async () => {
+      const h = makeHarness();
+      const original = h.folder(h.root, ORIGINAL_NAME);
+      const originalPath = `${original.filePath.path}${suffix}`;
+      const storage = { directory, content: ORIGINAL_STORAGE };
+      h.disk.set(originalPath, storage);
+      original.definition.scope = ORIGINAL_DEFINITION;
+      assert.deepEqual(h.openDBs, []);
+      assert.equal(h.cachedDatabases.size, 0);
+      let allocated;
+      h.root.addSubfolder = name => {
+        h.mutations.push([EVENT.ADD]);
+        allocated = h.folder(h.root, name);
+        h.fileAliases.set(`${allocated.filePath.path}${suffix}`, originalPath);
+        allocated.definition = original.definition;
+        return allocated;
+      };
+      assertRefused(await h.create({ name: SAFE_ALIAS_NAME }), /storage|exist|alias/i);
+      assert.notEqual(allocated.URI, original.URI);
+      assert.notEqual(allocated.name, original.name);
+      assert.notEqual(allocated.filePath.path, original.filePath.path);
+      const returnedPath = h.file(`${allocated.filePath.path}${suffix}`);
+      assert.equal(returnedPath.exists(), true);
+      assert.equal(returnedPath.equals(h.file(originalPath)), true);
+      assert.equal(allocated.flags, 0);
+      assert.equal(original.flags, 0);
+      assert.equal(original.definition.scope, ORIGINAL_DEFINITION);
+      assert.equal(h.disk.get(originalPath), storage);
+      assert.deepEqual(h.mutations.map(([event]) => event), [EVENT.ADD]);
+      assert.ok(!h.events.some(([event]) => [EVENT.CLOSE, EVENT.RELEASE, EVENT.ENUMERATE].includes(event)));
+    });
+  }
+
+  it("refuses unreadable filesystem identity before setting Virtual or writing a definition", async () => {
+    const h = makeHarness();
+    const original = h.folder(h.root, ORIGINAL_NAME);
+    h.disk.set(original.filePath.path, { directory: false, content: ORIGINAL_STORAGE });
+    let allocated;
+    h.root.addSubfolder = name => {
+      h.mutations.push([EVENT.ADD]);
+      allocated = h.folder(h.root, name);
+      h.fileFailures.set(allocated.filePath.path, { equals: true });
+      return allocated;
+    };
+    assertRefused(await h.create({ name: SAFE_ALIAS_NAME }), /identity unreadable/);
+    assert.equal(allocated.flags, 0);
+    assert.equal(allocated.definition.scope, "");
+    assert.deepEqual(h.mutations.map(([event]) => event), [EVENT.ADD]);
+    assert.ok(!h.events.some(([event]) => [EVENT.CLOSE, EVENT.RELEASE].includes(event)));
+  });
+
+  it("retains independent preallocation file snapshots after the native enumerator closes", async () => {
+    const h = makeHarness();
+    const original = h.folder(h.root, ORIGINAL_NAME);
+    const storage = { directory: false, content: ORIGINAL_STORAGE };
+    h.disk.set(original.filePath.path, storage);
+    h.fileFailures.set(h.root.filePath.path, { invalidateEntriesOnClose: true });
+    let allocated;
+    h.root.addSubfolder = name => {
+      h.mutations.push([EVENT.ADD]);
+      allocated = h.folder(h.root, name);
+      h.fileAliases.set(allocated.filePath.path, original.filePath.path);
+      return allocated;
+    };
+    assertRefused(await h.create({ name: SAFE_ALIAS_NAME }), /storage|exist|alias/i);
+    assert.equal(allocated.flags, 0);
+    assert.equal(h.disk.get(original.filePath.path), storage);
+    assert.deepEqual(h.mutations.map(([event]) => event), [EVENT.ADD]);
+    assert.ok(h.events.some(([event, entry]) => event === EVENT.DIRECTORY_CLOSE && entry === h.root.filePath.path));
+  });
 });
 
 describe("saved-search input and privacy boundaries", () => {

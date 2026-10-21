@@ -2873,7 +2873,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            name: { type: "string", description: "Name for the saved search" },
+            name: { type: "string", description: "Name for the saved search. Cannot contain '~' followed by a digit (a possible Windows short-name alias), on any platform." },
             parentFolderPath: { type: "string", description: "URI of the folder to create it under (from listFolders) -- typically an account root" },
             searchFolderPaths: { type: "array", minItems: 1, items: { type: "string" }, description: "Individual real folder URIs to search across (from listFolders), not account roots or saved searches. Duplicate folders are searched once." },
             conditions: {
@@ -11423,6 +11423,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX = ".sbd";
             const SAVED_SEARCH_SUMMARY_SUFFIX = ".msf";
             const SAVED_SEARCH_DATABASE_SERVICE = "@mozilla.org/msgDatabase/msgDBService;1";
+            const SAVED_SEARCH_CREATE_STORAGE_ERROR = "Existing or unexpected folder storage; saved search not configured";
             const SAVED_SEARCH_STORAGE_ERROR = "Cannot delete a saved search with nonempty, unreadable or unexpected storage";
             const SAVED_SEARCH_MBOX_STORE = "mbox";
             const SAVED_SEARCH_MAILDIR_STORE = "maildir";
@@ -11456,6 +11457,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const directory = parent.filePath.clone();
               if (!parent.isServer) directory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
               const names = new Set();
+              const files = [];
               if (directory.exists()) {
                 if (!directory.isDirectory()) throw new Error("Cannot inspect parent folder storage");
                 const entries = directory.directoryEntries;
@@ -11466,12 +11468,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                     // Cover canonically equivalent filenames on macOS too.
                     names.add(entry.leafName.normalize().toLowerCase());
+                    // Keep native identities as well: Windows short names can
+                    // address existing storage despite different leaf names.
+                    files.push(entry.clone());
                   }
                 } finally {
                   entries.close();
                 }
               }
-              return { directory, names };
+              return { directory, names, files };
             }
 
             function assertReadableSavedSearchStorage(file) {
@@ -11585,6 +11590,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (/^\.|[.~ ]$|[;#]/.test(name)) {
                   return { error: "Invalid saved-search name: cannot start with '.', end with '.', '~' or a space, or contain ';' or '#'" };
                 }
+                // Refuse possible Windows 8.3 aliases on every platform, even
+                // when no open database or matching folder URI exposes them.
+                if (/~[0-9]/.test(name)) {
+                  return { error: "Saved-search names cannot contain '~' followed by a digit (Windows short-name alias)" };
+                }
                 if (searchOnline !== undefined && typeof searchOnline !== "boolean") {
                   return { error: "searchOnline must be a boolean" };
                 }
@@ -11667,7 +11677,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     summary.leafName !== file.leafName + SAVED_SEARCH_SUMMARY_SUFFIX ||
                     [file.leafName, summary.leafName, file.leafName + SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX]
                       .some(leaf => storage.names.has(leaf.normalize().toLowerCase()))) {
-                  throw new Error("Existing or unexpected folder storage; saved search not configured");
+                  throw new Error(SAVED_SEARCH_CREATE_STORAGE_ERROR);
+                }
+                const childDirectory = file.clone();
+                childDirectory.leafName += SAVED_SEARCH_CHILD_DIRECTORY_SUFFIX;
+                const storagePaths = [file, summary, childDirectory];
+                if (storagePaths.some(candidate => storage.files.some(existing => candidate.equals(existing)))) {
+                  throw new Error(SAVED_SEARCH_CREATE_STORAGE_ERROR);
                 }
                 // A cached orphan may have an in-memory DB even with no files.
                 // Both service APIs are read-only; never close a borrowed DB.
