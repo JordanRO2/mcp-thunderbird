@@ -5,11 +5,14 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const DRAFTS_URI = "imap://user@example.test/Drafts";
 const OTHER_DRAFTS_URI = "imap://other@example.test/Drafts";
 const Ci = {
+  nsIPrefBranch: prefTypes,
   nsIMsgCompType: { New: 0, Draft: 9 },
   nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 4 },
   nsMsgFolderFlags: { Drafts: 0x400 },
@@ -26,6 +29,7 @@ function snippet(name) {
 }
 
 function loadDraftTools(options = {}) {
+  const clock = makeSendLaterClock();
   const calls = { finds: [], accessible: [], flags: [], sends: [], attachments: [], bodies: [], timerCancels: 0 };
   const folder = options.folder || {
     URI: DRAFTS_URI,
@@ -41,6 +45,11 @@ function loadDraftTools(options = {}) {
   const destination = options.destination || folder;
   const sandbox = {
     Ci,
+    Date: clock.Date,
+    Services: { prefs: makeDirectSendPrefs(options.prefs) },
+    isSkipReviewBlocked: () => options.blocked === true,
+    isToolEnabled: name => !(options.disabledTools || []).includes(name),
+    __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : SEND_LATER_READY,
     Components: { isSuccessCode: status => status === 0 },
     ChromeUtils: { generateQI: () => () => {} },
     MailServices: { accounts: { accounts: [{ key: "account-1", identities: [identity] }] } },
@@ -97,11 +106,12 @@ function loadDraftTools(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("TWO DIGIT PADDING"), snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DRAFT HELPERS"), snippet("SAVE DRAFT TOOL"),
     snippet("DIRECT SEND HELPER"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   return {
-    api: sandbox, calls, hdr, identity,
+    api: sandbox, calls, hdr, identity, clock,
     save(args = {}) {
       return sandbox.dispatchTool("saveDraft", {
         to: "new@example.test", subject: "New subject", body: "New body", isHtml: false,
@@ -285,4 +295,60 @@ describe("saveDraft replacement", () => {
     assert.match((await save()).error, /Attachment preparation failed/);
     assert.equal(calls.sends.length, 0);
   });
+});
+
+describe("replacing scheduled drafts", () => {
+  const uuidHeader = "X-Send-Later-Uuid";
+  const atHeader = "X-Send-Later-At";
+  const oldAt = "Fri, 1 Jan 2027 01:00:00 +0000";
+  const newAt = "2027-02-01T12:00:00Z";
+
+  for (const legacy of [false, true]) {
+    for (const sendAt of [newAt, undefined, null]) {
+      it(`replaces the old schedule with ${sendAt}, legacy=${legacy}`, async () => {
+        const h = loadDraftTools({ legacy });
+        h.hdr.headers = new Map([[uuidHeader, "old-instance"], [atHeader, oldAt]]);
+        const result = await h.save({ sendAt });
+        assert.equal(result.success, true, result.error);
+        const native = h.calls.sends.at(-1);
+        assert.equal(native[6], Ci.nsIMsgCompDeliverMode.SaveAsDraft);
+        assert.equal(native[7], h.hdr, "replace the exact original, never append a second draft");
+        const fields = native[3];
+        if (sendAt) {
+          assert.equal(result.sendAt, new Date(newAt).toISOString());
+          assert.equal(fields.headers.get(uuidHeader), SEND_LATER_READY.uuid);
+          assert.equal(Date.parse(fields.headers.get(atHeader)), Date.parse(newAt));
+        } else {
+          assert.equal(result.sendAt, undefined);
+          assert.equal(fields.headers.has(uuidHeader), false);
+          assert.equal(fields.headers.has(atHeader), false);
+        }
+        assert.equal(h.hdr.headers.get(atHeader), oldAt, "never rewrite the old header in place");
+      });
+    }
+  }
+
+  const refusals = [
+    ["safety block", { blocked: true }, {}],
+    ["disabled sender", { disabledTools: ["sendMail"] }, {}],
+    ["missing Send Later", { info: null }, {}],
+    ["stale Send Later", { info: { ...SEND_LATER_READY, checkedAt: SEND_LATER_NOW - 180001 } }, {}],
+    ["encryption", { prefs: { "mail.identity.default.encryptionpolicy": 1 } }, {}],
+    ["missing original", { findError: "Original missing" }, {}],
+    ["inaccessible destination", { accessError: "Account restricted" }, {}],
+    ["wrong Drafts folder", { destination: { URI: OTHER_DRAFTS_URI } }, {}],
+    ["invalid date", {}, { sendAt: "2027-02-30T12:00:00Z" }],
+    ["missing recipients", {}, { to: "" }],
+  ];
+  for (const [label, options, args] of refusals) {
+    it(`leaves the existing scheduled draft untouched on ${label}`, async () => {
+      const h = loadDraftTools(options);
+      h.hdr.headers = new Map([[uuidHeader, SEND_LATER_READY.uuid], [atHeader, oldAt]]);
+      const result = await h.save({ sendAt: newAt, ...args });
+      assert.equal(typeof result.error, "string");
+      assertNoComposeSideEffects(h.calls);
+      assert.equal(h.hdr.subject, "Old subject");
+      assert.deepEqual([...h.hdr.headers], [[uuidHeader, SEND_LATER_READY.uuid], [atHeader, oldAt]]);
+    });
+  }
 });

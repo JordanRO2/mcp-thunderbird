@@ -1525,7 +1525,9 @@ function parseFilterType(raw) {
 }
 
 const LOCAL_DAY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+// BEGIN TWO DIGIT PADDING
 const pad2 = (n) => String(n).padStart(2, "0");
+// END TWO DIGIT PADDING
 const formatLocalDay = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 
 // Each codec: the hint shown in the schema and in error messages, parse(raw,
@@ -10369,6 +10371,84 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DRAFT HELPERS
 
+            // BEGIN SAVE DRAFT TOOL
+            // BEGIN SEND LATER SCHEDULING
+            const SEND_LATER_MAX_DAYS = 366;
+            const SEND_LATER_INFO_MAX_AGE_MS = 3 * 60 * 1000;
+            const SEND_LATER_PAST_TOLERANCE_MS = 60 * 1000;
+            const SEND_LATER_DAY_MS = 24 * 60 * 60 * 1000;
+            const SEND_LATER_REVIEW_INSTRUCTION = "Omit sendAt to save a plain draft, or use sendMail with skipReview: false to send through Thunderbird's review window.";
+
+            /**
+             * Formats a date as an RFC 5322 date-time in local time, the format
+             * Send Later itself writes into X-Send-Later-At.
+             */
+            function formatRfc5322Local(date) {
+              const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+              const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+              const offset = -date.getTimezoneOffset();
+              const sign = offset >= 0 ? "+" : "-";
+              const abs = Math.abs(offset);
+              return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()} ` +
+                `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())} ` +
+                `${sign}${pad2(Math.floor(abs / 60))}${pad2(abs % 60)}`;
+            }
+
+            /**
+             * Validates sendAt and returns the Send Later headers to set, or
+             * { error }. Scheduling sends without review, so it is gated by the
+             * same preference as skipReview.
+             */
+            function resolveSendLaterSchedule(sendAt) {
+              const match = typeof sendAt === "string" && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/.exec(sendAt.trim());
+              if (!match) {
+                return { error: "sendAt must be an ISO 8601 date-time such as 2026-10-17T10:00 (local time) or 2026-10-17T10:00:00+02:00" };
+              }
+              if (isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview, and a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
+              }
+              if (!isToolEnabled("sendMail")) {
+                return { error: "sendAt requires the sendMail tool to be enabled; a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
+              }
+              const now = Date.now();
+              const info = globalThis.__tbMcpSendLaterInfo;
+              if (!info || !Number.isFinite(info.checkedAt) || info.checkedAt > now ||
+                  now - info.checkedAt > SEND_LATER_INFO_MAX_AGE_MS) {
+                return { error: "Send Later add-on (sendlater3@kamens.us) is not installed, disabled, or its information is unavailable or older than 3 minutes; the draft was not saved." };
+              }
+              // A scheduled draft that Send Later will never scan would look
+              // scheduled to the caller and silently stay in Drafts.
+              if (info.sendDrafts !== true) {
+                return { error: "Send Later is installed but does not send scheduled drafts (its \"send scheduled drafts\" option is off or unreadable); the draft was not saved." };
+              }
+              if (info.sendUnsentMsgs !== true) {
+                return { error: "Send Later's \"send unsent messages\" option is off or unreadable; the draft was not saved." };
+              }
+              if (!(Number.isFinite(info.checkTimePref) && info.checkTimePref > 0)) {
+                return { error: "Send Later is installed but its check interval is 0 or unreadable, so it never sends; the draft was not saved." };
+              }
+              const [year, month, day, hour, minute, second] = match.slice(1, 7).map(value => Number(value || 0));
+              const calendarDay = new Date(0);
+              calendarDay.setUTCFullYear(year, month - 1, day);
+              if (calendarDay.getUTCFullYear() !== year || calendarDay.getUTCMonth() !== month - 1 ||
+                  calendarDay.getUTCDate() !== day || hour > 23 || minute > 59 || second > 59) {
+                return { error: "sendAt is not a valid calendar date-time" };
+              }
+              const date = new Date(sendAt.trim());
+              if (Number.isNaN(date.getTime())) return { error: "sendAt is not a valid date" };
+              // A local time in a DST gap must not silently move to a later hour.
+              if (!match[8] && (date.getFullYear() !== year || date.getMonth() !== month - 1 ||
+                  date.getDate() !== day || date.getHours() !== hour || date.getMinutes() !== minute)) {
+                return { error: "sendAt is not a valid local date-time" };
+              }
+              // RFC 5322 headers have second precision. Report the stored instant.
+              date.setUTCMilliseconds(0);
+              if (date.getTime() < now - SEND_LATER_PAST_TOLERANCE_MS) return { error: "sendAt is in the past" };
+              if (date.getTime() > now + SEND_LATER_MAX_DAYS * SEND_LATER_DAY_MS) return { error: `sendAt is more than ${SEND_LATER_MAX_DAYS} days ahead` };
+              return { uuid: info.uuid, date, header: formatRfc5322Local(date) };
+            }
+            // END SEND LATER SCHEDULING
+
             /**
              * Saves a composed message to the identity's Drafts folder without
              * sending or opening a compose window. The destination folder is
@@ -10382,63 +10462,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * correction of a saved draft would accumulate one more copy in the
              * Drafts folder, and the caller has no way to remove the stale one.
              */
-            // BEGIN SAVE DRAFT TOOL
-            // BEGIN SEND LATER SCHEDULING
-            const SEND_LATER_MAX_DAYS = 366;
-            const SEND_LATER_REVIEW_INSTRUCTION = "Omit sendAt to save a plain draft, or use sendMail with skipReview: false to send through Thunderbird's review window.";
-
-            /**
-             * Formats a date as an RFC 5322 date-time in local time, the format
-             * Send Later itself writes into X-Send-Later-At.
-             */
-            function formatRfc5322Local(date) {
-              const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-              const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-              const pad = (n) => String(n).padStart(2, "0");
-              const offset = -date.getTimezoneOffset();
-              const sign = offset >= 0 ? "+" : "-";
-              const abs = Math.abs(offset);
-              return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()} ` +
-                `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ` +
-                `${sign}${pad(Math.floor(abs / 60))}${pad(abs % 60)}`;
-            }
-
-            /**
-             * Validates sendAt and returns the Send Later headers to set, or
-             * { error }. Scheduling sends without review, so it is gated by the
-             * same preference as skipReview.
-             */
-            function resolveSendLaterSchedule(sendAt) {
-              if (typeof sendAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?$/.test(sendAt.trim())) {
-                return { error: "sendAt must be an ISO 8601 date-time such as 2026-10-17T10:00 (local time) or 2026-10-17T10:00:00+02:00" };
-              }
-              if (isSkipReviewBlocked()) {
-                return { error: "User preference blocks skipReview, and a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
-              }
-              if (!isToolEnabled("sendMail")) {
-                return { error: "sendAt requires the sendMail tool to be enabled; a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
-              }
-              const info = globalThis.__tbMcpSendLaterInfo;
-              if (!info || typeof info.uuid !== "string" || !info.uuid) {
-                return { error: "Send Later add-on (sendlater3@kamens.us) is not installed, disabled, or has not answered yet; the draft was not saved." };
-              }
-              // A scheduled draft that Send Later will never scan would look
-              // scheduled to the caller and silently stay in Drafts.
-              if (info.sendDrafts !== true) {
-                return { error: "Send Later is installed but does not send scheduled drafts (its \"send scheduled drafts\" option is off or unreadable); the draft was not saved." };
-              }
-              if (!(typeof info.checkTimePref === "number" && info.checkTimePref > 0)) {
-                return { error: "Send Later is installed but its check interval is 0 or unreadable, so it never sends; the draft was not saved." };
-              }
-              const date = new Date(sendAt.trim());
-              if (Number.isNaN(date.getTime())) return { error: "sendAt is not a valid date" };
-              const now = Date.now();
-              if (date.getTime() < now - 60000) return { error: "sendAt is in the past" };
-              if (date.getTime() > now + SEND_LATER_MAX_DAYS * 86400000) return { error: `sendAt is more than ${SEND_LATER_MAX_DAYS} days ahead` };
-              return { uuid: info.uuid, date, header: formatRfc5322Local(date) };
-            }
-            // END SEND LATER SCHEDULING
-
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt) {
               try {
                 // Omitted or null sendAt keeps the plain draft behavior unchanged.
@@ -12864,20 +12887,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
         // END OPTIONS ACCESS API
 
-        // Called by background.js with what Send Later answered (or null).
+        // BEGIN SEND LATER INFO API
+        // Called only by background.js; identifiers must survive header emission
+        // unchanged. Accept historical formats, never trim or repair them.
         setSendLaterInfo: async function(info) {
-          if (info && typeof info.uuid === "string" && info.uuid) {
+          const uuid = info?.uuid;
+          if (typeof uuid === "string" && uuid.length > 0 && uuid.length <= 64 &&
+              !/[^\x21-\x7e]/.test(uuid) && Number.isFinite(info.checkedAt) && info.checkedAt <= Date.now()) {
             globalThis.__tbMcpSendLaterInfo = {
-              uuid: info.uuid,
-              version: typeof info.version === "string" ? info.version : null,
+              uuid,
+              checkedAt: info.checkedAt,
               sendDrafts: typeof info.sendDrafts === "boolean" ? info.sendDrafts : null,
-              checkTimePref: typeof info.checkTimePref === "number" ? info.checkTimePref : null,
+              sendUnsentMsgs: typeof info.sendUnsentMsgs === "boolean" ? info.sendUnsentMsgs : null,
+              checkTimePref: Number.isFinite(info.checkTimePref) ? info.checkTimePref : null,
             };
           } else {
             globalThis.__tbMcpSendLaterInfo = null;
           }
           return { success: true };
         },
+        // END SEND LATER INFO API
 
         getBlockSkipReview: async function() {
           let blocked = true;

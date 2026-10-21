@@ -14,6 +14,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 
@@ -35,6 +36,7 @@ const Ci = {
 };
 
 function loadSaveDraft(options = {}) {
+  const clock = makeSendLaterClock();
   const sent = [];
   const calls = { attachments: 0, signatures: 0 };
   const composeFields = {
@@ -53,12 +55,10 @@ function loadSaveDraft(options = {}) {
   const sandbox = {
     Ci,
     Services: { prefs: makeDirectSendPrefs(options.prefs) },
-    Date,
+    Date: clock.Date,
     isSkipReviewBlocked: () => options.blocked === true,
     isToolEnabled: name => !(options.disabledTools || []).includes(name),
-    __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : {
-      uuid: "draft-test-instance", sendDrafts: true, checkTimePref: 1,
-    },
+    __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : SEND_LATER_READY,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => composeFields },
@@ -86,6 +86,7 @@ function loadSaveDraft(options = {}) {
 
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("TWO DIGIT PADDING"),
     snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DRAFT HELPERS"),
     snippet("SAVE DRAFT TOOL"),
@@ -94,7 +95,7 @@ function loadSaveDraft(options = {}) {
   ].join("\n"), sandbox);
 
   return {
-    saveDraft: sandbox.saveDraft, composeFields, sent, calls,
+    saveDraft: sandbox.saveDraft, composeFields, sent, calls, clock,
     save: args => sandbox.dispatchTool("saveDraft", { to: "a@example.com", subject: "Hi", body: "body", ...args }),
   };
 }
@@ -259,15 +260,20 @@ describe("saveDraft threading", () => {
 });
 
 describe("saveDraft scheduling permissions and identity policy", () => {
-  const future = () => new Date(Date.now() + 3600000).toISOString();
+  const future = () => new Date(SEND_LATER_NOW + 3600000).toISOString();
   const identityPrefix = "mail.identity.default.";
   const autoEnable = "mail.e2ee.auto_enable";
   const refusals = [
     ["Block skipReview", { blocked: true }, {}, /blocks skipReview/],
     ["disabled sendMail", { disabledTools: ["sendMail"] }, {}, /requires the sendMail tool/],
     ["unavailable add-on", { info: null }, {}, /not installed/],
-    ["disabled draft sending", { info: { uuid: "instance", sendDrafts: false } }, {}, /does not send scheduled drafts/],
-    ["disabled scan", { info: { uuid: "instance", sendDrafts: true, checkTimePref: 0 } }, {}, /check interval/],
+    ["disabled draft sending", { info: { ...SEND_LATER_READY, sendDrafts: false } }, {}, /does not send scheduled drafts/],
+    ["disabled scan", { info: { ...SEND_LATER_READY, checkTimePref: 0 } }, {}, /check interval/],
+    ["unsent sending off", { info: { ...SEND_LATER_READY, sendUnsentMsgs: false } }, {}, /send unsent messages/],
+    ["stale information", { info: { ...SEND_LATER_READY, checkedAt: SEND_LATER_NOW - 180001 } }, {}, /older than 3 minutes/],
+    ["calendar rollover", {}, { sendAt: "2027-02-30T10:00:00Z" }, /valid calendar/],
+    ["past date", {}, { sendAt: "2026-12-31T23:00:00Z" }, /in the past/],
+    ["distant date", {}, { sendAt: "2028-02-01T00:00:00Z" }, /366 days/],
     ["missing recipients", {}, { to: "", cc: " \t", bcc: "" }, /at least one recipient/],
     ["restricted identity", { identityError: "identity belongs to a restricted account" }, {}, /restricted account/],
     ["invalid threading", {}, { inReplyTo: "bad" }, /inReplyTo/],

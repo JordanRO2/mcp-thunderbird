@@ -20,33 +20,46 @@ browser.runtime.onStartup.addListener(init);
 // Also call init() directly — the event listeners above don't fire when
 // a user disables and re-enables the extension.
 init();
-// Send Later (sendlater3@kamens.us) sends a draft only when its
-// X-Send-Later-Uuid header matches its own instance UUID. Ask it for that
-// UUID, and for the preferences that decide whether it sends at all, through
-// its external messaging API so saveDraft can schedule drafts. A failed
-// request clears the info, so scheduling is refused within a minute of Send
-// Later being disabled or removed.
+
+// Send Later discovery is advisory: a failure or timeout clears readiness.
+// The Experiment also expires a successful snapshot after three minutes.
 const SEND_LATER_ID = "sendlater3@kamens.us";
+const SEND_LATER_REFRESH_INTERVAL_MS = 60 * 1000;
+const SEND_LATER_REFRESH_TIMEOUT_MS = 10 * 1000;
+let sendLaterRefreshGeneration = 0;
 
 async function refreshSendLaterInfo() {
-  let info = {};
+  const generation = ++sendLaterRefreshGeneration;
+  const checkedAt = Date.now();
+  let timeout;
+  let info = null;
   try {
-    const uuid = await browser.runtime.sendMessage(SEND_LATER_ID, { action: "getUUID" });
-    const version = await browser.runtime.sendMessage(SEND_LATER_ID, { action: "getVersion" });
-    const prefs = await browser.runtime.sendMessage(SEND_LATER_ID, { action: "getPreferences" });
-    if (typeof uuid === "string" && uuid) {
+    const answers = await Promise.race([
+      Promise.all([
+        browser.runtime.sendMessage(SEND_LATER_ID, { action: "getUUID" }),
+        browser.runtime.sendMessage(SEND_LATER_ID, { action: "getPreferences" }),
+      ]),
+      new Promise(resolve => { timeout = setTimeout(() => resolve(null), SEND_LATER_REFRESH_TIMEOUT_MS); }),
+    ]);
+    // Check elapsed time as well: suspended/throttled timers may fire late.
+    const elapsed = Date.now() - checkedAt;
+    if (answers && elapsed >= 0 && elapsed < SEND_LATER_REFRESH_TIMEOUT_MS) {
+      const [uuid, prefs] = answers;
       info = {
         uuid,
-        version: typeof version === "string" ? version : "",
-        // Send Later only scans Drafts when sendDrafts is on and its check
-        // interval (minutes) is above zero.
-        sendDrafts: prefs ? prefs.sendDrafts : undefined,
-        checkTimePref: prefs ? prefs.checkTimePref : undefined,
+        checkedAt,
+        sendDrafts: prefs?.sendDrafts,
+        sendUnsentMsgs: prefs?.sendUnsentMsgs,
+        checkTimePref: prefs?.checkTimePref,
       };
     }
   } catch {
-    // Not installed, disabled, or not started yet: scheduling stays unavailable.
+    // Absent, disabled or unreadable: refuse scheduling without console noise.
+  } finally {
+    clearTimeout(timeout);
   }
+  // An earlier request must never replace a newer success or clear its state.
+  if (generation !== sendLaterRefreshGeneration) return;
   try {
     await browser.mcpServer.setSendLaterInfo(info);
   } catch (e) {
@@ -55,4 +68,4 @@ async function refreshSendLaterInfo() {
 }
 
 refreshSendLaterInfo();
-setInterval(refreshSendLaterInfo, 60 * 1000);
+setInterval(refreshSendLaterInfo, SEND_LATER_REFRESH_INTERVAL_MS);

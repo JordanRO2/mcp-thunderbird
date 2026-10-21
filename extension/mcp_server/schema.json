@@ -192,13 +192,13 @@
         "name": "setSendLaterInfo",
         "type": "function",
         "async": true,
-        "description": "Record the Send Later add-on instance UUID and version (null when absent). Called by the background script; not exposed over MCP.",
+        "description": "Record Send Later readiness from a bounded background refresh, or clear it when unavailable. Called only by the background script; not exposed over MCP.",
         "parameters": [
           {
             "name": "info",
             "type": "any",
             "optional": true,
-            "description": "{ uuid, version } as answered by Send Later, or an empty object."
+            "description": "{ uuid, checkedAt, sendDrafts, sendUnsentMsgs, checkTimePref }, or null. checkedAt is the refresh start time in Unix milliseconds; snapshots older than three minutes cannot schedule delivery."
           }
         ]
       }

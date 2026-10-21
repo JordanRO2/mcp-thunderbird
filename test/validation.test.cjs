@@ -2129,3 +2129,26 @@ describe('Outbound attachment failures are atomic', () => {
     }
   });
 });
+
+describe('saveDraft dedicated scheduling schema', () => {
+  const runtime = loadProductionAttachmentValidation();
+  vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'), runtime);
+
+  it('accepts optional scheduling and null through the production validator', () => {
+    for (const sendAt of [undefined, null, '2027-01-01T12:00:00Z']) {
+      assert.equal(runtime.validateToolArgs('saveDraft', { sendAt }).length, 0);
+    }
+  });
+
+  it('rejects raw header writing, caller UUIDs, and a saveDraft skipReview shortcut', () => {
+    for (const [name, value] of [['headers', { 'X-Send-Later-At': 'tomorrow' }], ['uuid', 'caller-instance'], ['skipReview', true]]) {
+      assert.match(runtime.validateToolArgs('saveDraft', { [name]: value })[0], /Unknown parameter/);
+    }
+  });
+
+  it('rejects wrong-type scheduling arguments', () => {
+    for (const sendAt of [42, true, {}, []]) {
+      assert.ok(runtime.validateToolArgs('saveDraft', { sendAt }).length > 0);
+    }
+  });
+});
