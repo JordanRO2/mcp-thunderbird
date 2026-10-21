@@ -353,6 +353,7 @@ describe("direct send identity policy changes while the original is being classi
           prefs: { [`${identityPrefix}openpgp_key_id`]: "ABCD" },
         });
         const pending = h.run(tool);
+        await Promise.resolve();
         assert.equal(h.calls.mime, 1);
         assert.deepEqual(h.calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
         assert.equal(h.calls.sends.length, 0);

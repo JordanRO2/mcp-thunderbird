@@ -8283,6 +8283,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Ceiling for synchronous raw-MIME work on a whole stored message.
             const RAW_MESSAGE_MAX_BYTES = 50 * 1024 * 1024;
             const MESSAGE_STREAM_DEADLINE_ERROR = "message read deadline exceeded";
+            const MESSAGE_STREAM_ZERO_ERROR = "Message has zero size - cannot read raw source";
+            const MESSAGE_READ_STOPPED_ERROR = "Message read stopped";
 
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
@@ -8336,7 +8338,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            const RAW_SERVER_FETCH_TIMEOUT_MS = 120000;
+            const MESSAGE_READ_TIMEOUT_MS = 120000;
+            const MESSAGE_READ_OUTPUT_MAX_BYTES = RAW_MESSAGE_MAX_BYTES;
+
+            // Keep native errors (which can contain store paths) in the log.
+            // Only the bounded reader's known outcomes are safe to disclose.
+            function getMessageReadFailure(error, fallback) {
+              console.error("thunderbird-mcp: message read failed:", error);
+              if (error?.isStreamSizeLimit) return `message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`;
+              if (error?.message === MESSAGE_STREAM_DEADLINE_ERROR) return MESSAGE_STREAM_DEADLINE_ERROR;
+              if (error?.message === MESSAGE_STREAM_ZERO_ERROR) return MESSAGE_STREAM_ZERO_ERROR;
+              return fallback;
+            }
+
+            // findMessage owns the account/folder check; the dispatcher check is
+            // insufficient once a read has yielded to changes in Tool Access.
+            function getMessageReadAccessError(toolName, messageId, folderPath) {
+              if (!isToolEnabled(toolName)) return `Tool '${toolName}' is disabled in extension options`;
+              return findMessage(messageId, folderPath).error || null;
+            }
 
             /**
              * Reads a message's complete raw source. An IMAP message's local copy
@@ -8347,55 +8367,86 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * originals. Rejects on failure, timeout, or more than
              * RAW_MESSAGE_MAX_BYTES.
              */
-            function readCompleteRawMessage(msgHdr) {
+            function readCompleteRawMessage(msgHdr, { deadline = Date.now() + MESSAGE_READ_TIMEOUT_MS, checkAccess = () => {}, pending } = {}) {
+              const check = () => {
+                checkAccess();
+                if (Date.now() >= deadline) throw new Error(MESSAGE_STREAM_DEADLINE_ERROR);
+              };
               const isImap = msgHdr.folder?.server?.type === "imap";
-              if (!isImap || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
-                let stream = null;
-                try {
-                  // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
-                  stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
-                  return Promise.resolve(readMessageStreamFully(stream));
-                } catch (e) {
-                  return Promise.reject(e);
-                } finally {
-                  if (stream) try { stream.close(); } catch { /* ignore */ }
+              try {
+                check();
+                if (!isImap || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
+                  let raw;
+                  try {
+                    raw = readBoundedRawMessage(msgHdr, deadline);
+                    if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
+                  } catch (error) {
+                    check();
+                    // A stale Offline flag may hide a missing local store. Size
+                    // failures are final, even when the server could be retried.
+                    if (!isImap || error?.isStreamSizeLimit || error?.message === MESSAGE_STREAM_DEADLINE_ERROR) throw error;
+                  }
+                  check();
+                  if (raw) return Promise.resolve(raw);
                 }
+              } catch (error) {
+                return Promise.reject(error);
               }
               return new Promise((resolve, reject) => {
                 let settled = false;
                 let request = null;
                 let raw = "";
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                let timer = null;
+                const cancel = () => settle(new Error(MESSAGE_STREAM_DEADLINE_ERROR));
                 const settle = (error) => {
                   if (settled) return;
                   settled = true;
-                  try { timer.cancel(); } catch { /* already fired */ }
+                  pending?.delete(cancel);
+                  try { timer?.cancel(); } catch { /* already fired */ }
                   if (error) {
                     try { request?.cancel(Cr.NS_BINDING_ABORTED); } catch { /* finished */ }
+                    raw = "";
                     reject(error);
                   } else {
                     resolve(raw);
                   }
                 };
-                timer.initWithCallback({
-                  notify() { settle(new Error("raw message fetch from the server timed out")); },
-                }, RAW_SERVER_FETCH_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
                 try {
+                  pending?.add(cancel);
+                  check();
+                  timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback({ notify: cancel }, Math.max(1, deadline - Date.now()), Ci.nsITimer.TYPE_ONE_SHOT);
+                  if (settled) return;
+                  check();
                   const msgURI = msgHdr.folder.getUriForMsg(msgHdr);
-                  MailServices.messageServiceFromURI(msgURI).streamMessage(msgURI, {
+                  const service = MailServices.messageServiceFromURI(msgURI);
+                  if (settled) return;
+                  check();
+                  service.streamMessage(msgURI, {
                     QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
-                    onStartRequest(startedRequest) { request = startedRequest; },
+                    onStartRequest(startedRequest) {
+                      if (settled) {
+                        try { startedRequest.cancel(Cr.NS_BINDING_ABORTED); } catch {}
+                        return;
+                      }
+                      request = startedRequest;
+                      try { check(); } catch (error) { settle(error); }
+                    },
                     onDataAvailable(_request, stream, _offset, count) {
                       if (settled) return;
                       try {
+                        check();
                         if (count > RAW_MESSAGE_MAX_BYTES - raw.length) {
-                          settle(new Error(`message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`));
-                          return;
+                          const error = new Error(`message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`);
+                          error.isStreamSizeLimit = true;
+                          throw error;
                         }
                         while (count > 0) {
+                          check();
                           const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
                           const bytes = NetUtil.readInputStreamToString(stream, length);
                           if (bytes.length !== length) throw new Error("message stream read made no progress");
+                          check();
                           raw += bytes;
                           count -= length;
                         }
@@ -8404,12 +8455,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     },
                     onStopRequest(_request, status) {
-                      request = null;
-                      if (!Components.isSuccessCode(status)) {
-                        settle(new Error(`raw message fetch failed (status 0x${status.toString(16)})`));
-                        return;
+                      if (settled) return;
+                      try {
+                        check();
+                        if (!Components.isSuccessCode(status)) throw new Error(`raw message fetch failed (status 0x${status.toString(16)})`);
+                        if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
+                        request = null;
+                        settle(null);
+                      } catch (error) {
+                        settle(error);
                       }
-                      settle(null);
                     },
                   }, null, null, false, "", false);
                 } catch (e) {
@@ -10193,12 +10248,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // examineEncryptedParts disabled. Prove the stored MIME is clear
             // before invoking it. Reuse the strict raw checks to reject names
             // and syntax that libmime could interpret as protected content.
-            function getDirectSendOriginal(msgHdr) {
+            function getDirectSendOriginal(msgHdr, checkAccess = () => {}) {
               return new Promise(resolve => {
                 const deadline = Date.now() + DIRECT_SEND_PREFLIGHT_TIMEOUT_MS;
                 let settled = false;
                 let timer = null;
-                let rawRequest = null;
+                const pending = new Set();
                 let failure = DIRECT_SEND_RAW_ERROR;
                 // Reuse the send helper's settle-once timer pattern. Gloda has
                 // no public cancellation handle, so ignore every late callback.
@@ -10207,14 +10262,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   settled = true;
                   try { timer?.cancel(); } catch {}
                   timer = null;
-                  try { rawRequest?.cancel(Cr.NS_BINDING_ABORTED); } catch {}
-                  rawRequest = null;
+                  for (const cancel of pending) { try { cancel(); } catch {} }
+                  pending.clear();
+                  try { checkAccess(); } catch (error) { result = { error: error.message }; }
                   resolve(Date.now() >= deadline ? { error: failure } : result);
+                };
+                const canContinue = () => {
+                  if (settled) return false;
+                  try {
+                    checkAccess();
+                    if (Date.now() >= deadline) throw new Error(failure);
+                    return true;
+                  } catch (error) {
+                    settle({ error: error.message });
+                    return false;
+                  }
                 };
                 // Both local reads and raw-only IMAP retrieval feed the same
                 // existing classification and structured checks.
                 const inspectRaw = raw => {
-                  if (settled) return;
+                  if (!canContinue()) return;
                   failure = DIRECT_SEND_ORIGINAL_ERROR;
                   try {
                     if (settled || Date.now() >= deadline ||
@@ -10226,14 +10293,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
                       "resource:///modules/gloda/MimeMessage.sys.mjs"
                     );
-                    if (settled || Date.now() >= deadline) {
+                    if (!canContinue()) {
                       settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                       return;
                     }
                     // An uncached original may still need downloading for Gloda.
                     // Its raw bytes have already passed the non-decrypting guard.
                     MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
-                      if (settled) return;
+                      if (!canContinue()) return;
                       try {
                         if (!isDirectSendMimeComplete(mime, deadline)) {
                           settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
@@ -10259,69 +10326,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   timer.initWithCallback({
                     notify() { settle({ error: failure }); },
                   }, DIRECT_SEND_PREFLIGHT_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-                  if (settled || Date.now() >= deadline) {
-                    settle({ error: failure });
-                    return;
-                  }
-                  let raw;
-                  try {
-                    raw = readBoundedRawMessage(msgHdr, deadline);
-                  } catch (error) {
-                    if (error?.isStreamSizeLimit || Date.now() >= deadline ||
-                        msgHdr.folder.server.type !== "imap") {
-                      settle({ error: failure });
-                      return;
-                    }
-                    // Searched for raw streaming: readBoundedRawMessage is local
-                    // only. Reuse the listener probe's bounded read/cancel pattern
-                    // with the message service's converter explicitly disabled.
-                    raw = "";
-                    const msgURI = msgHdr.folder.getUriForMsg(msgHdr);
-                    MailServices.messageServiceFromURI(msgURI).streamMessage(msgURI, {
-                      QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
-                      onStartRequest(request) {
-                        rawRequest = request;
-                        if (settled) {
-                          try { request.cancel(Cr.NS_BINDING_ABORTED); } catch {}
-                          rawRequest = null;
-                        } else if (Date.now() >= deadline) {
-                          settle({ error: failure });
-                        }
-                      },
-                      onDataAvailable(_request, stream, _offset, count) {
-                        if (settled) return;
-                        try {
-                          if (Date.now() >= deadline || count > RAW_MESSAGE_MAX_BYTES - raw.length) {
-                            settle({ error: failure });
-                            return;
-                          }
-                          while (count > 0) {
-                            const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
-                            const bytes = NetUtil.readInputStreamToString(stream, length);
-                            if (bytes.length !== length || Date.now() >= deadline) {
-                              settle({ error: failure });
-                              return;
-                            }
-                            raw += bytes;
-                            count -= length;
-                          }
-                        } catch {
-                          settle({ error: failure });
-                        }
-                      },
-                      onStopRequest(_request, status) {
-                        rawRequest = null;
-                        if (settled) return;
-                        if (!Components.isSuccessCode(status) || Date.now() >= deadline) {
-                          settle({ error: failure });
-                          return;
-                        }
-                        inspectRaw(raw);
-                      },
-                    }, null, null, false, "", false);
-                    return;
-                  }
-                  inspectRaw(raw);
+                  if (!canContinue()) return;
+                  readCompleteRawMessage(msgHdr, { deadline, checkAccess, pending })
+                    .then(inspectRaw)
+                    .catch(() => settle({ error: failure }));
                 } catch {
                   settle({ error: failure });
                 }

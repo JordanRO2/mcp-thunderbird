@@ -73,6 +73,7 @@ function loadPreflight(options = {}) {
   const hdr = {
     folder, messageId: "original@example.test", subject: "Original",
     author: "author@example.test", recipients: "recipient@example.test", date: 0,
+    flags: options.offline ?? !options.uncached ? 0x80 : 0,
   };
   const sandbox = {
     TextDecoder, Uint8Array, atob, btoa,
@@ -82,6 +83,7 @@ function loadPreflight(options = {}) {
     Services: { prefs: makeDirectSendPrefs() },
     Ci: {
       nsIPrefBranch: prefTypes, nsITimer: { TYPE_ONE_SHOT: 0 },
+      nsMsgMessageFlags: { Offline: 0x80 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompFormat: { Default: 0, HTML: 1, PlainText: 2 },
       nsIMsgCompDeliverMode: { Now: 0 },
@@ -209,6 +211,7 @@ function loadPreflight(options = {}) {
     filePathsToAttachDescs: attachments.convert,
     descsToMsgAttachments: attachments.toNative,
     isSkipReviewBlocked: () => false,
+    isToolEnabled: () => true,
     getReplyAllCcRecipients: () => "",
     PREF_ALLOW_ENCRYPTED_MESSAGES: "encrypted",
     isPrivacyOptInEnabled: () => true,
@@ -314,7 +317,7 @@ if (require.main === module) describe("direct-send preflight retrieves uncached 
         const h = loadPreflight({ uncached: true, synchronousFetch });
         const result = await h.run(tool);
         assert.equal(result.success, true, result.error);
-        assert.equal(h.calls.rawOpenAttempts, 1);
+        assert.equal(h.calls.rawOpenAttempts, 0);
         assert.equal(h.calls.rawOpens, 0);
         assert.deepEqual(h.calls.rawServices, ["message-uri"]);
         assert.equal(h.calls.rawFetches.length, 1);
@@ -463,7 +466,7 @@ if (require.main === module) describe("direct-send preflight retrieves uncached 
       assert.equal(h.calls.imports, 0);
     });
     it(`${tool}: an expired cache read does not start an IMAP download`, async () => {
-      const h = loadPreflight({ uncached: true, openDuration: TIME_LIMIT });
+      const h = loadPreflight({ uncached: true, offline: true, openDuration: TIME_LIMIT });
       assertPreflightRefused(h, await h.run(tool));
       assert.equal(h.calls.rawFetches.length, 0);
       assert.equal(h.calls.imports, 0);
@@ -777,6 +780,7 @@ if (require.main === module) describe("direct-send preflight deadline and late c
       it(`${tool}: callback at ${elapsed} ms obeys the deadline without relying on timer scheduling`, async () => {
         const h = loadPreflight({ deferMime: true });
         const pending = h.run(tool);
+        await Promise.resolve();
         assert.equal(h.calls.mime.length, 1);
         h.clock.now += elapsed;
         h.calls.deliverMime({ contentType: "text/plain", body: "Original text" });
@@ -793,6 +797,7 @@ if (require.main === module) describe("direct-send preflight deadline and late c
     it(`${tool}: timeout settles once and ignores late callbacks without reading their MIME`, async () => {
       const h = loadPreflight({ deferMime: true });
       const pending = h.run(tool);
+      await Promise.resolve();
       const timer = h.calls.timers[0];
       assert.equal(timer.delay, TIME_LIMIT);
       h.clock.now += TIME_LIMIT;
@@ -813,6 +818,7 @@ if (require.main === module) describe("direct-send preflight deadline and late c
     it(`${tool}: elapsed deadline before the awaiting tool resumes prevents attachment conversion`, async () => {
       const h = loadPreflight();
       const pending = h.run(tool);
+      await Promise.resolve();
       assert.equal(h.calls.mime.length, 1);
       assert.equal(h.calls.timers[0].cancelled, true, "The callback completed before the tool resumed");
       h.clock.now += TIME_LIMIT;
@@ -821,6 +827,7 @@ if (require.main === module) describe("direct-send preflight deadline and late c
     it(`${tool}: repeated callbacks after success cannot compose or send again`, async () => {
       const h = loadPreflight({ deferMime: true });
       const pending = h.run(tool);
+      await Promise.resolve();
       h.calls.deliverMime({ contentType: "text/plain", body: "Original text" });
       assert.equal((await pending).success, true);
       h.calls.deliverMime({ contentType: "text/plain", body: "duplicate callback" });
