@@ -1326,6 +1326,7 @@ const REFRESH_MAX_TIMEOUT_MS = 25000;
 const REFRESH_ABANDON_MS = 60000;
 const REFRESH_TIMEOUT_DESCRIPTION = `Maximum wait in ms (default ${REFRESH_DEFAULT_TIMEOUT_MS}); clamped to ${REFRESH_MIN_TIMEOUT_MS}-${REFRESH_MAX_TIMEOUT_MS}.`;
 const REFRESH_OFFLINE_ERROR = "Thunderbird is offline; switch it online to refresh.";
+const REFRESH_COMPLETION_DESCRIPTION = "Completion is best effort: a timer cannot interrupt synchronous provider work.";
 
 function clampRefreshTimeout(timeoutMs) {
   const n = Number(timeoutMs);
@@ -2558,7 +2559,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshCalendar",
         group: "calendar", crud: "read",
         title: "Refresh Calendar",
-        description: "Synchronize a calendar with its server and wait for completion -- Thunderbird's Synchronize button, for making events created, accepted or changed elsewhere (e.g. an invite sent from Outlook or the web) visible to listEvents. Uses the calendar's own refresh, so it works for any network calendar (Exchange/Owl, CalDAV, Google). Omit calendarId to refresh every enabled calendar that can be refreshed. Local calendars are skipped. The wait is bounded by timeoutMs; on timeout the sync keeps running in Thunderbird, a timeout result is returned, and a repeat call joins the running sync instead of starting another.",
+        description: `Refresh a calendar, or all enabled refreshable calendars if calendarId is omitted, using its provider (built-in Exchange, Owl, CalDAV, Google). Non-refreshable calendars are skipped. A completed load after a provider error returns a warning; without completion, the error is returned. Silence returns timeout, completion unconfirmed. Offline calls fail. ${REFRESH_COMPLETION_DESCRIPTION}`,
         inputSchema: {
           type: "object",
           properties: {
@@ -2949,11 +2950,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshFolder",
         group: "messages", crud: "read",
         title: "Refresh Folder",
-        description: "Sync a folder with its server and wait for completion -- the Get Messages button, for making mail sent, received or moved elsewhere visible to searchMessages/getMessage. Works on IMAP and on add-on accounts that implement their own folders (e.g. Owl for Exchange/Office 365). Pass an account root to refresh its Inbox and check-new folders, as Get Messages does. Returns message and unread counts before/after, and netMessageDelta (a net count change, not a count of arrivals: an expunge or filter move can cancel out new mail). Local, POP, RSS and news folders are skipped. The wait is bounded by timeoutMs; on timeout the sync keeps running in Thunderbird, a timeout result is returned, and a repeat call joins the running sync instead of starting another.",
+        description: `Refresh one IMAP, built-in Exchange (EWS/Graph), or Owl folder. Returns before/after counts and netMessageDelta (net change, not arrivals). loaded means Thunderbird reported loading; updateConfirmed requires a successful update URL. Warnings explain unconfirmed updates or a busy folder where no update ran. Account roots, saved searches and no-select folders are refused; local, POP, RSS and news folders are skipped. Offline calls fail. ${REFRESH_COMPLETION_DESCRIPTION}`,
         inputSchema: {
           type: "object",
           properties: {
-            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh, or an account root URI to refresh that account's Inbox and check-new folders. Saved-search and IMAP no-select folders are rejected." },
+            folderPath: { type: "string", description: "Folder URI from listFolders. Select an individual folder; account roots, saved searches and no-select folders are refused." },
             timeoutMs: { type: "integer", minimum: REFRESH_MIN_TIMEOUT_MS, maximum: REFRESH_MAX_TIMEOUT_MS, description: REFRESH_TIMEOUT_DESCRIPTION },
           },
           required: ["folderPath"],
