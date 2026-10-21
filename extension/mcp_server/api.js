@@ -2460,6 +2460,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
+        name: "refreshCalendar",
+        group: "calendar", crud: "read",
+        title: "Refresh Calendar",
+        description: "Synchronize a calendar with its server and wait for completion -- Thunderbird's Synchronize button, for making events created, accepted or changed elsewhere (e.g. an invite sent from Outlook or the web) visible to listEvents. Uses the calendar's own refresh, so it works for any network calendar (Exchange/Owl, CalDAV, Google). Omit calendarId to refresh every enabled calendar that can be refreshed. Local calendars are skipped. The wait is bounded by timeoutMs; on timeout the sync keeps running in Thunderbird, a timeout result is returned, and a repeat call joins the running sync instead of starting another.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            calendarId: { type: "string", description: "Calendar ID (from listCalendars). If omitted, refreshes all enabled calendars that support refresh." },
+            timeoutMs: { type: "integer", minimum: 1000, maximum: 25000, description: "Max ms to wait for the sync to complete (default 15000). Clamped to 1000-25000 to stay below the stdio bridge's HTTP request timeout (30000ms)." },
+          },
+          required: [],
+        },
+      },
+      {
         name: "createEvent",
         group: "calendar", crud: "create",
         title: "Create Event",
@@ -2832,6 +2846,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             moveTo: { type: "string", description: "Destination folder URI for moving messages (optional). Cannot be used with copyTo or trash." },
             copyTo: { type: "string", description: "Destination folder URI for copying messages without removing the source (optional), within or across accessible accounts. On Gmail, adds the destination label while preserving existing labels. Cannot be used with moveTo or trash." },
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo or copyTo." },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
+        name: "refreshFolder",
+        group: "messages", crud: "read",
+        title: "Refresh Folder",
+        description: "Sync a folder with its server and wait for completion -- the Get Messages button, for making mail sent, received or moved elsewhere visible to searchMessages/getMessage. Works on IMAP and on add-on accounts that implement their own folders (e.g. Owl for Exchange/Office 365). Pass an account root to refresh its Inbox and check-new folders, as Get Messages does. Returns message and unread counts before/after, and netMessageDelta (a net count change, not a count of arrivals: an expunge or filter move can cancel out new mail). Local, POP, RSS and news folders are skipped. The wait is bounded by timeoutMs; on timeout the sync keeps running in Thunderbird, a timeout result is returned, and a repeat call joins the running sync instead of starting another.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh, or an account root URI to refresh that account's Inbox and check-new folders. Saved-search and IMAP no-select folders are rejected." },
+            timeoutMs: { type: "integer", minimum: 1000, maximum: 25000, description: "Max ms to wait for the sync to complete (default 15000). Clamped to 1000-25000 to stay below the stdio bridge's HTTP request timeout (30000ms)." },
           },
           required: ["folderPath"],
         },
@@ -6340,6 +6368,156 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: e.toString() };
               }
             }
+
+            // refreshCalendar: the Synchronize button for calendars. Calls the
+            // calendar's own refresh() -- Thunderbird's generic sync entry
+            // point, used by its Synchronize command and refresh timer for
+            // every provider (Owl/Exchange, CalDAV, Google) -- and waits for the
+            // onLoad notification that ends the sync. For a cached calendar,
+            // onLoad fires only after the offline cache is re-synchronised, so
+            // listEvents sees the result as soon as this returns.
+            //
+            // As in Thunderbird, only enabled calendars with canRefresh are
+            // refreshed; local storage calendars have no server and are skipped.
+            //
+            // One sync per calendar at a time: a second call joins the running
+            // one. The timeout bounds the wait, not the work -- the slot stays
+            // taken until the sync really ends (or CAL_REFRESH_ABANDON_MS passes).
+            const CAL_REFRESH_DEFAULT_TIMEOUT_MS = 15000;
+            const CAL_REFRESH_MAX_TIMEOUT_MS = 25000;
+            const CAL_REFRESH_MIN_TIMEOUT_MS = 1000;
+            const CAL_REFRESH_ABANDON_MS = 300000;
+            const calendarRefreshInFlight = new Map(); // calendar id -> completion Promise
+
+            function clampCalendarRefreshTimeout(timeoutMs) {
+              const n = Number(timeoutMs);
+              if (!Number.isFinite(n) || n <= 0) return CAL_REFRESH_DEFAULT_TIMEOUT_MS;
+              return Math.min(Math.max(Math.floor(n), CAL_REFRESH_MIN_TIMEOUT_MS), CAL_REFRESH_MAX_TIMEOUT_MS);
+            }
+
+            function calendarRefreshTimer(ms, callback) {
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+              return timer;
+            }
+
+            // Start a sync. Returns a Promise that settles with
+            // { status: "loaded" | "error" | "abandoned", error?, warning? }.
+            function startCalendarSync(calendar) {
+              const id = calendar.id;
+              const completion = new Promise(resolve => {
+                let settled = false;
+                let abandonTimer = null;
+                let observer = null;
+                // Providers can report non-fatal errors mid-sync and still
+                // finish with onLoad; keep the last one rather than stopping.
+                let lastError = null;
+                const settle = (outcome) => {
+                  if (settled) return;
+                  settled = true;
+                  if (abandonTimer) abandonTimer.cancel();
+                  if (observer) {
+                    try { calendar.removeObserver(observer); } catch {}
+                  }
+                  if (lastError && outcome.status === "loaded") outcome.warning = lastError;
+                  if (lastError && !outcome.error && outcome.status !== "loaded") outcome.error = lastError;
+                  resolve(outcome);
+                };
+                const isThisCalendar = (c) => !c || c.id === id;
+                abandonTimer = calendarRefreshTimer(CAL_REFRESH_ABANDON_MS, () => settle({ status: "abandoned" }));
+                observer = {
+                  QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
+                  onStartBatch() {},
+                  onEndBatch() {},
+                  onLoad(aCalendar) {
+                    if (isThisCalendar(aCalendar)) settle({ status: "loaded" });
+                  },
+                  onAddItem() {},
+                  onModifyItem() {},
+                  onDeleteItem() {},
+                  onError(aCalendar, errNo, message) {
+                    if (isThisCalendar(aCalendar)) {
+                      lastError = message || `calendar error 0x${(Number(errNo) >>> 0).toString(16)}`;
+                    }
+                  },
+                  onPropertyChanged() {},
+                  onPropertyDeleting() {},
+                };
+                try {
+                  // Observe before starting: a fast sync can report onLoad
+                  // before refresh() returns.
+                  calendar.addObserver(observer);
+                  const pending = calendar.refresh();
+                  if (pending && typeof pending.then === "function") {
+                    pending.catch(e => settle({ status: "error", error: String((e && e.message) || e) }));
+                  }
+                } catch (e) {
+                  settle({ status: "error", error: String((e && e.message) || e) });
+                }
+              });
+              calendarRefreshInFlight.set(id, completion);
+              // completion never rejects (every path settles via resolve).
+              completion.then(() => calendarRefreshInFlight.delete(id)).catch(() => {});
+              return completion;
+            }
+
+            async function syncOneCalendar(calendar, timeoutMs) {
+              const id = calendar.id;
+              const started = Date.now();
+              const joinedInFlight = calendarRefreshInFlight.has(id);
+              const completion = joinedInFlight ? calendarRefreshInFlight.get(id) : startCalendarSync(calendar);
+              let waitTimer = null;
+              const timedOut = new Promise(resolve => {
+                waitTimer = calendarRefreshTimer(timeoutMs, () => resolve({
+                  status: "timeout",
+                  error: `refreshCalendar timed out after ${timeoutMs}ms; the sync keeps running in the background`,
+                }));
+              });
+              const outcome = await Promise.race([completion, timedOut]);
+              waitTimer.cancel();
+              const result = {
+                success: outcome.status === "loaded",
+                calendarId: id,
+                name: calendar.name,
+                type: calendar.type,
+                status: outcome.status,
+                elapsedMs: Date.now() - started,
+              };
+              if (joinedInFlight) result.joinedInFlight = true;
+              if (outcome.error) result.error = outcome.error;
+              if (outcome.warning) result.warning = outcome.warning;
+              return result;
+            }
+
+            async function refreshCalendar(calendarId, timeoutMs) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                const timeout = clampCalendarRefreshTimeout(timeoutMs);
+                const calendars = cal.manager.getCalendars();
+                if (calendarId) {
+                  const calendar = calendars.find(c => c.id === calendarId);
+                  if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                  if (calendar.getProperty("disabled")) {
+                    return { error: `Calendar "${calendar.name}" is disabled. Enable it in Thunderbird's calendar properties and retry.` };
+                  }
+                  if (!calendar.canRefresh) {
+                    return { success: true, calendarId: calendar.id, name: calendar.name, type: calendar.type, skipped: "calendar has no server to sync" };
+                  }
+                  return await syncOneCalendar(calendar, timeout);
+                }
+                const targets = calendars.filter(c => !c.getProperty("disabled") && c.canRefresh);
+                if (targets.length === 0) {
+                  return { error: "No enabled calendars that support refresh" };
+                }
+                const results = await Promise.all(targets.map(c => syncOneCalendar(c, timeout)));
+                return { success: results.every(r => r.success), scope: "all", results };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+            // END refreshCalendar
 
             function getEnabledCalendars(calendarId) {
               const calendars = cal.manager.getCalendars();
@@ -11566,6 +11744,184 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // refreshFolder: sync one folder with its server and wait until
+            // Thunderbird reports the pass done.
+            //
+            // IMAP drives nsIMsgImapMailFolder.updateFolderWithListener -- the
+            // targeted, waitable per-folder update. (folder.getNewMessages is
+            // the account-level Get Mail path: it updates the Inbox, so for any
+            // other folder the listener waits on the wrong work.)
+            //
+            // Add-on account types that implement their own folders (Owl for
+            // Exchange/Office 365, and similar) sync in folder.updateFolder --
+            // the call Thunderbird makes when you click a folder -- and signal
+            // the end with the folder's "FolderLoaded" event, which is what we
+            // wait for. Local-store types have no server to sync and are skipped.
+            //
+            // An account root refreshes the Inbox plus any folder opted into
+            // new-mail checks, as the Get Messages button does.
+            //
+            // One sync per folder at a time: a second call joins the running
+            // one. The timeout bounds the wait, not the work -- the slot stays
+            // taken until the sync really ends (or REFRESH_ABANDON_MS passes),
+            // so repeated calls on a slow server don't stack syncs.
+            const REFRESH_DEFAULT_TIMEOUT_MS = 15000;
+            // Kept under the stdio bridge's 30000ms request timeout (5s safety
+            // margin) so a structured timeout result is returned rather than
+            // the bridge hard-failing.
+            const REFRESH_MAX_TIMEOUT_MS = 25000;
+            const REFRESH_MIN_TIMEOUT_MS = 1000;
+            const REFRESH_ABANDON_MS = 300000;
+            const refreshInFlight = new Map(); // folder URI -> completion Promise
+            // Built-in types whose folders have no server-side copy to sync.
+            const REFRESH_LOCAL_SERVER_TYPES = new Set(["none", "pop3", "rss", "nntp"]);
+
+            function clampRefreshTimeout(timeoutMs) {
+              const n = Number(timeoutMs);
+              if (!Number.isFinite(n) || n <= 0) return REFRESH_DEFAULT_TIMEOUT_MS;
+              return Math.min(Math.max(Math.floor(n), REFRESH_MIN_TIMEOUT_MS), REFRESH_MAX_TIMEOUT_MS);
+            }
+
+            function refreshFolderCounts(folder) {
+              try {
+                return { total: folder.getTotalMessages(false), unread: folder.getNumUnread(false) };
+              } catch {
+                return { total: null, unread: null };
+              }
+            }
+
+            function oneShotTimer(ms, callback) {
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+              return timer;
+            }
+
+            // Start a sync. Returns a Promise that settles with
+            // { status: "loaded" | "error" | "abandoned", error? } when it ends.
+            function startFolderSync(folder) {
+              const uri = folder.URI;
+              const completion = new Promise(resolve => {
+                let settled = false;
+                let abandonTimer = null;
+                let folderListener = null;
+                const settle = (outcome) => {
+                  if (settled) return;
+                  settled = true;
+                  if (abandonTimer) abandonTimer.cancel();
+                  if (folderListener) {
+                    try { MailServices.mailSession.RemoveFolderListener(folderListener); } catch {}
+                  }
+                  resolve(outcome);
+                };
+                abandonTimer = oneShotTimer(REFRESH_ABANDON_MS, () => settle({ status: "abandoned" }));
+                try {
+                  if (folder.server.type === "imap") {
+                    folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
+                      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                      OnStartRunningUrl() {},
+                      OnStopRunningUrl(url, exitCode) {
+                        // >>> 0 coerces the (negative, signed 32-bit) nsresult to
+                        // its unsigned form so the hex reads e.g. 0x80004005.
+                        settle(Components.isSuccessCode(exitCode)
+                          ? { status: "loaded" }
+                          : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
+                      },
+                    });
+                  } else {
+                    folderListener = {
+                      QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                      onFolderEvent(eventFolder, event) {
+                        if (event === "FolderLoaded" && eventFolder && eventFolder.URI === uri) {
+                          settle({ status: "loaded" });
+                        }
+                      },
+                    };
+                    // Listen before starting: a fast or cached update can
+                    // report FolderLoaded before updateFolder returns.
+                    MailServices.mailSession.AddFolderListener(folderListener, Ci.nsIFolderListener.event);
+                    folder.updateFolder(null);
+                  }
+                } catch (e) {
+                  settle({ status: "error", error: String((e && e.message) || e) });
+                }
+              });
+              refreshInFlight.set(uri, completion);
+              // completion never rejects (every path settles via resolve).
+              completion.then(() => refreshInFlight.delete(uri)).catch(() => {});
+              return completion;
+            }
+
+            async function syncOneFolder(folder, timeoutMs) {
+              const uri = folder.URI;
+              const started = Date.now();
+              const before = refreshFolderCounts(folder);
+              const joinedInFlight = refreshInFlight.has(uri);
+              const completion = joinedInFlight ? refreshInFlight.get(uri) : startFolderSync(folder);
+              let waitTimer = null;
+              const timedOut = new Promise(resolve => {
+                waitTimer = oneShotTimer(timeoutMs, () => resolve({
+                  status: "timeout",
+                  error: `refreshFolder timed out after ${timeoutMs}ms; the sync keeps running in the background`,
+                }));
+              });
+              const outcome = await Promise.race([completion, timedOut]);
+              waitTimer.cancel();
+              const after = refreshFolderCounts(folder);
+              const result = {
+                success: outcome.status === "loaded",
+                folderPath: uri,
+                status: outcome.status,
+                elapsedMs: Date.now() - started,
+                totalBefore: before.total,
+                totalAfter: after.total,
+                unreadBefore: before.unread,
+                unreadAfter: after.unread,
+                // A net count change, not arrivals: an expunge or a filter
+                // move can cancel out new mail.
+                netMessageDelta: (before.total !== null && after.total !== null) ? after.total - before.total : null,
+              };
+              if (joinedInFlight) result.joinedInFlight = true;
+              if (outcome.error) result.error = outcome.error;
+              return result;
+            }
+
+            async function refreshFolder(folderPath, timeoutMs) {
+              try {
+                const lookup = getAccessibleFolder(folderPath);
+                if (lookup.error) return { error: lookup.error };
+                const folder = lookup.folder;
+                const timeout = clampRefreshTimeout(timeoutMs);
+
+                if (!folder.server || REFRESH_LOCAL_SERVER_TYPES.has(folder.server.type)) {
+                  return { success: true, folderPath: folder.URI, skipped: "no server-side folder to sync" };
+                }
+                if (folder.isServer) {
+                  const wanted = Ci.nsMsgFolderFlags.Inbox | Ci.nsMsgFolderFlags.CheckNew;
+                  const targets = Array.from(folder.descendants).filter(f =>
+                    (f.flags & wanted) && !(f.flags & (Ci.nsMsgFolderFlags.Virtual | Ci.nsMsgFolderFlags.ImapNoselect)));
+                  if (targets.length === 0) {
+                    return { error: `No Inbox or check-new folders found under ${folderPath}` };
+                  }
+                  const results = await Promise.all(targets.map(f => syncOneFolder(f, timeout)));
+                  return {
+                    success: results.every(r => r.success),
+                    folderPath: folder.URI,
+                    scope: "account",
+                    results,
+                  };
+                }
+                if (folder.flags & Ci.nsMsgFolderFlags.Virtual) {
+                  return { error: `Saved-search (virtual) folders cannot be refreshed; refresh their source folders: ${folderPath}` };
+                }
+                if (folder.flags & Ci.nsMsgFolderFlags.ImapNoselect) {
+                  return { error: `IMAP folder cannot be selected (no-select): ${folderPath}` };
+                }
+                return await syncOneFolder(folder, timeout);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             // BEGIN FILTER TOOL HANDLERS
             function getFilterListForAccount(accountId) {
               if (!isAccountAllowed(accountId)) {
@@ -12210,6 +12566,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return deleteContact(args.contactId);
                 case "listCalendars":
                   return listCalendars();
+                case "refreshCalendar":
+                  return await refreshCalendar(args.calendarId, args.timeoutMs);
                 case "createEvent":
                   return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.attendees);
                 case "listEvents":
@@ -12242,6 +12600,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo);
+                case "refreshFolder":
+                  return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
                 case "renameFolder":

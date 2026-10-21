@@ -50,6 +50,7 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
+| `refreshFolder` | Sync a folder with its server and wait for it to finish, so mail sent or received elsewhere becomes visible. IMAP and add-on accounts such as Owl (Exchange/Office 365); an account root refreshes its Inbox and check-new folders, like Get Messages. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
@@ -153,6 +154,7 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with disabled, read-only, event, and task support flags |
+| `refreshCalendar` | Synchronize a calendar (or every enabled refreshable calendar) with its server and wait for it to finish, like the Synchronize button, so events created or changed elsewhere become visible to `listEvents`. Uses the calendar's own refresh, so it works for Exchange/Owl, CalDAV and Google calendars. |
 | `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
 | `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
 | `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
