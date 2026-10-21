@@ -2390,7 +2390,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             query: { type: "string", description: "Text to search. Multi-word queries are AND-of-tokens: every word must appear somewhere across subject/author/recipients/ccList/preview (or inside the selected field when an operator is used). Prefix with 'from:', 'subject:', 'to:', or 'cc:' to restrict matching to one field (e.g. 'from:Alice Smith' requires both tokens in the author field). Use empty string to match all." },
-            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
+            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders. Scoped header searches may wait up to 5 seconds for the named selectable IMAP folder's sync, within the search budget. Descendants and searchBody do not wait. Count/page objects can include folderRefresh with status, joinedInFlight, updateConfirmed, warning or error; only updateConfirmed:true confirms server success. Plain arrays are unchanged." },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date. Date-only strings (e.g. '2024-01-15') include the full day." },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
@@ -2400,7 +2400,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
-            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries. Counts exactly the rows a listing would return; with folderPath, both first wait up to 5 seconds for that folder's IMAP sync." },
+            countOnly: { type: "boolean", description: "If true, return a best-effort count of currently resolvable, non-expunged collected candidates, respecting dedupByMessageId and including candidates beyond the requested page. Rechecks yield without hydrating result content. If the search deadline interrupts validation, only validated rows count and truncated:true is returned; this count can be zero." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing. Gloda supplies relevance-limited candidates without a completeness indicator; object responses report truncated:true. Without offset, message results remain a plain array without completeness information. Narrow the text query; use header search when header/preview matching is sufficient." },
             dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
           },
@@ -3639,7 +3639,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const message = scan.timedOut
                 ? "Search reached its 20-second time budget; results, counts and date ordering are partial. Narrow the query with folderPath, includeSubfolders:false, or dates."
                 : scan.glodaLimited
-                  ? "Gloda returns a relevance-limited candidate set; completeness cannot be verified. Narrow the text query; use header search for exact counts when applicable."
+                  ? "Gloda returns a relevance-limited candidate set; completeness cannot be verified. Narrow the text query; use header search when header/preview matching is sufficient."
                   : "Some messages or folders became unavailable during the search; results and counts may be incomplete. Retry or narrow the query.";
               return { ...response, truncated: true, message };
             }
