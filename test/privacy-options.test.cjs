@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadContactRuntime } = require("./helpers/contact-runtime.cjs");
 
 const optionsSource = fs.readFileSync(path.resolve(__dirname, "../extension/options.js"), "utf8");
 
@@ -49,7 +50,7 @@ const corruptTools = {
 
 // Only the DOM and browser API boundaries are stubbed. Access decisions and
 // event listeners come from the production options script's marked sections.
-function loadOptions(overrides = {}) {
+function loadOptions(overrides = {}, apiOverrides = {}) {
   const byId = new Map();
   class Element {
     constructor(tagName) {
@@ -165,7 +166,9 @@ function loadOptions(overrides = {}) {
       return structuredClone(state.privacyResult);
     },
   };
-  const sandbox = { ...elements, document, browser: { mcpServer: api } };
+  // Reuse this DOM/listener harness for persistence checks with the production
+  // contact preference API; ordinary UI error tests keep their boundary mocks.
+  const sandbox = { ...elements, document, browser: { mcpServer: { ...api, ...apiOverrides } } };
   vm.createContext(sandbox);
   vm.runInContext([
     markedOptionsSnippet("OPTIONS ACCESS STATE"),
@@ -421,6 +424,48 @@ describe("Options contact writes", () => {
     assert.deepEqual(ui.calls.contactWrites, [false]);
     assert.equal(ui.saveContactWritesStatus.textContent, "Saved.");
     assert.equal(ui.saveContactWritesBtn.disabled, false);
+  });
+
+  it("persists consent and revocation across Options reloads through the production preference API", async () => {
+    const runtime = loadContactRuntime();
+    const fields = { emails: [{ address: "roundtrip@example.com", type: "work" }], displayName: "Round Trip" };
+    const first = loadOptions({}, runtime.options);
+    await first.loadContactWritesPref();
+    assert.equal(first.allowContactWrites.checked, false);
+    assert.match(runtime.create(fields).error, /Allow contact writes/);
+
+    first.allowContactWrites.checked = true;
+    await first.saveContactWritesBtn.fire("click");
+    assert.equal(first.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, true);
+    const created = runtime.create(fields);
+    assert.equal(created.success, true);
+
+    await first.loadPrivacySettings();
+    first.allowAllAddressBooks.checked = true;
+    await first.savePrivacyBtn.fire("click");
+    assert.equal((await runtime.options.getPrivacySettings()).allowAllAddressBooks, true);
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, true);
+
+    const reopened = loadOptions({}, runtime.options);
+    await reopened.loadContactWritesPref();
+    assert.equal(reopened.allowContactWrites.checked, true);
+    reopened.allowContactWrites.checked = false;
+    await reopened.saveContactWritesBtn.fire("click");
+    assert.equal(reopened.saveContactWritesStatus.textContent, "Saved.");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, false);
+
+    const revoked = loadOptions({}, runtime.options);
+    await revoked.loadContactWritesPref();
+    assert.equal(revoked.allowContactWrites.checked, false);
+    await revoked.loadPrivacySettings();
+    assert.equal(revoked.allowAllAddressBooks.checked, true);
+    await revoked.savePrivacyBtn.fire("click");
+    assert.equal((await runtime.options.getAllowContactWrites()).allowContactWrites, false);
+    assert.match(runtime.create(fields).error, /Allow contact writes/);
+    assert.match(runtime.update(created.id, { displayName: "Blocked" }).error, /Allow contact writes/);
+    assert.match(runtime.deleteContact(created.id).error, /Allow contact writes/);
+    assert.equal(runtime.getContact(created.id).displayName, fields.displayName);
   });
 
   it("treats anything but true as off", async () => {

@@ -81,9 +81,10 @@ describe("stored vCard fixture fidelity", () => {
     assert.equal(book.savedCards.get(uid).vCardProperties.toVCard(), expectedRaw);
   });
 
-  it("forwards the reloaded primaryEmail setter and rebuilds its cache on save", () => {
+  it("forwards the reloaded primaryEmail setter and rebuilds its cache on save", async () => {
     const book = new FakeAddressBook();
     const runtime = loadContactRuntime({ books: [book] });
+    await runtime.options.setAllowContactWrites(true);
     const created = runtime.create({ emails });
     assert.equal(created.success, true, created.error);
     const loaded = book.reloadCard(created.id);
@@ -103,9 +104,10 @@ describe("stored vCard fixture fidelity", () => {
 
 describe("createContact native card selection and persistence", () => {
   for (const [name, dirType] of VCARD_BOOK_TYPES) {
-    it(`creates and reloads three typed emails and two mobile phones in a ${name} book`, () => {
+    it(`creates and reloads three typed emails and two mobile phones in a ${name} book`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const addresses = [{ type: "home", street: "12 Engine Lane", city: "London", country: "UK" }];
       const result = runtime.create({ ...scalarFields, email: emails[0].address, emails, phones, addresses });
 
@@ -187,9 +189,10 @@ describe("createContact native card selection and persistence", () => {
     ["numeric 101", 101],
     ["numeric 102", 102],
   ]) {
-    it(`uses the flat factory for ${name}, saves two emails and refuses three before mutation`, () => {
+    it(`uses the flat factory for ${name}, saves two emails and refuses three before mutation`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const result = runtime.create({ ...scalarFields, emails: emails.slice(0, 2), phones: phones.slice(0, 1) });
       assert.equal(result.success, true, result.error);
       assert.equal(runtime.calls.vCardCards.length, 0);
@@ -226,11 +229,12 @@ describe("createContact native card selection and persistence", () => {
 });
 
 describe("createContact address book selection", () => {
-  it("uses the first writable book by default", () => {
+  it("uses the first writable book by default", async () => {
     const readOnly = new FakeAddressBook({ UID: "read-only", readOnly: true });
     const chosen = new FakeAddressBook({ UID: "chosen", dirName: "Writable", dirType: DIRECTORY_TYPES.CARDDAV_DIRECTORY_TYPE });
     const later = new FakeAddressBook({ UID: "later" });
     const runtime = loadContactRuntime({ books: [readOnly, chosen, later] });
+    await runtime.options.setAllowContactWrites(true);
     const result = runtime.create({ displayName: "Selected" });
     assert.equal(result.success, true, result.error);
     assert.equal(result.addressBook, chosen.dirName);
@@ -238,13 +242,14 @@ describe("createContact address book selection", () => {
   });
 
   for (const key of ["URI", "UID", "dirPrefId"]) {
-    it(`selects an explicit book by ${key}`, () => {
+    it(`selects an explicit book by ${key}`, async () => {
       const first = new FakeAddressBook();
       const selected = new FakeAddressBook({
         UID: "selected-uid", URI: "jsaddrbook://selected.sqlite",
         dirPrefId: "ldap_2.servers.selected", dirName: "Selected Book",
       });
       const runtime = loadContactRuntime({ books: [first, selected] });
+      await runtime.options.setAllowContactWrites(true);
       const result = runtime.create({ displayName: "Explicit", addressBookId: selected[key] });
       assert.equal(result.success, true, result.error);
       assert.equal(result.addressBook, selected.dirName);
@@ -259,8 +264,9 @@ describe("createContact address book selection", () => {
     ["no books", [], undefined, /No writable address book/],
     ["only read-only books", [new FakeAddressBook({ readOnly: true })], undefined, /No writable address book/],
   ]) {
-    it(`rejects ${name} without constructing or adding a card`, () => {
+    it(`rejects ${name} without constructing or adding a card`, async () => {
       const runtime = loadContactRuntime({ books });
+      await runtime.options.setAllowContactWrites(true);
       assert.match(runtime.create({ displayName: "Valid", addressBookId }).error, error);
       assert.deepEqual(runtime.calls.vCardCards, []);
       assert.deepEqual(runtime.calls.flatCards, []);
@@ -282,10 +288,11 @@ describe("createContact validation before construction", () => {
     ["empty address", { addresses: [{ type: "home" }] }, /non-empty address field/],
     ["invalid birthday", { birthday: "2023-02-29" }, /birthday must be/],
   ]) {
-    it(`rejects ${name} without constructors or addCard`, () => {
+    it(`rejects ${name} without constructors or addCard`, async () => {
       for (const dirType of [DIRECTORY_TYPES.JS_DIRECTORY_TYPE, DIRECTORY_TYPES.LDAP_DIRECTORY_TYPE]) {
         const book = new FakeAddressBook({ dirType });
         const runtime = loadContactRuntime({ books: [book] });
+        await runtime.options.setAllowContactWrites(true);
         assert.match(runtime.create(fields).error, error);
         assert.deepEqual(runtime.calls.vCardCards, []);
         assert.deepEqual(runtime.calls.flatCards, []);
@@ -300,9 +307,10 @@ describe("createContact validation before construction", () => {
     ["vCard", DIRECTORY_TYPES.JS_DIRECTORY_TYPE],
     ["flat", DIRECTORY_TYPES.LDAP_DIRECTORY_TYPE],
   ]) {
-    it(`keeps phone-only display name synthesis for ${name} cards`, () => {
+    it(`keeps phone-only display name synthesis for ${name} cards`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const result = runtime.create({ phones: [{ type: "mobile", number: "  +48 123 456 789  " }] });
       assert.equal(result.success, true, result.error);
       assert.equal(result.displayName, "+48 123 456 789");
@@ -317,8 +325,9 @@ describe("createContact validation before construction", () => {
 
 describe("contact production module imports", () => {
   for (const esmUnavailable of [[], ["VCardUtils"], ["AddrBookCard"], ["VCardUtils", "AddrBookCard"]]) {
-    it(`creates a vCard using ${esmUnavailable.length ? `JSM fallback for ${esmUnavailable.join(" and ")}` : "ESM modules"}`, () => {
+    it(`creates a vCard using ${esmUnavailable.length ? `JSM fallback for ${esmUnavailable.join(" and ")}` : "ESM modules"}`, async () => {
       const runtime = loadContactRuntime({ esmUnavailable });
+      await runtime.options.setAllowContactWrites(true);
       const expectedImports = [];
       for (const name of ["VCardUtils", "AddrBookCard"]) {
         expectedImports.push({ method: "importESModule", uri: `resource:///modules/${name}.sys.mjs` });
@@ -339,9 +348,10 @@ describe("contact production module imports", () => {
 
 describe("contact get/update/delete handler wiring", () => {
   for (const [name, dirType] of VCARD_BOOK_TYPES) {
-    it(`replaces stale caches and raw data when updating and clearing a reloaded ${name} card`, () => {
+    it(`replaces stale caches and raw data when updating and clearing a reloaded ${name} card`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const created = runtime.create({ ...scalarFields, emails });
       assert.equal(created.success, true, created.error);
       const originalSnapshot = book.savedCards.get(created.id);
@@ -412,9 +422,10 @@ describe("contact get/update/delete handler wiring", () => {
   for (const [name, dirType] of [
     ["vCard", DIRECTORY_TYPES.JS_DIRECTORY_TYPE], ["flat", DIRECTORY_TYPES.LDAP_DIRECTORY_TYPE],
   ]) {
-    it(`rejects control characters before constructing or modifying ${name} cards`, () => {
+    it(`rejects control characters before constructing or modifying ${name} cards`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const created = runtime.create({ displayName: "Unchanged", emails: emails.slice(0, 2) });
       const before = structuredClone(runtime.getContact(created.id));
       // C0, DEL and C1 are forbidden, including whitespace that trim() would remove.
@@ -433,17 +444,19 @@ describe("contact get/update/delete handler wiring", () => {
       assert.deepEqual(book.calls.modify, []);
     });
 
-    it(`accepts non-ASCII and quoted punctuation in ${name} addresses`, () => {
+    it(`accepts non-ASCII and quoted punctuation in ${name} addresses`, async () => {
       const runtime = loadContactRuntime({ books: [new FakeAddressBook({ dirType })] });
+      await runtime.options.setAllowContactWrites(true);
       const address = '"é;x:y"@例え.example';
       const created = runtime.create({ email: address, emails: [{ address }] });
       assert.equal(created.success, true, created.error);
       assert.equal(runtime.getContact(created.id).email, address);
     });
 
-    it(`documents scalar empty-email clearing through the ${name} handler`, () => {
+    it(`documents scalar empty-email clearing through the ${name} handler`, async () => {
       const book = new FakeAddressBook({ dirType });
       const runtime = loadContactRuntime({ books: [book] });
+      await runtime.options.setAllowContactWrites(true);
       const created = runtime.create({ emails: emails.slice(0, 2) });
       assert.equal(runtime.update(created.id, { email: "" }).success, true);
       book.reloadCard(created.id);
@@ -456,7 +469,7 @@ describe("contact get/update/delete handler wiring", () => {
     });
   }
 
-  it("reads duplicates without deduplication and refuses their write-back before mutation", () => {
+  it("reads duplicates without deduplication and refuses their write-back before mutation", async () => {
     const card = new FakeAddrBookCard({ UID: "duplicates" }, new FakeVCardProperties([
       new FakeVCardPropertyEntry("fn", {}, "text", "Unchanged"),
       new FakeVCardPropertyEntry("email", { pref: "1", type: "work" }, "text", "same@example.com"),
@@ -464,6 +477,7 @@ describe("contact get/update/delete handler wiring", () => {
     ]));
     const book = new FakeAddressBook({ cards: [card] });
     const runtime = loadContactRuntime({ books: [book] });
+    await runtime.options.setAllowContactWrites(true);
     const before = structuredClone(runtime.getContact(card.UID));
     assert.deepEqual(before.emails, [
       { type: "work", address: "same@example.com" }, { type: "home", address: "SAME@example.com" },
@@ -473,7 +487,7 @@ describe("contact get/update/delete handler wiring", () => {
     assert.deepEqual(book.calls.modify, []);
   });
 
-  it("finds a UID across books, skips mailing lists, and preserves native entries and metadata on update", () => {
+  it("finds a UID across books, skips mailing lists, and preserves native entries and metadata on update", async () => {
     const primary = new FakeVCardPropertyEntry("email", { type: ["WORK", "internet"], pref: "1", group: "item1" }, "text", "first@example.com");
     const second = new FakeVCardPropertyEntry("email", { type: "home", pref: "2" }, "text", "second@example.com");
     const extra = new FakeVCardPropertyEntry("url", { group: "item1" }, "uri", "https://example.com");
@@ -483,6 +497,7 @@ describe("contact get/update/delete handler wiring", () => {
     const first = new FakeAddressBook({ cards: [mailingList] });
     const book = new FakeAddressBook({ UID: "second-book", dirName: "Second Book", cards: [card] });
     const runtime = loadContactRuntime({ books: [first, book] });
+    await runtime.options.setAllowContactWrites(true);
 
     const before = runtime.getContact(card.UID);
     assert.equal(before.addressBook, book.dirName);
@@ -525,9 +540,10 @@ describe("contact get/update/delete handler wiring", () => {
     assert.match(runtime.getContact(card.UID).error, /Contact not found/);
   });
 
-  it("updates, reloads and deletes flat cards through the production handlers", () => {
+  it("updates, reloads and deletes flat cards through the production handlers", async () => {
     const book = new FakeAddressBook({ dirType: DIRECTORY_TYPES.MAPI_DIRECTORY_TYPE });
     const runtime = loadContactRuntime({ books: [book] });
+    await runtime.options.setAllowContactWrites(true);
     const created = runtime.create({ email: "old@example.com", displayName: "Old" });
     assert.equal(created.success, true, created.error);
     const changed = runtime.update(created.id, { email: "new@example.com", firstName: "New", lastName: "Name", displayName: "New Name" });
@@ -544,10 +560,11 @@ describe("contact get/update/delete handler wiring", () => {
     assert.match(runtime.getContact(created.id).error, /Contact not found/);
   });
 
-  it("rejects invalid IDs, missing contacts and invalid updates without modifying or deleting cards", () => {
+  it("rejects invalid IDs, missing contacts and invalid updates without modifying or deleting cards", async () => {
     const card = new FakeFlatCard({ UID: "existing", DisplayName: "Unchanged" });
     const book = new FakeAddressBook({ cards: [card] });
     const runtime = loadContactRuntime({ books: [book] });
+    await runtime.options.setAllowContactWrites(true);
     for (const id of [undefined, "", 42]) {
       assert.match(runtime.getContact(id).error, /contactId must be a non-empty string/);
       assert.match(runtime.update(id, { displayName: "Changed" }).error, /contactId must be a non-empty string/);

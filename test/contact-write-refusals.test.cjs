@@ -36,18 +36,32 @@ describe("updateContact refuses unreadable stored vCards before mutation", () =>
       ["mixed scalar and collection", { displayName: "Changed", emails: [{ address: "new@example.com" }] }],
       ["no fields", {}],
     ]) {
-      it(`refuses ${field} when parsing returns ${parseMode}, without saving or changing cached data`, () => {
+      it(`refuses ${field} when parsing returns ${parseMode}, without saving or changing cached data`, async () => {
         // Reuse the lazy-card fixture; the production shared read/write check
         // must identify all native parser failure modes, including VERSION-only.
         const card = new FakeStoredCard({ properties: CACHED_CONTACT, raw: CORRUPT_VCARD, parseMode });
         const book = new FakeAddressBook({ cards: [card] });
         const runtime = loadContactRuntime({ books: [book] });
         const before = structuredClone(card.stored);
+
+        assert.match(runtime.update(CACHED_CONTACT.UID, fields).error, /Contact writes are disabled/);
+        assert.equal(runtime.calls.directories, 0, "consent is checked before looking up the corrupt card");
+        assert.equal(card.stats.parses, 0);
+        assert.deepEqual(card.stats.events, []);
+        assert.deepEqual(card.writes, []);
+        assert.deepEqual(card.stored, before);
+        assert.deepEqual(book.calls, { add: [], modify: [], delete: [] });
+        assert.deepEqual(book.cards, [card]);
+
+        await runtime.options.setAllowContactWrites(true);
         const result = runtime.update(CACHED_CONTACT.UID, fields);
 
         assert.match(result.error, /stored vCard.*unreadable.*refusing to overwrite/i);
+        assert.ok(runtime.calls.directories > 0, "enabled writes reach the real lookup and vCard guard");
+        assert.equal(card.stats.parses, 1);
         assert.deepEqual(book.calls.modify, []);
         assert.deepEqual(book.calls.add, []);
+        assert.deepEqual(book.calls.delete, []);
         assert.equal(book.savedCards.size, 0);
         assert.deepEqual(card.writes, []);
         assert.deepEqual(card.stored, before);

@@ -613,7 +613,7 @@ describe("contact email addresses", () => {
     assert.strictEqual(properties.getFirstEntry("x-ablabel"), label);
   });
 
-  it("preserves serialized email metadata across getContact, unchanged updateContact and reload", () => {
+  it("preserves serialized email metadata across getContact, unchanged updateContact and reload", async () => {
     const rawProperty = "_vCard";
     const params = [
       { type: ["work", "home", "INTERNET"], pref: "1", group: "item1", "x-custom": "keep" },
@@ -628,6 +628,7 @@ describe("contact email addresses", () => {
     const book = new FakeAddressBook();
     const { UID } = book.addCard(new FakeAddrBookCard({}, properties));
     const runtime = loadContactRuntime({ books: [book] });
+    await runtime.options.setAllowContactWrites(true);
     const beforeRaw = book.savedCards.get(UID).getProperty(rawProperty);
     const beforeParams = structuredClone(params);
     const read = runtime.getContact(UID);

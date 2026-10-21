@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { installMcpHandler } = require("./httpd.cjs");
 
 // Search/reuse: rg found the marker/VM and constant extraction patterns in
 // calendar-runtime.cjs and folder-tools.cjs, and the non-exported entry,
@@ -12,9 +13,11 @@ const vm = require("node:vm");
 // validation, formatting, reconciliation, search and handlers come from api.js.
 const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8");
 
-function snippet(name) {
-  const startMarker = `// BEGIN ${name}`;
-  const endMarker = `// END ${name}`;
+function snippet(startMarker, endMarker) {
+  if (endMarker === undefined) {
+    endMarker = `// END ${startMarker}`;
+    startMarker = `// BEGIN ${startMarker}`;
+  }
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start + startMarker.length);
   assert.ok(start >= 0, `api.js marker missing: ${startMarker}`);
@@ -394,8 +397,44 @@ class FakeAddressBook {
   }
 }
 
-function loadContactRuntime({ books = [new FakeAddressBook()], esmUnavailable = [] } = {}) {
-  const calls = { imports: [], vCardCards: [], flatCards: [], factoryInterfaces: [] };
+function loadContactRuntime({
+  books = [new FakeAddressBook()], esmUnavailable = [], initial = {}, unreadable = [], dispatch = false,
+} = {}) {
+  const calls = { imports: [], vCardCards: [], flatCards: [], factoryInterfaces: [], directories: 0 };
+  // Search/reuse: privacy-access has a mutable preference fixture but does not
+  // export it; direct-send-prefs is read-only. Keep only the needed service
+  // boundary here, while loading privacy/access decisions from production.
+  const values = new Map();
+  const readErrors = new Set();
+  const writes = [];
+  const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_INT: 64, PREF_BOOL: 128 };
+  const prefs = {
+    getPrefType(name) {
+      if (readErrors.has(name)) throw new Error("Preference is unreadable");
+      if (!values.has(name)) return prefTypes.PREF_INVALID;
+      const value = values.get(name);
+      if (typeof value === "string") return prefTypes.PREF_STRING;
+      if (typeof value === "boolean") return prefTypes.PREF_BOOL;
+      if (Number.isInteger(value)) return prefTypes.PREF_INT;
+      throw new Error("Unsupported preference value");
+    },
+    clearUserPref(name) {
+      values.delete(name);
+      writes.push({ name });
+    },
+  };
+  for (const kind of ["Bool", "String", "Int"]) {
+    prefs[`get${kind}Pref`] = (name, fallback) => {
+      if (readErrors.has(name)) throw new Error("Preference is unreadable");
+      // Return malformed values too, so the real opt-in helper must require
+      // strict true rather than relying on a fixture's boolean coercion.
+      return values.has(name) ? values.get(name) : fallback;
+    };
+    prefs[`set${kind}Pref`] = (name, value) => {
+      values.set(name, value);
+      writes.push({ name, value });
+    };
+  }
   class AddrBookCard extends FakeAddrBookCard {
     constructor() {
       super();
@@ -423,7 +462,8 @@ function loadContactRuntime({ books = [new FakeAddressBook()], esmUnavailable = 
 
   const sandbox = vm.createContext({
     console,
-    Ci: { nsIAbManager: DIRECTORY_TYPES, nsIAbCard: "fixture:nsIAbCard" },
+    Services: { prefs },
+    Ci: { nsIAbManager: DIRECTORY_TYPES, nsIAbCard: "fixture:nsIAbCard", nsIPrefBranch: prefTypes },
     Cc: {
       "@mozilla.org/addressbook/cardproperty;1": {
         createInstance(iface) {
@@ -438,17 +478,79 @@ function loadContactRuntime({ books = [new FakeAddressBook()], esmUnavailable = 
       importESModule: uri => importModule("importESModule", uri),
       import: uri => importModule("import", uri),
     },
-    MailServices: { ab: { directories: books } },
+    MailServices: { ab: { get directories() { calls.directories++; return books; } } },
   });
+  const prefConstants = [
+    "PREF_ALLOW_CONTACT_WRITES", "PREF_ALLOWED_ACCOUNTS", "PREF_DISABLED_TOOLS",
+    "PREF_ALLOW_ALL_ADDRESS_BOOKS", "PREF_ALLOW_ALL_CALENDARS", "PREF_ALLOW_ENCRYPTED_MESSAGES",
+    "PREF_GET_MESSAGES_LIMIT",
+  ];
   vm.runInContext([
+    ...prefConstants.map(constant),
     constant("DEFAULT_MAX_RESULTS"),
     constant("MAX_SEARCH_RESULTS_CAP"),
+    snippet("PRIVACY PREFERENCE HELPERS"),
     snippet("CONTACT FIELD HELPERS"),
     snippet("CONTACT MODULE IMPORTS"),
     snippet("CONTACT SEARCH"),
     snippet("CONTACT TOOL HANDLERS"),
     "this.limits = { DEFAULT_MAX_RESULTS, MAX_SEARCH_RESULTS_CAP };",
+    `this.prefNames = { ${prefConstants.join(", ")} };`,
+    "this.options = {",
+    snippet("CONTACT WRITE PREFERENCE METHODS"),
+    snippet("PRIVACY OPTIONS API"),
+    "};",
   ].join("\n"), sandbox, { filename: "contact-runtime.api.js" });
+
+  for (const [name, value] of Object.entries(initial)) {
+    assert.ok(sandbox.prefNames[name], `Unknown preference constant: ${name}`);
+    values.set(sandbox.prefNames[name], value);
+  }
+  for (const name of unreadable) {
+    assert.ok(sandbox.prefNames[name], `Unknown preference constant: ${name}`);
+    readErrors.add(sandbox.prefNames[name]);
+  }
+
+  if (dispatch) {
+    // Reuse privacy-access/calendar-runtime's production schema dependencies
+    // and the existing HTTP installer. No handler or access gate is replaced.
+    vm.runInContext([
+      ...["DEFAULT_GET_MESSAGES_LIMIT", "MAX_GET_MESSAGES_LIMIT", "UNDISABLEABLE_TOOLS"].map(constant),
+      snippet("OUTBOUND ATTACHMENT LIMITS"),
+      snippet("MESSAGE HEADER LIMITS"),
+      snippet("function normalizeGetMessagesLimit(", "// BEGIN TOOL SCHEMA BUILDER"),
+      snippet("FILTER SEARCH TERM HELPERS"),
+      snippet("BOUNDED REFRESH HELPERS"),
+      snippet("TOOL SCHEMA BUILDER"),
+      snippet("TOOL SCHEMA VALIDATOR"),
+      snippet("SERVER ACCESS HELPERS"),
+      snippet("MCP TEXT SANITIZATION"),
+      snippet("INLINE IMAGE CONTENT HELPERS"),
+      snippet("TOOL CALL DISPATCH"),
+    ].join("\n"), sandbox, { filename: "contact-dispatch.api.js" });
+
+    let handler;
+    const authToken = "contact-fixture-token";
+    installMcpHandler({
+      sandbox,
+      server: { registerPathHandler(route, callback) { assert.equal(route, "/"); handler = callback; } },
+    }, authToken);
+    // Search/reuse: validation.test.cjs captures HTTP responses this way; the
+    // exported httpd.request instead drives socket framing. Simulate only I/O.
+    sandbox.request = (method, params) => new Promise(resolve => {
+      const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
+      let output = "";
+      handler({
+        method: "POST",
+        bodyInputStream: { available: () => body.length, read: count => body.subarray(0, count) },
+        getHeader: name => name === "Authorization" ? `Bearer ${authToken}` : String(body.length),
+      }, {
+        processAsync() {}, setStatusLine() {}, setHeader() {},
+        write(text) { output += text; },
+        finish() { resolve(JSON.parse(output)); },
+      });
+    });
+  }
 
   // Convenience adapters only unpack arguments; production owns all decisions.
   const fields = [
@@ -456,7 +558,7 @@ function loadContactRuntime({ books = [new FakeAddressBook()], esmUnavailable = 
     "organization", "title", "note", "birthday",
   ];
   return {
-    ...sandbox, books, calls,
+    ...sandbox, books, calls, values, readErrors, writes,
     create(args = {}) {
       return sandbox.createContact(...fields.map(field => args[field]), args.addressBookId);
     },
