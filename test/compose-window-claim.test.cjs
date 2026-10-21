@@ -180,7 +180,7 @@ function makeHarness(options = {}) {
     };
     call.promise = sandbox.openComposeWindowWithCustomizations(
       params, ORIGINAL_URI, type, identity, call.body, call.isHtml,
-      call.to, call.cc, call.bcc, call.attachments
+      call.to, call.cc, call.bcc, call.attachments, undefined, options.checkAccess
     );
     return call;
   }
@@ -273,6 +273,24 @@ describe("compose window ownership", () => {
     assert.deepEqual(duplicate.bodies, []);
     assertClean(h);
   });
+
+  for (const stage of ["initialization", "body ready"]) {
+    it(`stops automatic-draft customization when permission is revoked before ${stage}`, async () => {
+      let allowed = true;
+      const h = makeHarness({ checkAccess() { if (!allowed) throw new Error("saveDraft permission revoked"); } });
+      const call = h.start("A");
+      const win = h.openings[0].win;
+      if (stage === "body ready") win.fireInit();
+      allowed = false;
+      if (stage === "initialization") win.fireInit();
+      else win.bodyReady();
+      assert.match((await call.promise).error, /saveDraft permission revoked/);
+      assert.deepEqual(win.bodies, []);
+      assert.deepEqual(win.recipients, []);
+      assert.deepEqual(win.attachments, []);
+      assertClean(h);
+    });
+  }
 
   it("recovers when an abandoned forward initializes late and closes", async () => {
     const h = makeHarness({ deferNativeWindow: true });

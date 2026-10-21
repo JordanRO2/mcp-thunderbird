@@ -62,6 +62,9 @@ function loadTools({ allowed = false, streamError = null } = {}) {
   folder.msgDatabase = { enumerateMessages: () => headers };
   const sandbox = {
     console,
+    TextDecoder, Uint8Array, atob,
+    Cr: { NS_BASE_STREAM_CLOSED: "closed" },
+    isToolEnabled: () => true,
     Services: { prefs: { getBoolPref: (name, fallback) => (name.endsWith(".allowEncryptedMessages") ? allowed : fallback) } },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
@@ -83,10 +86,13 @@ function loadTools({ allowed = false, streamError = null } = {}) {
   vm.runInContext([
     source.match(/^const PREF_\w+ = .+;$/gm).join("\n"),
     snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
+    snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
+    snippet("// BEGIN MESSAGE TEXT CONVERSION", "// END MESSAGE TEXT CONVERSION"),
     snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
+    snippet("// BEGIN RAW MIME ATTACHMENT HELPERS", "// END RAW MIME ATTACHMENT HELPERS"),
     snippet("// BEGIN ENCRYPTED MESSAGE GUARD", "// END ENCRYPTED MESSAGE GUARD"),
     snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
-    snippet("function displayMessage(", "function isTrashOrDescendant("),
+    snippet("async function displayMessage(", "function isTrashOrDescendant("),
   ].join("\n"), sandbox);
   return {
     api: sandbox, stats, folder,
@@ -174,7 +180,7 @@ describe("getRecentMessages protects subjects of encrypted mail", () => {
 });
 
 describe("displayMessage while encrypted message access is off", () => {
-  it("refuses messages that are encrypted or recorded as encrypted, before opening them", () => {
+  it("refuses messages that are encrypted or recorded as encrypted, before opening them", async () => {
     for (const options of [
       { raw: ENCRYPTED_RAW },
       { raw: "Subject: S/MIME\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nx" },
@@ -183,7 +189,7 @@ describe("displayMessage while encrypted message access is off", () => {
     ]) {
       const h = loadTools();
       h.add({ id: "message", ...options });
-      const result = h.api.displayMessage("message", h.folder.URI);
+      const result = await h.api.displayMessage("message", h.folder.URI);
       assert.match(result.error, /Encrypted messages cannot be displayed while encrypted message access is off/);
       assert.equal(result.subject, undefined);
       assert.equal(h.stats.displayed, 0);
@@ -191,11 +197,11 @@ describe("displayMessage while encrypted message access is off", () => {
     }
   });
 
-  it("displays clear messages and, after opt-in, encrypted ones", () => {
+  it("displays clear messages and, after opt-in, encrypted ones", async () => {
     for (const [allowed, raw] of [[false, CLEAR_RAW], [true, ENCRYPTED_RAW]]) {
       const h = loadTools({ allowed });
       h.add({ id: "message", raw });
-      const result = h.api.displayMessage("message", h.folder.URI);
+      const result = await h.api.displayMessage("message", h.folder.URI);
       assert.equal(result.success, true, result.error);
       assert.equal(h.stats.displayed, 1);
     }

@@ -181,6 +181,10 @@ describe('bridge request outcomes', () => {
     ['getMessage', { rawSource: true }],
     ['getMessage', { rawSource: 'true' }],
     ['getMessages', { rawSource: true }],
+    ['getMessage', { rawSource: false }],
+    ['getMessage', {}],
+    ['getMessages', {}],
+    ['displayMessage', {}],
   ]) {
     it(`${name} ${JSON.stringify(args)} outlasts the extension's 120 s server fetch`, async () => {
       const { runtime, requests } = loadRequests();
@@ -193,8 +197,6 @@ describe('bridge request outcomes', () => {
   }
 
   for (const message of [
-    toolCall('getMessage', { rawSource: false }),
-    toolCall('getMessage'),
     toolCall('listFolders'),
     toolCall('sendMail'),
     ...['sendMail', 'replyToMessage', 'forwardMessage'].flatMap((name) =>

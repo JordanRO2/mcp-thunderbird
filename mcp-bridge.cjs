@@ -1299,9 +1299,8 @@ async function handleMessage(line) {
 // BEGIN BRIDGE HTTP REQUEST HELPERS
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
-// The extension streams an uncached IMAP message from the server for up to
-// 120 s (RAW_SERVER_FETCH_TIMEOUT_MS) before getMessage(rawSource) answers.
-const RAW_SOURCE_TIMEOUT = 150000;
+// Whole message reads (including batches) have a 120 s extension deadline.
+const MESSAGE_READ_TIMEOUT = MAIL_OPERATION_TIMEOUT;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;
@@ -1309,9 +1308,8 @@ function getThunderbirdRequestPolicy(message) {
   if (message?.method === 'tools/call') {
     const name = message.params?.name;
     const args = message.params?.arguments;
-    const rawSource = args?.rawSource === true || args?.rawSource === 'true';
-    if ((name === 'getMessage' || name === 'getMessages') && rawSource) {
-      timeoutMs = RAW_SOURCE_TIMEOUT;
+    if (name === 'getMessage' || name === 'getMessages' || name === 'displayMessage') {
+      timeoutMs = MESSAGE_READ_TIMEOUT;
     }
     // Match coerceToolArgs in the extension: only the exact string "true"
     // becomes true before validation and dispatch.
