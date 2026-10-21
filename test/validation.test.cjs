@@ -61,6 +61,7 @@ function loadProductionAttachmentValidation(overrides = {}, transform = code => 
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
     getMarkedApiSnippet('// BEGIN ATTACHMENT EXPORT DIRECTORY', '// END ATTACHMENT EXPORT DIRECTORY'),
     getMarkedApiSnippet('// BEGIN COMPOSE ACCOUNT KEY', '// END COMPOSE ACCOUNT KEY'),
+    getMarkedApiSnippet('// BEGIN COMPOSE SIZE GUARD', '// END COMPOSE SIZE GUARD'),
     'Object.assign(this, { composeMail, saveDraft, replyToMessage, forwardMessage, isSensitiveFilePath, ensureAttachmentDir, descsToMsgAttachments, addAttachmentsToComposeWindow });',
     'this.isValidBase64 = isValidBase64;',
     'this.buildTools = buildTools;',
@@ -1855,7 +1856,7 @@ function makeOutboundMailRuntime(options = {}) {
         },
       }); } },
       '@mozilla.org/messengercompose/composeparams;1': { createInstance: () => { state.params++; return {}; } },
-      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => { state.fields++; return { addAttachment() {} }; } },
+      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => { state.fields++; return { addAttachment() {}, setHeader() {} }; } },
       '@mozilla.org/messengercompose;1': { getService: () => ({ OpenComposeWindowWithParams() { state.windows++; } }) },
       '@mozilla.org/network/file-output-stream;1': { createInstance: () => ({
         init(file, flags) {
@@ -2706,4 +2707,182 @@ describe('Direct send recipient preflight', () => {
       }
     });
   }
+});
+
+describe('Conservative compose size preflight', () => {
+  const thresholdPref = 'mailnews.message_warning_size';
+  const args = { to: 'to@example.com', subject: 'subject', body: 'Body', skipReview: true };
+  // Reuse the production signature/format loaders and instrumented filesystem.
+  function makeRuntime({ identity = {}, prefs = {} } = {}) {
+    const h = makeOutboundMailRuntime();
+    h.runtime.Services.prefs = makeDirectSendPrefs(prefs);
+    h.runtime.setComposeIdentity = params => {
+      params.identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, ...identity };
+    };
+    h.runtime.Ci.nsIMsgCompFormat = { Default: 0, HTML: 1, PlainText: 2 };
+    vm.runInContext([
+      getMarkedApiSnippet('function escapeHtml(s) {', '// BEGIN MESSAGE TEXT CONVERSION'),
+      getMarkedApiSnippet('// BEGIN COMPOSE HTML FRAGMENT', '// END COMPOSE HTML FRAGMENT'),
+      getMarkedApiSnippet('// BEGIN COMPOSE SIGNATURE HELPERS', '// END COMPOSE SIGNATURE HELPERS'),
+      getMarkedApiSnippet('// BEGIN COMPOSE FORMAT HELPER', '// END COMPOSE FORMAT HELPER'),
+    ].join('\n'), h.runtime);
+    return h;
+  }
+  const noExecution = state => {
+    assert.equal(state.writes + state.decodes + state.native + state.params + state.fields + state.sent + state.windows + state.drafts, 0);
+    assert.equal(state.removed.length, 0);
+  };
+
+  it('uses padded base64 with 72-column CRLFs, including exact multiples and the terminal blank line', () => {
+    const { runtime } = makeRuntime();
+    for (const [raw, expected] of [[0, 2], [1, 6], [2, 6], [3, 6], [4, 10], [53, 76], [54, 76], [55, 80], [108, 150]]) {
+      assert.equal(runtime.getComposeBase64Size(raw), expected, String(raw));
+    }
+    const textSize = runtime.getComposeTextSize(1000);
+    assert.ok(textSize > 3000, 'QP and soft breaks exceed the tempting base64-only bound');
+  });
+
+  it('allows equality and refuses only greater estimates, with the same dry-run blocker before materialization', async () => {
+    const attachments = [{ name: 'payload.bin', contentType: 'application/octet-stream', base64: Buffer.alloc(54).toString('base64') }];
+    const { runtime } = makeRuntime();
+    const estimate = runtime.dryRunCompose({ ...args, attachments }).estimatedEncodedBytes;
+    assert.ok(estimate > 76);
+    for (const [threshold, allowed] of [[estimate - 1, false], [estimate, true], [estimate + 1, true]]) {
+      const h = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const dry = h.runtime.dryRunCompose({ ...args, attachments });
+      assert.equal(dry.wouldSucceed, allowed);
+      assert.equal(dry.estimatedEncodedBytes, estimate);
+      assert.equal(dry.warningThresholdBytes, threshold);
+      noExecution(h.state);
+      const real = await h.runtime.composeMail({ ...args, attachments });
+      if (allowed) {
+        assert.equal(real.success, true, real.error);
+        assert.equal(h.state.sent, 1);
+        assert.equal(h.state.writes, 1);
+      } else {
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /skipReview: false/);
+        noExecution(h.state);
+      }
+    }
+  });
+
+  for (const threshold of [0, -1]) {
+    it(`does not gate sizes when the user's threshold is ${threshold}`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const result = runtime.dryRunCompose({ ...args, body: 'x'.repeat(1000000) });
+      assert.equal(result.wouldSucceed, true);
+      assert.ok(result.estimatedEncodedBytes > 3000000);
+      assert.equal(result.warningThresholdBytes, threshold);
+      noExecution(state);
+    });
+  }
+
+  for (const threshold of [undefined, 'large', 1.5, NaN]) {
+    it(`fails closed on an invalid threshold (${String(threshold)}) while review remains available`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const direct = runtime.dryRunCompose(args);
+      assert.equal(direct.wouldSucceed, false);
+      assert.match(direct.blockers[0], /threshold could not be read/);
+      const review = runtime.dryRunCompose({ ...args, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.match(review.warnings[0], /threshold could not be read/);
+      assert.equal(runtime.composeMail(args).error, direct.blockers[0]);
+      noExecution(state);
+    });
+  }
+
+  it('refuses failed preference reads without writing preferences or executing compose', () => {
+    const { runtime, state } = makeRuntime();
+    const prefs = runtime.Services.prefs;
+    runtime.Services.prefs = new Proxy(prefs, {
+      get(target, key) {
+        if (String(key).startsWith('set')) return () => assert.fail('must not change preferences');
+        if (key === 'getIntPref') return name => {
+          if (name === thresholdPref) throw new Error('unreadable');
+          return target[key](name);
+        };
+        return target[key];
+      },
+    });
+    const dry = runtime.dryRunCompose(args);
+    assert.match(dry.blockers[0], /threshold could not be read/);
+    noExecution(state);
+  });
+
+  it('bounds prepared UTF-8, HTML entities, newlines and appended signatures, with distinct input length', () => {
+    const body = 'Zażółć 😀\n<&>\r\n';
+    const identity = { htmlSigText: 'Signed 😀\nSupport', composeHtml: true };
+    const { runtime, state } = makeRuntime({ identity });
+    for (const isHtml of [false, true, null]) {
+      const request = { ...args, body, isHtml };
+      const plan = runtime.prepareCompose(request);
+      const result = runtime.dryRunCompose(request);
+      assert.equal(result.inputBodyLength, body.length);
+      assert.ok(result.estimatedEncodedBytes > Buffer.byteLength(plan.body));
+      assert.ok(plan.body.includes('Signed 😀'));
+      if (isHtml !== false) assert.ok(plan.body.startsWith('<html>'));
+      assert.ok(result.estimatedEncodedBytes > runtime.dryRunCompose({ ...request, includeSignature: false }).estimatedEncodedBytes);
+      assert.equal(result.isHtml, isHtml !== false);
+    }
+    noExecution(state);
+  });
+
+  it('blocks body-only and signature-only messages, and warns for a dry review', () => {
+    for (const config of [
+      { request: { body: 'é\n'.repeat(10000) } },
+      { identity: { htmlSigText: 'é\n'.repeat(10000) }, request: {} },
+    ]) {
+      const h = makeRuntime({ identity: config.identity, prefs: { [thresholdPref]: 100000 } });
+      const dry = h.runtime.dryRunCompose({ ...args, ...config.request });
+      assert.equal(dry.wouldSucceed, false);
+      assert.ok(dry.estimatedEncodedBytes > 100000);
+      assert.equal(h.runtime.composeMail({ ...args, ...config.request }).error, dry.blockers[0]);
+      const review = h.runtime.dryRunCompose({ ...args, ...config.request, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.equal(review.warnings.length, 1);
+      noExecution(h.state);
+    }
+  });
+
+  it('includes dynamic subjects, Bcc, filenames, custom headers, organization, Reply-To and vCards', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const long = '😀'.repeat(1000);
+    for (const config of [
+      { request: { subject: long } }, { request: { bcc: long + '@example.com' } },
+      { request: { attachments: [{ name: long, base64: 'QQ==' }] } },
+      { identity: { organization: long } }, { identity: { replyTo: long + '@example.com' } },
+      { identity: { attachVCard: true, escapedVCard: long } },
+      { prefs: { 'mail.identity.sender.headers': 'custom', 'mail.identity.sender.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'mail.identity.default.headers': 'custom', 'mail.identity.default.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'general.useragent.override': long } },
+    ]) {
+      const { runtime, state } = makeRuntime(config);
+      assert.ok(runtime.dryRunCompose({ ...args, ...config.request }).estimatedEncodedBytes > baseline + 1000);
+      noExecution(state);
+    }
+  });
+
+  it('fails closed on unbounded identity content and raw snapshot lengths; nonpositive thresholds still disable the gate', () => {
+    for (const config of [
+      { identity: { attachVCard: true } },
+      { identity: { organization: 42 } },
+      { prefs: { 'mail.identity.sender.headers': 42 } },
+    ]) {
+      const h = makeRuntime(config);
+      const direct = h.runtime.dryRunCompose(args);
+      assert.equal(direct.estimatedEncodedBytes, null);
+      assert.match(direct.blockers[0], /could not be safely bounded/);
+      assert.equal(h.runtime.dryRunCompose({ ...args, skipReview: false }).warnings.length, 1);
+      noExecution(h.state);
+      const disabled = makeRuntime({ ...config, prefs: { ...config.prefs, [thresholdPref]: 0 } });
+      assert.equal(disabled.runtime.dryRunCompose(args).wouldSucceed, true);
+    }
+    const { runtime } = makeRuntime();
+    for (const inheritedRawBytes of [undefined, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER]) {
+      const size = runtime.assessComposeSize({ identity: { key: 'sender' }, body: '', inheritedRawBytes });
+      assert.equal(size.estimatedEncodedBytes, null);
+      assert.match(size.warning, /could not be safely bounded/);
+    }
+  });
 });

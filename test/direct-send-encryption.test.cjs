@@ -324,7 +324,8 @@ describe("direct send identity encryption pass-through cases", () => {
         assert.equal(result.success, true, result.error);
         assert.equal(h.calls.reviews, 1);
         assert.equal(h.calls.sends.length, 0);
-        assert.equal(h.calls.preferences.length, 0);
+        assert.equal(h.calls.preferences.filter(({ name }) =>
+          /encryptionpolicy|openpgp_key_id|encryption_cert_name|auto_enable/.test(name)).length, 0);
       });
     }
     it(`${tool}: Block skipReview still wins before identity preferences or native creation`, async () => {

@@ -5203,6 +5203,118 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return key;
             }
             // END COMPOSE ACCOUNT KEY
+            // BEGIN COMPOSE SIZE GUARD
+            const COMPOSE_SIZE_WARNING_PREF = "mailnews.message_warning_size";
+            const COMPOSE_SIZE_REVIEW = "Use skipReview: false to review the message in Thunderbird.";
+            const COMPOSE_SIZE_FIXED_BYTES = 16 * 1024;
+            const COMPOSE_SIZE_PART_BYTES = 1024;
+            const COMPOSE_SIZE_HEADER_BYTES = 256;
+            const COMPOSE_SIZE_MARGIN = 1.25;
+            const COMPOSE_BASE64_COLUMNS = 72;
+            // Quote prefixes, HTML escaping, charset decoding, inherited headers
+            // and re-encoded original attachments can all expand a raw snapshot.
+            // Also measure the final prepared quote before sending (see below).
+            const COMPOSE_ORIGINAL_EXPANSION = 32;
+
+            // Searched getBase64EncodedSize/truncateHtmlForParsing: reuse their
+            // base64 quantum and UTF-8 accounting. MimeEncoder on ESR128/140/153
+            // adds a CRLF even on an exact 72-column boundary (and for empty data).
+            function getComposeBase64Size(bytes) {
+              const encoded = getBase64EncodedSize(bytes);
+              return encoded + 2 * (Math.floor(encoded / COMPOSE_BASE64_COLUMNS) + 1);
+            }
+
+            function getComposeTextSize(bytes) {
+              // QP may encode every byte, with soft breaks. Base64 can instead
+              // encode text after LF -> CRLF normalization; bound both choices.
+              const qp = 3 * bytes;
+              return Math.max(qp + 3 * (Math.floor(qp / COMPOSE_BASE64_COLUMNS) + 1) + 2,
+                getComposeBase64Size(2 * bytes));
+            }
+
+            function estimateComposeSize(plan) {
+              const { identity, body, headers = [], attachments = [], useHtml = false } = plan;
+              const inheritedRawBytes = Object.hasOwn(plan, "inheritedRawBytes") ? plan.inheritedRawBytes : 0;
+              const textBytes = value => {
+                if (typeof value !== "string") throw new Error("Unbounded compose text");
+                return truncateHtmlForParsing(value, Number.MAX_SAFE_INTEGER).bytes;
+              };
+              const validSize = value => {
+                if (!Number.isSafeInteger(value) || value < 0) throw new Error("Unbounded compose size");
+                return value;
+              };
+              // Reuse S4's typed identity-pref fallback. Missing custom attributes
+              // are empty; failed reads or wrong types must not become empty data.
+              const optionalPref = name => {
+                const type = Services.prefs.getPrefType(name);
+                if (type === Ci.nsIPrefBranch.PREF_INVALID) return "";
+                if (type !== Ci.nsIPrefBranch.PREF_STRING) throw new Error("Unreadable header preference");
+                const value = Services.prefs.getStringPref(name);
+                textBytes(value);
+                return value;
+              };
+              const identityPref = name => {
+                const pref = `mail.identity.${identity.key}.${name}`;
+                return optionalPref(Services.prefs.getPrefType(pref) === Ci.nsIPrefBranch.PREF_INVALID
+                  ? `mail.identity.default.${name}` : pref);
+              };
+              const headerValues = [...headers];
+              for (const key of ["email", "fullName", "organization", "replyTo", "doCcList", "doBccList"]) {
+                headerValues.push(identity[key] ?? "");
+              }
+              headerValues.push(identityPref("FQDN"), optionalPref("general.useragent.override"));
+              for (const name of identityPref("headers").split(",")) {
+                // Thunderbird even reads header.<empty> for an empty list.
+                headerValues.push(identityPref(`header.${name}`));
+              }
+              // From/receipt/Reply-To and mailing-list headers can repeat values.
+              // RFC 2047 and RFC 2231 folding/encoding is covered by the text
+              // bound plus per-header overhead, with a growth-dependent margin.
+              const headerBytes = headerValues.reduce((sum, value) => sum + textBytes(value) + COMPOSE_SIZE_HEADER_BYTES, 0);
+              let bytes = COMPOSE_SIZE_FIXED_BYTES + 4 * getComposeTextSize(headerBytes);
+              // Reserve an HTML part and its possible generated plain alternative.
+              bytes += getComposeTextSize(textBytes(body) * (useHtml ? 3 : 1));
+              bytes += getComposeTextSize(validSize(inheritedRawBytes) * COMPOSE_ORIGINAL_EXPANSION);
+              for (const attachment of attachments) {
+                const size = validSize(attachment.size);
+                bytes += COMPOSE_SIZE_PART_BYTES;
+                bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? ""));
+                // Only a known binary type guarantees base64. Path/type inference
+                // and textual attachments need the QP worst case instead.
+                bytes += attachment.contentType === "application/octet-stream"
+                  ? getComposeBase64Size(size) : getComposeTextSize(size);
+              }
+              if (identity.attachVCard) {
+                // Percent-unescaping cannot exceed the escaped input's byte count.
+                bytes += COMPOSE_SIZE_PART_BYTES + getComposeTextSize(textBytes(identity.escapedVCard));
+              }
+              return validSize(Math.ceil(bytes * COMPOSE_SIZE_MARGIN));
+            }
+
+            function assessComposeSize(plan) {
+              let estimatedEncodedBytes = null;
+              let warningThresholdBytes;
+              try { estimatedEncodedBytes = estimateComposeSize(plan); } catch { /* fail closed below */ }
+              try {
+                if (Services.prefs.getPrefType(COMPOSE_SIZE_WARNING_PREF) !== Ci.nsIPrefBranch.PREF_INT) {
+                  throw new Error("Unreadable size threshold");
+                }
+                warningThresholdBytes = Services.prefs.getIntPref(COMPOSE_SIZE_WARNING_PREF);
+                if (!Number.isSafeInteger(warningThresholdBytes)) throw new Error("Invalid size threshold");
+              } catch { warningThresholdBytes = null; }
+              let warning = null;
+              if (warningThresholdBytes === null) {
+                warning = `Unreviewed sending is blocked because Thunderbird's large-message threshold could not be read. ${COMPOSE_SIZE_REVIEW}`;
+              } else if (warningThresholdBytes > 0) {
+                if (estimatedEncodedBytes === null) {
+                  warning = `Unreviewed sending is blocked because the encoded message size could not be safely bounded. ${COMPOSE_SIZE_REVIEW}`;
+                } else if (estimatedEncodedBytes > warningThresholdBytes) {
+                  warning = `Unreviewed sending is blocked because the conservative encoded size estimate (${estimatedEncodedBytes} bytes) exceeds Thunderbird's large-message threshold (${warningThresholdBytes} bytes). ${COMPOSE_SIZE_REVIEW}`;
+                }
+              }
+              return { estimatedEncodedBytes, warningThresholdBytes, warning };
+            }
+            // END COMPOSE SIZE GUARD
             function sendThroughCompose(msgComposeParams, attachDescs, useHtml, preparedAccountKey) {
               const identity = msgComposeParams.identity;
               if (!identity) {
@@ -10539,7 +10651,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                           return;
                         }
-                        settle({ mime, quoted, deadline });
+                        settle({ mime, quoted, deadline, rawBytes: raw.length });
                       } catch {
                         settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                       }
@@ -10678,7 +10790,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // The window inserts its own signature. The direct path must build it here.
               const preparedBody = buildBodyWithSignature(body, identity, useHtml, isHtml,
                 skipReview ? includeSignature : false);
-              return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody };
+              const size = assessComposeSize({ identity, useHtml, body: skipReview ? preparedBody
+                : buildBodyWithSignature(body, identity, useHtml, isHtml),
+              headers: [...Object.values(recipients.headers), args.subject || ""], attachments: descs });
+              return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody, size,
+                ...(skipReview && size.warning ? { error: size.warning } : {}) };
+
             }
             // END COMPOSE PREPARATION
 
@@ -10693,16 +10810,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const refuse = error => dryRun ? { ...report, blockers: [error] } : { error };
               try {
                 const plan = prepareCompose(args);
+                const { identity, accountKey, recipients, useHtml, format, descs, body, size } = plan;
+                if (identity) Object.assign(report, {
+                  resolvedIdentity: { id: identity.key, email: identity.email, name: identity.fullName || null },
+                  isHtml: useHtml, recipients: recipients.counts,
+                  attachments: descs.map(({ name, size, contentType }) => ({ name, size, ...(contentType ? { contentType } : {}) })),
+                  estimatedEncodedBytes: size.estimatedEncodedBytes, warningThresholdBytes: size.warningThresholdBytes,
+                  warnings: !args.skipReview && size.warning ? [size.warning] : [],
+                });
                 if (plan.error) return refuse(plan.error);
-                const { identity, accountKey, recipients, useHtml, format, descs, body } = plan;
-                if (dryRun) {
-                  return {
-                    ...report, wouldSucceed: true,
-                    resolvedIdentity: { id: identity.key, email: identity.email, name: identity.fullName || null },
-                    isHtml: useHtml, recipients: recipients.counts,
-                    attachments: descs.map(({ name, size, contentType }) => ({ name, size, ...(contentType ? { contentType } : {}) })),
-                  };
-                }
+                if (dryRun) return { ...report, wouldSucceed: true };
                 const fileDescs = materializeAttachmentDescs(descs);
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
@@ -11049,7 +11166,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  if (error) return { error };
 	                }
 	                if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
-	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+	                const { descs: inspectedDescs } = filePathsToAttachDescs(attachments, { dryRun: true });
+	                let preparedAccountKey;
+	                let sizePlan;
+	                if (skipReview) {
+	                  preparedAccountKey = getComposeAccountKey(selectedIdentity.identity);
+	                  const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
+	                  sizePlan = {
+	                    identity: selectedIdentity.identity, useHtml,
+	                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+	                    headers: [to || "", cc || "", bcc || "", messageId || "",
+	                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
+	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+	                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+	                  };
+	                  const size = assessComposeSize(sizePlan);
+	                  if (size.warning) return { error: size.warning };
+	                }
+	                const fileDescs = skipReview ? inspectedDescs : materializeAttachmentDescs(inspectedDescs);
 	                return await new Promise((resolve) => {
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
 	                    .createInstance(Ci.nsIMsgComposeParams);
@@ -11144,7 +11278,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    }
 
 	                    // On success Thunderbird marks the original replied.
-	                    sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
+	                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body });
+	                    if (size.warning) {
+	                      resolve({ error: size.warning });
+	                      return;
+	                    }
+	                    sendThroughCompose(msgComposeParams, materializeAttachmentDescs(fileDescs), replyUseHtml, preparedAccountKey).then(result => {
 	                      if (result.success) {
 	                        let msg = "Reply sent";
 	                        result.message = msg;
@@ -11251,7 +11390,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (error) return { error };
                 }
                 if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
-                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+                const { descs: inspectedDescs } = filePathsToAttachDescs(attachments, { dryRun: true });
+                let preparedAccountKey;
+                let sizePlan;
+                if (skipReview) {
+                  preparedAccountKey = getComposeAccountKey(selectedIdentity.identity);
+                  const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
+                  sizePlan = {
+                    identity: selectedIdentity.identity, useHtml,
+                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+                    headers: [to || "", cc || "", bcc || "", messageId || "",
+                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
+                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+                  };
+                  const size = assessComposeSize(sizePlan);
+                  if (size.warning) return { error: size.warning };
+                }
+                const fileDescs = skipReview ? inspectedDescs : materializeAttachmentDescs(inspectedDescs);
                 return await new Promise((resolve) => {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                     .createInstance(Ci.nsIMsgComposeParams);
@@ -11350,10 +11506,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                       }
                     }
-                    const allDescs = [...origDescs, ...fileDescs];
 
                     // On success Thunderbird marks the original forwarded.
-                    sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
+                    const size = assessComposeSize({ ...sizePlan, body: composeFields.body });
+                    if (size.warning) {
+                      resolve({ error: size.warning });
+                      return;
+                    }
+                    const allDescs = [...origDescs, ...materializeAttachmentDescs(fileDescs)];
+                    sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml, preparedAccountKey).then(result => {
                       if (result.success) {
                         let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                         result.message = msg;

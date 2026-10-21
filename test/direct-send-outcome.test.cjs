@@ -128,6 +128,8 @@ function loadSend(options = {}) {
     isSkipReviewBlocked: () => !!options.blocked,
     findMessage: () => ({ msgHdr: hdr, folder }),
     filePathsToAttachDescs: () => ({ descs: [] }),
+    materializeAttachmentDescs: descs => descs,
+    buildBodyWithSignature: body => body || "",
     setComposeIdentity(params) { params.identity = identity; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     PREF_ALLOW_ENCRYPTED_MESSAGES: "encrypted",

@@ -130,7 +130,7 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
   });
   vm.runInContext([
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
-    snippet("COMPOSE ACCOUNT KEY"), snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
+    snippet("COMPOSE SIZE GUARD"), snippet("COMPOSE ACCOUNT KEY"), snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), api);
   return loaded;
 }
@@ -289,12 +289,15 @@ describe("Direct compose identity signatures", () => {
 
   it("leaves signature insertion to Thunderbird on the review path", async () => {
     const { api, calls } = loadComposeTools();
-    api.buildSignatureFragment = () => assert.fail("review must not append a second signature");
+    let signatureReads = 0;
+    const build = api.buildSignatureFragment;
+    api.buildSignatureFragment = (...args) => { signatureReads++; return build(...args); };
     const result = await api.dispatchTool("sendMail", {
       to: "to@example.test", subject: "Subject", body: "Hello", isHtml: false, includeSignature: true,
     });
     assert.equal(result.success, true);
     assert.equal(calls.reviews[0].composeFields.body, "Hello");
+    assert.equal(signatureReads, 1, "estimate reads the signature, but review body leaves insertion to Thunderbird");
     assert.equal(calls.sends.length, 0);
   });
 
