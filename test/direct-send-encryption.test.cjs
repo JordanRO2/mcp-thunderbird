@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
+const { SEND_LATER_NOW, SEND_LATER_READY, SEND_LATER_HEADER_PARSER, makeSendLaterClock } = require("./helpers/send-later.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const tools = ["sendMail", "replyToMessage", "forwardMessage"];
@@ -61,6 +62,8 @@ function loadEncryptionTools(options = {}) {
   const account = { key: "account", defaultIdentity: options.defaultIdentity || identity, identities: [identity] };
   const sandbox = {
     ...clearOriginalRawFixture,
+    Date: makeSendLaterClock().Date,
+    __tbMcpSendLaterInfo: Object.hasOwn(options, "info") ? options.info : SEND_LATER_READY,
     Ci: {
       nsIPrefBranch: prefTypes,
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
@@ -121,7 +124,7 @@ function loadEncryptionTools(options = {}) {
         OpenComposeWindowWithParams() { calls.reviews++; },
       }) },
     },
-    MailServices: { accounts: {
+    MailServices: { headerParser: SEND_LATER_HEADER_PARSER, accounts: {
       accounts: [account], defaultAccount: account,
       findAccountForServer: () => account,
     } },
@@ -130,7 +133,7 @@ function loadEncryptionTools(options = {}) {
     getAccessibleAccounts: () => [account],
     isAccountAllowed: () => true,
     isSkipReviewBlocked: () => options.blocked === true,
-    isToolEnabled: () => true,
+    isToolEnabled: name => !(options.disabledTools || []).includes(name),
     findMessage: () => ({ msgHdr: hdr, folder }),
     filePathsToAttachDescs: attachments.convert,
     descsToMsgAttachments: attachments.toNative,
@@ -151,6 +154,7 @@ function loadEncryptionTools(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("TWO DIGIT PADDING"),
     snippet("COMPOSE IDENTITY HELPER"), snippet("COMPOSE FORMAT HELPER"),
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"),
@@ -365,4 +369,42 @@ describe("direct send identity policy changes while the original is being classi
       });
     }
   }
+});
+
+
+describe("scheduled draft attachment boundaries", () => {
+  const sendAt = new Date(SEND_LATER_NOW + 3600000).toISOString();
+  for (const [label, options] of [
+    ["encryption policy", { prefs: { [`${identityPrefix}encryptionpolicy`]: 1 } }],
+    ["safety block", { blocked: true }],
+    ["disabled sender", { disabledTools: ["sendMail"] }],
+    ["unavailable Send Later", { info: null }],
+    ["disabled unsent sending", { info: { ...SEND_LATER_READY, sendUnsentMsgs: false } }],
+  ]) {
+    it(`refuses ${label} before real attachment conversion`, async () => {
+      const h = loadEncryptionTools(options);
+      assert.equal(typeof (await h.run("saveDraft", { sendAt })).error, "string");
+      assert.equal(h.calls.drafts, 0);
+      assert.equal(h.calls.created.sender, 0);
+      assertNoAttachmentEffects(h.calls.attachments);
+    });
+  }
+
+  it("retains S2's sensitive-path refusal for scheduled drafts", async () => {
+    const h = loadEncryptionTools();
+    const result = await h.run("saveDraft", { sendAt, attachments: ["/fixture/.ssh/id_rsa"] });
+    assert.equal(typeof result.error, "string");
+    assert.equal(h.calls.drafts, 0);
+    assert.equal(h.calls.created.sender, 0);
+  });
+
+  it("saves allowed attachments through the existing draft sender", async () => {
+    const h = loadEncryptionTools();
+    const result = await h.run("saveDraft", { sendAt });
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.sendAt, sendAt);
+    assert.equal(h.calls.drafts, 1);
+    assert.equal(h.calls.sends.length, 0);
+    assert.equal(h.calls.attachments.nativeCreates, 2);
+  });
 });

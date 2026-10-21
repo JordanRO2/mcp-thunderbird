@@ -187,6 +187,20 @@
             "description": "When true, server binds to 0.0.0.0 instead of 127.0.0.1. Server will be restarted."
           }
         ]
+      },
+      {
+        "name": "setSendLaterInfo",
+        "type": "function",
+        "async": true,
+        "description": "Record Send Later readiness from a bounded background refresh, or clear it when unavailable. Called only by the background script; not exposed over MCP.",
+        "parameters": [
+          {
+            "name": "info",
+            "type": "any",
+            "optional": true,
+            "description": "{ uuid, checkedAt, sendDrafts, sendUnsentMsgs, checkTimePref }, or null. checkedAt is the refresh start time in Unix milliseconds; snapshots older than three minutes cannot schedule delivery."
+          }
+        ]
       }
     ]
   }

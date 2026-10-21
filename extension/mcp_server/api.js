@@ -1621,7 +1621,9 @@ function parseFilterType(raw) {
 }
 
 const LOCAL_DAY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+// BEGIN TWO DIGIT PADDING
 const pad2 = (n) => String(n).padStart(2, "0");
+// END TWO DIGIT PADDING
 const formatLocalDay = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 
 // Each codec: the hint shown in the schema and in error messages, parse(raw,
@@ -2503,7 +2505,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "saveDraft",
         group: "messages", crud: "create",
         title: "Save Draft",
-        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Includes the identity signature by default for new drafts, but not replacements.",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. With sendAt, the draft is scheduled for delayed delivery by the Send Later add-on. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Includes the identity signature by default for new drafts, but not replacements.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2519,6 +2521,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             includeSignature: { type: "boolean", description: "Append the identity signature. Defaults to true for a new draft and false when replacing a draft, whose body may already include it. Set false for a body with its own signature, or true to append one explicitly." },
             inReplyTo: { type: "string", minLength: 5, maxLength: 998, description: "One bracketed Message-ID, e.g. <id@example.com>, at most 998 characters, without whitespace or control characters. Invalid input is rejected, never repaired. Sets In-Reply-To and defaults References to this ID. Subject and quoted text remain the caller's responsibility." },
             references: { type: "string", minLength: 5, maxLength: 16384, description: "Up to 100 bracketed Message-IDs separated by single ASCII spaces, oldest first; at most 998 characters per ID and 16384 total. No whitespace within IDs or control characters. Invalid input is rejected. Defaults to inReplyTo when omitted; may also be supplied independently." },
+            sendAt: { type: "string", minLength: 10, maxLength: 64, description: "Schedule unreviewed delivery through Send Later: ISO 8601 date-time (local time without an offset; Z or +02:00 accepted). Requires sendMail enabled, Block skipReview off, a To/Cc/Bcc recipient, an identity permitted by the unreviewed-send encryption checks, and recent Send Later readiness with draft and unsent-message sending enabled. Thunderbird and Send Later must be running for delivery. Calendar-invalid dates are refused; at most 366 days ahead, with a one-minute past-time tolerance. The returned UTC time matches the saved header's second precision. Replacing a scheduled draft without sendAt unschedules it. Re-enabling Block skipReview does not cancel existing schedules." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -3721,6 +3724,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Check if the user has disabled the skipReview shortcut.
              * When true, send/reply/forward/createEvent/createTask tools must open
              * the review window/dialog even if the caller passed skipReview: true.
+             * Scheduled saveDraft delivery (sendAt) is also blocked.
              * Adding calendar attendees is blocked, and meetings with other
              * attendees are read-only: any write can send without review.
              *
@@ -10231,7 +10235,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Searched for identity policy readers: readAccessListPref supplies
             // the strict pref-type pattern, but no identity encryption guard exists.
             // nsIMsgIdentity.encryptionPolicy masks failed preference reads as 0.
-            function getDirectSendIdentityError(identity) {
+            function getDirectSendIdentityError(identity, reviewInstruction = DIRECT_SEND_REVIEW_INSTRUCTION) {
               try {
                 const key = identity?.key;
                 if (typeof key !== "string" || !key.trim()) throw new Error("Missing identity key");
@@ -10250,7 +10254,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const policy = Services.prefs.getIntPref(pref);
                     if (!Number.isInteger(policy) || policy < 0) throw new Error("Invalid encryption policy");
                     if (policy > 0) {
-                      return `Unreviewed sending is blocked because the identity requires encryption. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                      return `Unreviewed sending is blocked because the identity requires encryption. ${reviewInstruction}`;
                     }
                   } else {
                     const value = Services.prefs.getStringPref(pref);
@@ -10267,12 +10271,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const autoEnable = Services.prefs.getBoolPref(AUTO_ENABLE_ENCRYPTION_PREF);
                   if (typeof autoEnable !== "boolean") throw new Error("Invalid automatic encryption setting");
                   if (autoEnable) {
-                    return `Unreviewed sending is blocked because automatic encryption is enabled for this identity. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                    return `Unreviewed sending is blocked because automatic encryption is enabled for this identity. ${reviewInstruction}`;
                   }
                 }
                 return null;
               } catch {
-                return `Unreviewed sending is blocked because the identity's encryption settings could not be read. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                return `Unreviewed sending is blocked because the identity's encryption settings could not be read. ${reviewInstruction}`;
               }
             }
             // END DIRECT SEND ENCRYPTION GUARD
@@ -10569,6 +10573,84 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DRAFT HELPERS
 
+            // BEGIN SAVE DRAFT TOOL
+            // BEGIN SEND LATER SCHEDULING
+            const SEND_LATER_MAX_DAYS = 366;
+            const SEND_LATER_INFO_MAX_AGE_MS = 3 * 60 * 1000;
+            const SEND_LATER_PAST_TOLERANCE_MS = 60 * 1000;
+            const SEND_LATER_DAY_MS = 24 * 60 * 60 * 1000;
+            const SEND_LATER_REVIEW_INSTRUCTION = "Omit sendAt to save a plain draft, or use sendMail with skipReview: false to send through Thunderbird's review window.";
+
+            /**
+             * Formats a date as an RFC 5322 date-time in local time, the format
+             * Send Later itself writes into X-Send-Later-At.
+             */
+            function formatRfc5322Local(date) {
+              const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+              const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+              const offset = -date.getTimezoneOffset();
+              const sign = offset >= 0 ? "+" : "-";
+              const abs = Math.abs(offset);
+              return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()} ` +
+                `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())} ` +
+                `${sign}${pad2(Math.floor(abs / 60))}${pad2(abs % 60)}`;
+            }
+
+            /**
+             * Validates sendAt and returns the Send Later headers to set, or
+             * { error }. Scheduling sends without review, so it is gated by the
+             * same preference as skipReview.
+             */
+            function resolveSendLaterSchedule(sendAt) {
+              const match = typeof sendAt === "string" && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/.exec(sendAt.trim());
+              if (!match) {
+                return { error: "sendAt must be an ISO 8601 date-time such as 2026-10-17T10:00 (local time) or 2026-10-17T10:00:00+02:00" };
+              }
+              if (isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview, and a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
+              }
+              if (!isToolEnabled("sendMail")) {
+                return { error: "sendAt requires the sendMail tool to be enabled; a scheduled draft is sent without review. Omit sendAt to save a plain draft." };
+              }
+              const now = Date.now();
+              const info = globalThis.__tbMcpSendLaterInfo;
+              if (!info || !Number.isFinite(info.checkedAt) || info.checkedAt > now ||
+                  now - info.checkedAt > SEND_LATER_INFO_MAX_AGE_MS) {
+                return { error: "Send Later add-on (sendlater3@kamens.us) is not installed, disabled, or its information is unavailable or older than 3 minutes; the draft was not saved." };
+              }
+              // A scheduled draft that Send Later will never scan would look
+              // scheduled to the caller and silently stay in Drafts.
+              if (info.sendDrafts !== true) {
+                return { error: "Send Later is installed but does not send scheduled drafts (its \"send scheduled drafts\" option is off or unreadable); the draft was not saved." };
+              }
+              if (info.sendUnsentMsgs !== true) {
+                return { error: "Send Later's \"send unsent messages\" option is off or unreadable; the draft was not saved." };
+              }
+              if (!(Number.isFinite(info.checkTimePref) && info.checkTimePref > 0)) {
+                return { error: "Send Later is installed but its check interval is 0 or unreadable, so it never sends; the draft was not saved." };
+              }
+              const [year, month, day, hour, minute, second] = match.slice(1, 7).map(value => Number(value || 0));
+              const calendarDay = new Date(0);
+              calendarDay.setUTCFullYear(year, month - 1, day);
+              if (calendarDay.getUTCFullYear() !== year || calendarDay.getUTCMonth() !== month - 1 ||
+                  calendarDay.getUTCDate() !== day || hour > 23 || minute > 59 || second > 59) {
+                return { error: "sendAt is not a valid calendar date-time" };
+              }
+              const date = new Date(sendAt.trim());
+              if (Number.isNaN(date.getTime())) return { error: "sendAt is not a valid date" };
+              // A local time in a DST gap must not silently move to a later hour.
+              if (!match[8] && (date.getFullYear() !== year || date.getMonth() !== month - 1 ||
+                  date.getDate() !== day || date.getHours() !== hour || date.getMinutes() !== minute)) {
+                return { error: "sendAt is not a valid local date-time" };
+              }
+              // RFC 5322 headers have second precision. Report the stored instant.
+              date.setUTCMilliseconds(0);
+              if (date.getTime() < now - SEND_LATER_PAST_TOLERANCE_MS) return { error: "sendAt is in the past" };
+              if (date.getTime() > now + SEND_LATER_MAX_DAYS * SEND_LATER_DAY_MS) return { error: `sendAt is more than ${SEND_LATER_MAX_DAYS} days ahead` };
+              return { uuid: info.uuid, date, header: formatRfc5322Local(date) };
+            }
+            // END SEND LATER SCHEDULING
+
             /**
              * Saves a composed message to the identity's Drafts folder without
              * sending or opening a compose window. The destination folder is
@@ -10582,9 +10664,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * correction of a saved draft would accumulate one more copy in the
              * Drafts folder, and the caller has no way to remove the stale one.
              */
-            // BEGIN SAVE DRAFT TOOL
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature) {
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt) {
               try {
+                // Omitted or null sendAt keeps the plain draft behavior unchanged.
+                let scheduled = null;
+                if (sendAt !== undefined && sendAt !== null) {
+                  scheduled = resolveSendLaterSchedule(sendAt);
+                  if (scheduled.error) return { error: scheduled.error };
+                  // splitAddressHeader/extractAddressEmail do not flatten empty
+                  // groups. Reuse Thunderbird's parser without changing headers.
+                  if (![to, cc, bcc].some(value => typeof value === "string" && value.trim() &&
+                      MailServices.headerParser.parseDecodedHeader(value, false)
+                        .some(address => typeof address.email === "string" && address.email.trim()))) {
+                    return { error: "sendAt requires at least one recipient in To, Cc or Bcc. Omit sendAt to save a plain draft." };
+                  }
+                }
                 if (inReplyTo !== undefined && !isValidMessageIdList(inReplyTo, 1)) {
                   return { error: "inReplyTo must be one bracketed Message-ID (<id@example.com>), at most 998 characters, without whitespace or control characters" };
                 }
@@ -10611,6 +10705,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.references = inReplyTo;
                 }
                 if (references !== undefined) composeFields.references = references;
+                if (scheduled) {
+                  composeFields.setHeader("X-Send-Later-Uuid", scheduled.uuid);
+                  composeFields.setHeader("X-Send-Later-At", scheduled.header);
+                }
 
                 // Resolve the draft to replace BEFORE composing anything: an
                 // unresolvable id must fail the whole call, never silently fall
@@ -10650,6 +10748,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
 
+                if (scheduled) {
+                  const error = getDirectSendIdentityError(msgComposeParams.identity, SEND_LATER_REVIEW_INSTRUCTION);
+                  if (error) return { error };
+                }
+
                 if (msgToReplace) {
                   const draftURI = getIdentityDraftFolderURI(msgComposeParams.identity);
                   if (!draftURI) return { error: "Cannot replace draft: the selected identity has no configured Drafts folder" };
@@ -10683,6 +10786,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ).then(result => {
                   if (result.success) {
                     let msg = msgToReplace ? "Draft replaced" : "Draft saved";
+                    if (scheduled) {
+                      msg += `, scheduled by Send Later for ${scheduled.header}`;
+                      result.sendAt = scheduled.date.toISOString();
+                    }
                     result.message = msg;
 
                     // Thunderbird can populate the identity's folder during save.
@@ -12557,7 +12664,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.includeSignature);
                 case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature);
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature, args.sendAt);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft);
                 case "forwardMessage":
@@ -13114,6 +13221,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         // END OPTIONS ACCESS API
+
+        // BEGIN SEND LATER INFO API
+        // Called only by background.js; identifiers must survive header emission
+        // unchanged. Accept historical formats, never trim or repair them.
+        setSendLaterInfo: async function(info) {
+          const uuid = info?.uuid;
+          if (typeof uuid === "string" && uuid.length > 0 && uuid.length <= 64 &&
+              !/[^\x21-\x7e]/.test(uuid) && Number.isFinite(info.checkedAt) && info.checkedAt <= Date.now()) {
+            globalThis.__tbMcpSendLaterInfo = {
+              uuid,
+              checkedAt: info.checkedAt,
+              sendDrafts: typeof info.sendDrafts === "boolean" ? info.sendDrafts : null,
+              sendUnsentMsgs: typeof info.sendUnsentMsgs === "boolean" ? info.sendUnsentMsgs : null,
+              checkTimePref: Number.isFinite(info.checkTimePref) ? info.checkTimePref : null,
+            };
+          } else {
+            globalThis.__tbMcpSendLaterInfo = null;
+          }
+          return { success: true };
+        },
+        // END SEND LATER INFO API
 
         getBlockSkipReview: async function() {
           let blocked = true;
