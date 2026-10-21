@@ -2489,6 +2489,15 @@ describe('dryRunCompose behavior', () => {
     assert.equal(state.fileCalls, 0);
   });
 
+  it('fails a direct send with no recipients, but not a review window', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const direct = runtime.dryRunCompose({ to: '', subject: 's', body: 'b', cc: '', isHtml: false, skipReview: true });
+    assert.equal(direct.wouldSucceed, false);
+    assert.match(direct.blockers[0], /at least one recipient/);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', bcc: 'x@example.com', isHtml: false, skipReview: true }).wouldSucceed, true);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', isHtml: false, skipReview: false }).wouldSucceed, true);
+  });
+
   it('counts parsed recipients without echoing caller-only fields', () => {
     const { runtime } = makeRuntime({ skipReviewBlocked: false });
     const review = runtime.dryRunCompose({ to: '"Doe, Jane" <j@example.com>, k@example.com', subject: 's', body: 'b', isHtml: false });
@@ -2639,4 +2648,62 @@ describe('Shared compose preparation through production dispatch', () => {
     assert.match(runtime.dryRunCompose({ ...args, from: 'unknown' }).blockers[0], /unknown identity/);
     assert.equal(runtime.dryRunCompose({ ...args, from: 'FALLBACK@example.com' }).wouldSucceed, true);
   });
+});
+
+
+describe('Direct send recipient preflight', () => {
+  const base = { to: '', subject: 'subject', body: 'body', skipReview: true };
+  const group = 'Team: "Doe, Jane" <j@example.com>, k@example.com;';
+  const emptyGroup = 'Undisclosed:;';
+  const auto = 'archive@example.com';
+  const caller = 'other@example.com';
+  for (const config of [
+    { to: '', expected: 0 },
+    { to: '   ', expected: 0 },
+    { to: emptyGroup, expected: 0 },
+    { to: group, expected: 2 },
+    { identity: { doCc: true, doCcList: auto }, expected: 1, field: 'cc' },
+    { identity: { doBcc: true, doBccList: auto }, expected: 1, field: 'bcc' },
+    { identity: { doCc: false, doCcList: auto, doBcc: false, doBccList: auto }, expected: 0 },
+    { identity: { doCc: true, doCcList: emptyGroup }, expected: 0 },
+    { cc: auto + ', ' + caller, identity: { doCc: true, doCcList: auto }, expected: 2, field: 'cc' },
+  ]) {
+    it(`counts native flattened mailboxes and automatic fields: ${JSON.stringify(config)}`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      runtime.setComposeIdentity = params => { params.identity = { key: 'sender', ...config.identity }; };
+      const merged = auto + ', ' + caller;
+      runtime.MailServices.headerParser = {
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(preserveGroups, false);
+          const mailboxes = new Map([
+            [emptyGroup, []], [group, ['j@example.com', 'k@example.com']],
+            [auto, [auto]], [merged, [auto, caller]], ['   ', []],
+          ]).get(header);
+          assert.ok(mailboxes, `Unexpected header ${header}`);
+          return mailboxes.map(email => ({ email }));
+        },
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(automatic, config.identity.doCcList || config.identity.doBccList);
+          assert.ok(header === '' || header === merged);
+          return header ? caller : '';
+        },
+      };
+      const args = { ...base, to: config.to || '', cc: config.cc || '' };
+      const dry = runtime.dryRunCompose(args);
+      assert.equal(dry.wouldSucceed, config.expected > 0);
+      assert.equal(state.writes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+      if (config.expected) {
+        assert.equal(dry.recipients[config.field || 'to'], config.expected);
+        const real = await runtime.composeMail(args);
+        assert.equal(real.success, true);
+        assert.equal(state.sent, 1);
+      } else {
+        const real = runtime.composeMail({ ...args, attachments: ['/home/user/.env'] });
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /at least one recipient/);
+        assert.equal(state.fileCalls + state.writes + state.native + state.params + state.fields + state.sent, 0);
+        assert.equal(runtime.dryRunCompose({ ...args, skipReview: false }).wouldSucceed, true);
+      }
+    });
+  }
 });

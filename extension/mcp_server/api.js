@@ -10670,6 +10670,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               const accountKey = getComposeAccountKey(identity);
               const recipients = getComposeRecipients(args, identity);
+              if (skipReview && Object.values(recipients.counts).every(count => count === 0)) {
+                return { error: "A direct send needs at least one recipient (to, cc or bcc), including enabled identity automatic Cc/Bcc. Use skipReview: false to open an empty review window." };
+              }
               const { useHtml, format } = resolveComposeFormat(identity, isHtml, Ci.nsIMsgCompType.New);
               const { descs } = filePathsToAttachDescs(attachments, { dryRun: true });
               // The window inserts its own signature. The direct path must build it here.
