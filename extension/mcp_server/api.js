@@ -247,7 +247,9 @@ const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_EMAIL_TYPES = ["work", "home"];
 const CONTACT_EMAIL_CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f]/;
 const CONTACT_VCARD_PROPERTY = "_vCard";
-const CONTACT_ESCAPED_EMAIL_LINE = /^(?:[^:;\r\n]+\.)?email[;:][^\r\n]*[\\"]/m;
+// vCard lines end at CR/LF; JavaScript's multiline ^ also treats Unicode
+// separators inside NOTE text as line starts and can cause repeated rescans.
+const CONTACT_ESCAPED_EMAIL_LINE = /(?:^|[\r\n])(?:[^:;\r\n]+\.)?email[;:][^\r\n]*[\\"]/;
 const CONTACT_CACHED_FIELDS = {
   displayName: "DisplayName",
   firstName: "FirstName",

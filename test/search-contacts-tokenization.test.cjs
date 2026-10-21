@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const vm = require("node:vm");
 const {
   loadContactRuntime, FakeStoredCard, FakeVCardPropertyEntry, FakeFlatCard, FakeAddressBook,
 } = require("./helpers/contact-runtime.cjs");
@@ -194,6 +195,26 @@ describe("searchContacts lazy parsing and raw prefilter", () => {
     assert.equal(runtimeForCards(cards).searchContacts("missing@example.net").length, 0);
     assert.ok(cards.every(card => card.stats.parses === 0 && card.stats.emailReads === 0));
   });
+
+  for (const [name, separator] of [["line", "\u2028"], ["paragraph", "\u2029"]]) {
+    it(`rejects a long NOTE containing Unicode ${name} separators without rescanning or parsing`, () => {
+      // These are text inside one vCard content line, not new EMAIL lines.
+      // Bound production execution: a multiline regex used to rescan the
+      // remaining NOTE after every separator and take seconds for one card.
+      const card = makeSearchCard({ raw: [
+        "BEGIN:VCARD", "VERSION:4.0", "EMAIL:plain@example.com",
+        "NOTE:" + ("a" + separator).repeat(64000) + 'EMAIL:"not an address"',
+        "END:VCARD", "",
+      ].join("\r\n") });
+      const runtime = runtimeForCards([card]);
+      const results = vm.runInNewContext("searchContacts('absent-token')", {
+        searchContacts: runtime.searchContacts,
+      }, { timeout: 1000 });
+      assert.equal(results.length, 0);
+      assert.equal(card.stats.parses, 0);
+      assert.equal(card.stats.emailReads, 0);
+    });
+  }
 });
 
 describe("corrupt stored vCards in production search and getContact", () => {
