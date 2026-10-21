@@ -18,6 +18,17 @@ const REFRESH_MS = 60000;
 const TIMEOUT_MS = 10000;
 const ADDON_ID = "sendlater3@kamens.us";
 
+// Searched test/helpers and timer tests for a reusable deferred promise; only
+// private callbacks exist. Keep this fixture compatible with CI's Node 18 job.
+function deferred() {
+  const result = {};
+  result.promise = new Promise((resolve, reject) => {
+    result.resolve = resolve;
+    result.reject = reject;
+  });
+  return result;
+}
+
 // Searched background tests and timer harnesses: server-lifecycle mocks XPCOM
 // timers; privacy-options mocks browser methods. Combine those boundary patterns
 // to execute the whole background script and the real Experiment normalizer.
@@ -106,7 +117,7 @@ describe("Send Later background discovery", () => {
     it(`clears readiness after ten seconds waiting for ${action}, ignoring its late answer`, async () => {
       const h = loadBackground();
       await settle();
-      const delayed = Promise.withResolvers();
+      const delayed = deferred();
       h.answer = request => request === action ? delayed.promise : Promise.resolve(request === "getUUID" ? READY.uuid : READY);
       const pending = h.context.refreshSendLaterInfo();
       const [timer] = h.timers;
@@ -128,7 +139,7 @@ describe("Send Later background discovery", () => {
     it(`ignores a superseded refresh's ${outcome}`, async () => {
       const h = loadBackground();
       await settle();
-      const old = Promise.withResolvers();
+      const old = deferred();
       h.answer = action => action === "getUUID" ? old.promise : Promise.resolve(READY);
       const pending = h.context.refreshSendLaterInfo();
       const [oldTimer] = h.timers;
@@ -151,7 +162,7 @@ describe("Send Later background discovery", () => {
   it("ignores old success after a newer refresh has cleared readiness", async () => {
     const h = loadBackground();
     await settle();
-    const old = Promise.withResolvers();
+    const old = deferred();
     h.answer = action => action === "getUUID" ? old.promise : Promise.resolve(READY);
     const pending = h.context.refreshSendLaterInfo();
     h.answer = () => Promise.reject(new Error("Disabled"));
@@ -165,7 +176,7 @@ describe("Send Later background discovery", () => {
     it(`checks elapsed time even if the timeout callback has not run: ${elapsed}ms`, async () => {
       const h = loadBackground();
       await settle();
-      const delayed = Promise.withResolvers();
+      const delayed = deferred();
       h.answer = action => action === "getUUID" ? delayed.promise : Promise.resolve(READY);
       const checkedAt = h.clock.now;
       const pending = h.context.refreshSendLaterInfo();
