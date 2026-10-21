@@ -3533,43 +3533,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Validate only within the original search budget. Keep primitive
                 // candidates across yields, never native databases or headers.
                 const countsByAccount = new Map();
+                // Block scope in an async frame can retain native handles while
+                // suspended. Keep every database/header in a synchronous call.
+                function validateCountChunk(index) {
+                  const databases = new Map();
+                  const end = Math.min(index + SEARCH_YIELD_EVERY, finalResults.length);
+                  for (; index < end; index++) {
+                    if (searchTimeExpired(scan)) break;
+                    const row = finalResults[index];
+                    if (!isCurrentResult(row)) continue;
+                    if (searchTimeExpired(scan)) break;
+                    if (!databases.has(row.folderPath)) {
+                      try {
+                        const folder = folders.get(row.folderPath);
+                        const accountKey = MailServices.accounts.findAccountForServer(folder.server)?.key;
+                        if (searchTimeExpired(scan)) break;
+                        databases.set(row.folderPath, accountKey
+                          ? { db: folder.msgDatabase, accountKey } : null);
+                      }
+                      catch { databases.set(row.folderPath, null); }
+                    }
+                    // Opening a native database may itself consume the budget.
+                    if (searchTimeExpired(scan)) break;
+                    try {
+                      const entry = databases.get(row.folderPath);
+                      if (getSearchResultHeader(entry?.db, row)) {
+                        const counts = countsByAccount.get(entry.accountKey) || { public: 0, protected: 0 };
+                        if (row._requiresEncryptedAccess) counts.protected++;
+                        else counts.public++;
+                        countsByAccount.set(entry.accountKey, counts);
+                        continue;
+                      }
+                    } catch { /* gone with its database: not counted */ }
+                    scan.truncated = true;
+                  }
+                  return index;
+                }
                 for (let index = 0; index < finalResults.length;) {
                   if (searchTimeExpired(scan)) break;
                   folders.clear();
                   allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
-                  {
-                    const databases = new Map();
-                    const end = Math.min(index + SEARCH_YIELD_EVERY, finalResults.length);
-                    for (; index < end; index++) {
-                      if (searchTimeExpired(scan)) break;
-                      const row = finalResults[index];
-                      if (!isCurrentResult(row)) continue;
-                      if (searchTimeExpired(scan)) break;
-                      if (!databases.has(row.folderPath)) {
-                        try {
-                          const folder = folders.get(row.folderPath);
-                          const accountKey = MailServices.accounts.findAccountForServer(folder.server)?.key;
-                          if (searchTimeExpired(scan)) break;
-                          databases.set(row.folderPath, accountKey
-                            ? { db: folder.msgDatabase, accountKey } : null);
-                        }
-                        catch { databases.set(row.folderPath, null); }
-                      }
-                      // Opening a native database may itself consume the budget.
-                      if (searchTimeExpired(scan)) break;
-                      try {
-                        const entry = databases.get(row.folderPath);
-                        if (getSearchResultHeader(entry?.db, row)) {
-                          const counts = countsByAccount.get(entry.accountKey) || { public: 0, protected: 0 };
-                          if (row._requiresEncryptedAccess) counts.protected++;
-                          else counts.public++;
-                          countsByAccount.set(entry.accountKey, counts);
-                          continue;
-                        }
-                      } catch { /* gone with its database: not counted */ }
-                      scan.truncated = true;
-                    }
-                  }
+                  index = validateCountChunk(index);
                   if (index < finalResults.length && !searchTimeExpired(scan)) {
                     await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                   }

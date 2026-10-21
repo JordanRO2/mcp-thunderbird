@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
@@ -54,7 +55,7 @@ function makeFolder(name, { account = "account1", count = 0, messages, children 
       stats.databaseReads++;
       if (hooks.database) hooks.database();
       const openedGeneration = generation;
-      const assertLive = () => assert.equal(openedGeneration, generation, "Database retained across a yield");
+      const assertLive = () => assert.equal(openedGeneration, generation, "Stale database used after a yield");
       const database = {
         listAllKeys() {
           assertLive();
@@ -906,6 +907,30 @@ describe("searchMessages cooperative count finalization", () => {
     assert.equal(page.totalMatches, 3);
     assert.equal(page.truncated, true);
   });
+});
+
+describe("searchMessages count handle collection during pending yields", () => {
+  // The child uses fresh handles, without the ordinary harness's strong header
+  // maps, and executes the same production snapshot as the other scan tests.
+  const retentionSource = [
+    ...["SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
+    snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
+    snippet("function isFolderAccessible(", "function toColumnarTable("),
+  ].join("\n");
+
+  for (const scenario of ["single-folder", "many-folders"]) {
+    it(`collects count databases and headers before resuming ${scenario}`, () => {
+      const child = spawnSync(process.execPath, [
+        "--expose-gc", path.resolve(__dirname, "helpers/search-count-retention.cjs"), scenario,
+      ], { input: retentionSource, encoding: "utf8", timeout: 15000 });
+      assert.ifError(child.error);
+      assert.equal(child.signal, null, child.stderr);
+      assert.equal(child.status, 0, child.stderr);
+      // An unfinished async child can exit successfully without doing its work.
+      assert.deepEqual(JSON.parse(child.stdout), { scenario, checkedYields: 3, ok: true });
+    });
+  }
 });
 
 describe("searchMessages production Gloda collection", () => {
