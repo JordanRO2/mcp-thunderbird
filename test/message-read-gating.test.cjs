@@ -102,8 +102,9 @@ function loadRead(options = {}) {
     if (!options.deferCopy) entry.deliver();
     return entry;
   };
+  // loadPreflight already loads text sanitization and inline-image helpers for
+  // the integrated compose-size guard. Extend that VM without redeclaring them.
   vm.runInContext([
-    snippet("MCP TEXT SANITIZATION"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("MESSAGE READ TOOLS"),
     source.slice(source.indexOf("async function displayMessage("), source.indexOf("function getRecentMessages(")),
   ].join("\n"), api);
