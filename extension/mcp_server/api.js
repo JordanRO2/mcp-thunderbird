@@ -2549,6 +2549,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     }
 
     // BEGIN TOOL SCHEMA BUILDER
+    // BEGIN ATTACHMENT SEARCH LIMITS
+    const DEFAULT_ATTACHMENT_SCAN_CAP = 5000;
+    const MAX_ATTACHMENT_SCAN_CAP = 50000;
+    const ATTACHMENT_CANDIDATE_MULTIPLIER = 4;
+    // Full 50 MiB classification can block for seconds on deeply nested MIME
+    // or many tiny parts. Search skips larger messages instead of inspecting a
+    // prefix; explicit message reads retain their separate 50 MiB ceiling.
+    const ATTACHMENT_SEARCH_MAX_RAW_BYTES = 2 * 1024 * 1024;
+    // END ATTACHMENT SEARCH LIMITS
     const MAX_REMINDERS = 10;
     // Four weeks; also catches seconds/milliseconds supplied as minutes.
     const MAX_REMINDER_MINUTES = 40320;
@@ -9604,11 +9613,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // Reads the stored message within RAW_MESSAGE_MAX_BYTES. Throws on
             // read failure or overflow.
-            function readBoundedRawMessage(msgHdr, deadline) {
+            function readBoundedRawMessage(msgHdr, deadline, maxBytes = RAW_MESSAGE_MAX_BYTES) {
               let stream = null;
               try {
                 stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
-                return readMessageStreamFully(stream, RAW_MESSAGE_MAX_BYTES, deadline);
+                return readMessageStreamFully(stream, Math.min(maxBytes, RAW_MESSAGE_MAX_BYTES), deadline);
               } finally {
                 if (stream) try { stream.close(); } catch { /* ignore */ }
               }
@@ -9641,9 +9650,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * as 7.9 MB without any error), so such messages are streamed from the
              * server, the way the direct-send preflight retrieves uncached
              * originals. Rejects on failure, timeout, or more than
-             * RAW_MESSAGE_MAX_BYTES.
+             * RAW_MESSAGE_MAX_BYTES. Bulk callers may impose a smaller maxBytes
+             * and forbid server fallback with allowDownload:false. A Partial
+             * local copy cannot establish completeness for those callers.
              */
-            function readCompleteRawMessage(msgHdr, { deadline = Date.now() + MESSAGE_READ_TIMEOUT_MS, checkAccess = () => {}, pending } = {}) {
+            function readCompleteRawMessage(msgHdr, {
+              deadline = Date.now() + MESSAGE_READ_TIMEOUT_MS, checkAccess = () => {}, pending,
+              allowDownload = true, maxBytes = RAW_MESSAGE_MAX_BYTES,
+            } = {}) {
+              maxBytes = Math.min(maxBytes, RAW_MESSAGE_MAX_BYTES);
               const check = () => {
                 checkAccess();
                 if (Date.now() >= deadline) throw new Error(MESSAGE_STREAM_DEADLINE_ERROR);
@@ -9651,16 +9666,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const isImap = msgHdr.folder?.server?.type === "imap";
               try {
                 check();
+                if (!allowDownload && ((msgHdr.flags & Ci.nsMsgMessageFlags.Partial) ||
+                    (isImap && !(msgHdr.flags & Ci.nsMsgMessageFlags.Offline)))) {
+                  throw new Error("Complete local message unavailable");
+                }
                 if (!isImap || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
                   let raw;
                   try {
-                    raw = readBoundedRawMessage(msgHdr, deadline);
+                    raw = readBoundedRawMessage(msgHdr, deadline, maxBytes);
                     if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
                   } catch (error) {
                     check();
                     // A stale Offline flag may hide a missing local store. Size
                     // failures are final, even when the server could be retried.
-                    if (!isImap || error?.isStreamSizeLimit || error?.message === MESSAGE_STREAM_DEADLINE_ERROR) throw error;
+                    if (!allowDownload || !isImap || error?.isStreamSizeLimit || error?.message === MESSAGE_STREAM_DEADLINE_ERROR) throw error;
                   }
                   check();
                   if (raw) return Promise.resolve(raw);
@@ -9712,8 +9731,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (settled) return;
                       try {
                         check();
-                        if (count > RAW_MESSAGE_MAX_BYTES - raw.length) {
-                          const error = new Error(`message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`);
+                        if (count > maxBytes - raw.length) {
+                          const error = new Error(`message too large (> ${maxBytes} bytes)`);
                           error.isStreamSizeLimit = true;
                           throw error;
                         }
@@ -11822,66 +11841,134 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            // Searched getMessageReadAccessError/finishSearchResults: use their
+            // access + key/ID checks, without findMessage's fallback folder scan.
+            // The visitor is synchronous so no native handle enters an awaiting
+            // frame. Only primitive locators and detached result data may escape.
+            function checkAttachmentSearchCandidate(candidate, visit) {
+              try {
+                if (!isToolEnabled("searchAttachments")) return { failed: true };
+                const resolved = getAccessibleFolder(candidate.folderPath);
+                if (resolved.error) return { failed: true };
+                const hdr = getSearchHeader(resolved.folder.msgDatabase, candidate.key);
+                if (!hdr || hdr.messageId !== candidate.id || (hdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                  return { failed: true };
+                }
+                if (hasRecordedEncryption(hdr) ||
+                    (candidate.signed && !isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES))) {
+                  return { withheld: true };
+                }
+                if (!LOCAL_SERVER_TYPES.includes(resolved.folder.server?.type) && !(hdr.flags & Ci.nsMsgMessageFlags.Offline)) {
+                  return { notOffline: true };
+                }
+                if (hdr.flags & Ci.nsMsgMessageFlags.Partial) return { failed: true };
+                return visit(hdr);
+              } catch {
+                return { failed: true };
+              }
+            }
+
+            // Searched S24's read gate: search uses its complete reader and the
+            // STRICT tier only. The read-only recovery tier deliberately accepts
+            // some unusual MIME; it must not authorize a bulk native parse.
+            function prepareAttachmentSearchCandidate(candidate, scan) {
+              const checkAccess = () => {
+                if (checkAttachmentSearchCandidate(candidate, () => true) !== true) {
+                  throw new Error(MESSAGE_READ_STOPPED_ERROR);
+                }
+              };
+              if (searchTimeExpired(scan)) return Promise.resolve({ failed: true });
+              const pending = checkAttachmentSearchCandidate(candidate, hdr => readCompleteRawMessage(hdr, {
+                deadline: scan.deadline, checkAccess, allowDownload: false, maxBytes: ATTACHMENT_SEARCH_MAX_RAW_BYTES,
+              }));
+              // The raw snapshot belongs only to this synchronous continuation;
+              // the parser/waiting worker retains its signed bit, never the bytes.
+              return Promise.resolve(pending).then(raw => {
+                if (typeof raw !== "string") return raw;
+                if (searchTimeExpired(scan)) return { failed: true };
+                const split = findRawMimeHeaderBodySplit(raw);
+                const headers = split ? parseRawMimeHeaders(split.header) : null;
+                const signed = (headers?.["content-type"] || [])
+                  .some(value => parseRawMimeHeaderValue(value).value === "multipart/signed");
+                if (!headers || (signed && !isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES))) {
+                  return { withheld: true };
+                }
+                const state = classifyRawMessageEncryption(raw, 0, { signedRaw: true });
+                if (searchTimeExpired(scan)) return { failed: true };
+                return state === "clear" ? { signed } : { withheld: true };
+              }).catch(error => error?.isStreamSizeLimit ? { tooLarge: true } : { failed: true });
+            }
+
             /**
-             * Parses one candidate's MIME and resolves to one of
-             *   { match: { header, ts } }  attachments matched,
-             *   { none: true }             parsed, nothing matched,
-             *   { withheld: true }         encrypted or unverifiable, never inspected,
-             *   { failed: true }           no slot, timed out, vanished or unparsable.
-             * Never rejects and never throws. Its one-shot timer is cancelled on
-             * every settle path and is clamped to what is left of the shared
-             * budget. The header is read from a fresh database handle after the
-             * slot is acquired, so none outlives the scan's yields.
+             * Each reservation covers raw preflight and, if admitted, one MIME
+             * parse. A completed candidate releases immediately; a timed-out
+             * native parse keeps its reservation until its callback or reclaim.
+             * Outcomes are exclusive: match, none, withheld, failed, notOffline,
+             * or tooLarge. Only a verified, complete parse can report no match.
              */
             async function parseAttachmentCandidate(candidate, ctx) {
-              const { pool, scan, matcher, allowEncrypted, MsgHdrToMimeMessage } = ctx;
+              const { pool, scan, matcher, MsgHdrToMimeMessage } = ctx;
               if (!(await acquireParseSlot(pool, scan))) return { failed: true };
+              let released = false;
+              const slot = { stalledAt: 0, reclaimed: false };
+              const releaseSlot = () => {
+                if (released) return;
+                released = true;
+                pool.stalledSlots.delete(slot);
+                if (!slot.reclaimed) pool.live--;
+                wakeParseWaiters(pool);
+              };
+              const prepared = await prepareAttachmentSearchCandidate(candidate, scan);
+              if (prepared.signed === undefined || searchTimeExpired(scan)) {
+                releaseSlot();
+                return prepared.signed === undefined ? prepared : { failed: true };
+              }
+              candidate.signed = prepared.signed;
               return new Promise((resolve) => {
                 let settled = false;
-                let released = false;
-                const slot = { stalledAt: 0, reclaimed: false };
+                let received = false;
                 let timer = null;
-                const releaseSlot = () => {
-                  if (released) return;
-                  released = true;
-                  pool.stalledSlots.delete(slot);
-                  if (!slot.reclaimed) pool.live--;
-                  wakeParseWaiters(pool);
-                };
-                const settle = (value) => {
+                const settle = value => {
                   if (settled) return;
                   settled = true;
                   cancelTimer(timer);
                   timer = null;
                   resolve(value);
                 };
-                // Settles for outcomes that never started a MIME parse.
-                const settleWithoutParse = (value) => { releaseSlot(); settle(value); };
-
+                const settleWithoutParse = value => { releaseSlot(); settle(value); };
+                // This callback is created outside the native-header visitor. It
+                // retains locators only, including after a parse times out.
+                const onMime = (_msgHdr, mime) => {
+                  releaseSlot();
+                  if (settled || received) return;
+                  received = true;
+                  if (searchTimeExpired(scan)) { settle({ failed: true }); return; }
+                  const outcome = checkAttachmentSearchCandidate(candidate, hdr => {
+                    if (!mime) return { failed: true };
+                    if (classifyMimeMessageEncryption(mime) !== "clear") return { withheld: true };
+                    const attachments = mime.allUserAttachments;
+                    if (!Array.isArray(attachments)) return { failed: true };
+                    const matched = [];
+                    for (const att of attachments) {
+                      const name = att?.name ? String(att.name) : "";
+                      const type = att?.contentType ? String(att.contentType) : "";
+                      if (matcher(name.toLowerCase(), type.toLowerCase())) {
+                        matched.push({ name, contentType: type, size: typeof att.size === "number" ? att.size : null });
+                      }
+                    }
+                    if (searchTimeExpired(scan)) return { failed: true };
+                    if (matched.length === 0) return { none: true };
+                    const header = msgHdrToHeaderObject(hdr);
+                    header.folderPath = candidate.folderPath;
+                    header.matchingAttachments = matched;
+                    return { match: { header, ts: hdr.date || 0, candidate } };
+                  });
+                  settle(outcome);
+                };
                 try {
-                  const resolved = getAccessibleFolder(candidate.folderPath);
-                  if (resolved.error) { settleWithoutParse({ failed: true }); return; }
-                  const folder = resolved.folder;
-                  const hdr = getSearchHeader(folder.msgDatabase, candidate.key);
-                  if (!hdr || hdr.messageId !== candidate.id || (hdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
-                    settleWithoutParse({ failed: true });
-                    return;
-                  }
-                  // Cheap, bounded checks of the stored message (OpenPGP marker,
-                  // S/MIME or multipart/encrypted outer structure) before any parse:
-                  // libmime may decrypt, and S/MIME decryption can prompt for a
-                  // password. Skipped when encrypted access is enabled.
-                  // Outer headers that cannot be read in full (e.g. an oversized
-                  // header block) are treated as protected: withheld, not parsed.
-                  if (!allowEncrypted && (readOuterHeaders(hdr) === null || hasEncryptedOuterStructure(hdr))) {
-                    settleWithoutParse({ withheld: true });
-                    return;
-                  }
-
                   const timeoutMs = Math.max(0, Math.min(MIME_PARSE_TIMEOUT_MS, scan.deadline - Date.now()));
                   if (timeoutMs === 0) { settleWithoutParse({ failed: true }); return; }
                   timer = newOneShotTimer(() => {
-                    // The stream keeps running: keep the slot until the callback.
                     if (!released && !settled) {
                       slot.stalledAt = Date.now();
                       pool.stalledSlots.add(slot);
@@ -11889,39 +11976,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                     settle({ failed: true });
                   }, timeoutMs);
-
-                  // Three arguments: the 4th (allowDownload) would let MIME fetch
-                  // whole bodies over the network for IMAP/NNTP, the 5th
-                  // (examineEncryptedParts) would decrypt parts. Neither is wanted.
-                  MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
-                    releaseSlot();
-                    if (settled) return;
-                    try {
-                      if (!aMimeMsg) { settle({ failed: true }); return; }
-                      // Attachment names and types of protected mail are content.
-                      if (!allowEncrypted && classifyMimeMessageEncryption(aMimeMsg) !== "clear") {
-                        settle({ withheld: true });
-                        return;
-                      }
-                      const matched = [];
-                      for (const att of aMimeMsg.allUserAttachments || []) {
-                        const name = att && att.name ? String(att.name) : "";
-                        const type = att && att.contentType ? String(att.contentType) : "";
-                        if (matcher(name.toLowerCase(), type.toLowerCase())) {
-                          matched.push({ name, contentType: type, size: typeof att.size === "number" ? att.size : null });
-                        }
-                      }
-                      if (matched.length === 0) { settle({ none: true }); return; }
-                      const header = msgHdrToHeaderObject(hdr);
-                      header.folderPath = folder.URI;
-                      header.matchingAttachments = matched;
-                      settle({ match: { header, ts: hdr.date || 0 } });
-                    } catch {
-                      settle({ failed: true });
-                    }
+                  if (settled || searchTimeExpired(scan)) { settleWithoutParse({ failed: true }); return; }
+                  const refusal = checkAttachmentSearchCandidate(candidate, hdr => {
+                    // These flags prevent downloads and extra-part examination;
+                    // only the complete raw gate above prevents S/MIME decryption.
+                    MsgHdrToMimeMessage(hdr, null, onMime, false, { examineEncryptedParts: false });
+                    return null;
                   });
+                  if (refusal) settleWithoutParse(refusal);
                 } catch {
-                  // Timer allocation or the MIME call threw synchronously.
                   settleWithoutParse({ failed: true });
                 }
               });
@@ -11953,7 +12016,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const cap = Number.isFinite(maxResults) && maxResults > 0 ? Math.min(Math.floor(maxResults), 200) : 50;
                 const scanLimit = Number.isFinite(scanCap) && scanCap > 0 ? Math.min(Math.floor(scanCap), 50000) : 5000;
                 const candidateLimit = cap * 4;
-                const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
                 const matcher = (name, type) =>
                   (!wantName || name.includes(wantName)) && (!wantType || type.startsWith(wantType));
                 const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
@@ -12016,12 +12078,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = [];
                 let withheld = 0;
                 let notParsed = 0;
+                let tooLarge = 0;
                 const pool = attachmentParsePool;
                 if (candidates.length > 0) {
                   const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
                     "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
-                  const ctx = { pool: attachmentParsePool, scan, matcher, allowEncrypted, MsgHdrToMimeMessage };
+                  const ctx = { pool: attachmentParsePool, scan, matcher, MsgHdrToMimeMessage };
                   let nextIndex = 0;
                   const worker = async () => {
                     for (;;) {
@@ -12030,6 +12093,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const outcome = await parseAttachmentCandidate(candidates[nextIndex++], ctx);
                       if (outcome.match) found.push(outcome.match);
                       else if (outcome.withheld) withheld++;
+                      else if (outcome.tooLarge) tooLarge++;
+                      else if (outcome.notOffline) notOffline++;
                       else if (outcome.failed) notParsed++;
                       await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                     }
@@ -12053,7 +12118,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 visible.sort((a, b) => b.ts - a.ts);
                 const overflow = visible.length > cap;
-                const truncated = scan.truncated || scanCapHit || candidateLimitHit || overflow || notParsed > 0 || notOffline > 0;
+                const truncated = scan.truncated || scanCapHit || candidateLimitHit || overflow || withheld > 0 || tooLarge > 0 || notParsed > 0 || notOffline > 0;
                 const response = {
                   matches: visible.slice(0, cap).map(entry => entry.header),
                   totalScanned,
@@ -12061,10 +12126,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   truncated,
                 };
                 if (withheld > 0) response.protectedWithheld = withheld;
+                if (tooLarge > 0) response.tooLarge = tooLarge;
                 if (notParsed > 0) response.notParsed = notParsed;
                 if (notOffline > 0) response.notOffline = notOffline;
                 if (truncated) {
                   const reasons = [];
+                  if (withheld > 0) reasons.push(`${withheld} candidate(s) were withheld because they are protected, signed with access off, or could not be verified as clear`);
+                  if (tooLarge > 0) reasons.push(`${tooLarge} candidate(s) exceed the ${ATTACHMENT_SEARCH_MAX_RAW_BYTES / (1024 * 1024)} MiB search size limit`);
                   if (scan.timedOut) reasons.push(`the search reached its ${SEARCH_TIME_BUDGET_MS / 1000}-second time budget`);
                   if (candidateLimitHit) reasons.push("the candidate limit (maxResults x 4, newest across folders) was reached before every message was examined");
                   if (scanCapHit) reasons.push("scanCap was reached before every message was examined");

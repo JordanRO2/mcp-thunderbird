@@ -250,6 +250,37 @@ describe("complete raw snapshot gate", () => {
 });
 
 describe("shared raw transport bounds", () => {
+  it("lets local-only callers impose a smaller cap without accepting a prefix", async () => {
+    for (const extra of [0, 1]) {
+      const h = loadRead({ serverType: "imap", offline: true, raw: "x".repeat(1024 + extra) });
+      const result = h.api.readCompleteRawMessage(h.api.findMessage().msgHdr, { allowDownload: false, maxBytes: 1024 });
+      if (extra) await assert.rejects(result, error => error.isStreamSizeLimit === true);
+      else assert.equal((await result).length, 1024);
+      assert.equal(h.calls.rawFetches.length, 0);
+      assert.equal(h.calls.rawCloses, 1);
+    }
+  });
+  it("does not fetch a non-Offline IMAP prefix for a local-only caller", async () => {
+    const h = loadRead({ serverType: "imap", offline: false, raw: CLEAR });
+    await assert.rejects(h.api.readCompleteRawMessage(h.api.findMessage().msgHdr, { allowDownload: false }), /Complete local message unavailable/);
+    assert.equal(h.calls.rawOpenAttempts, 0);
+    assert.equal(h.calls.rawFetches.length, 0);
+  });
+  it("does not retry failed Offline storage on the server for a local-only caller", async () => {
+    const h = loadRead({ serverType: "imap", offline: true, readError: true });
+    await assert.rejects(h.api.readCompleteRawMessage(h.api.findMessage().msgHdr, { allowDownload: false }));
+    assert.equal(h.calls.rawCloses, 1);
+    assert.equal(h.calls.rawFetches.length, 0);
+  });
+  it("refuses a Partial local copy before opening its stream", async () => {
+    const h = loadRead({ serverType: "pop3", raw: CLEAR });
+    h.api.Ci.nsMsgMessageFlags.Partial = 0x400;
+    const hdr = h.api.findMessage().msgHdr;
+    hdr.flags |= h.api.Ci.nsMsgMessageFlags.Partial;
+    await assert.rejects(h.api.readCompleteRawMessage(hdr, { allowDownload: false }), /Complete local message unavailable/);
+    assert.equal(h.calls.rawOpenAttempts, 0);
+    assert.equal(h.calls.rawFetches.length, 0);
+  });
   for (const serverType of ["none", "pop3", "imap", "owl", "ews"]) {
     for (const extra of [0, 1]) {
       it(`${serverType} local read ${extra ? "over" : "at"} 50 MiB`, async () => {
