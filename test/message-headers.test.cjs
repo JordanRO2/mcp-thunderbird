@@ -6,6 +6,7 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadToolSchema } = require("./helpers/tool-schema.cjs");
 const { loadThunderbirdHeaderParser } = require("./helpers/thunderbird-header-parser.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
@@ -23,20 +24,11 @@ function constant(name) {
   return match[0];
 }
 
-// The real production schemas of the two header tools, evaluated in isolation.
+// Reuse the production builder; slicing adjacent tool definitions also captured
+// searchAttachments and silently depended on its schema's constants.
 function productionHeaderTools() {
-  const start = source.indexOf('      {\n        name: "getMessageHeaders"');
-  const startCrLf = source.indexOf('      {\r\n        name: "getMessageHeaders"');
-  const from = start >= 0 ? start : startCrLf;
-  const end = source.indexOf('name: "sendMail"', from);
-  const to = source.lastIndexOf("      {", end);
-  assert.ok(from >= 0 && to > from, "production header tool schemas missing");
-  const sandbox = {};
-  vm.runInNewContext([
-    snippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
-    `this.tools = [${source.slice(from, to)}];`,
-  ].join("\n"), sandbox);
-  return sandbox.tools;
+  return loadToolSchema().buildTools().filter(tool =>
+    tool.name === "getMessageHeaders" || tool.name === "batchGetMessageHeaders");
 }
 
 const HEADER_BATCH_LIMIT = vm.runInNewContext([

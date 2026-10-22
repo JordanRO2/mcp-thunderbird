@@ -160,6 +160,7 @@ function loadPrivacyRuntime({
     getMarkedApiSnippet("// BEGIN CONTACT FIELD CONSTANTS", "// END CONTACT FIELD CONSTANTS"),
     getMarkedApiSnippet("// BEGIN OUTBOUND ATTACHMENT LIMITS", "// END OUTBOUND ATTACHMENT LIMITS"),
     getMarkedApiSnippet("// BEGIN MESSAGE HEADER LIMITS", "// END MESSAGE HEADER LIMITS"),
+    getMarkedApiSnippet("// BEGIN SEARCH RESULT LIMITS", "// END SEARCH RESULT LIMITS"),
     getMarkedApiSnippet("function normalizeGetMessagesLimit(", "// BEGIN TOOL SCHEMA BUILDER"),
     getMarkedApiSnippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
     getMarkedApiSnippet("// BEGIN SERVER ACCESS HELPERS", "// END SERVER ACCESS HELPERS"),

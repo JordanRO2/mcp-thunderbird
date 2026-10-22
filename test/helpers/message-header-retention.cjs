@@ -1,12 +1,21 @@
 "use strict";
 
-// Only launched by message-headers.test.cjs, with production snippets on stdin.
+// Launched by message-headers/search-attachments tests, with production snippets
+// on stdin. Both consumers must release native handles while awaiting work.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
 const scenario = process.argv[2];
 const lookup = scenario === "lookup" || scenario === "lookup-without-direct";
+const attachments = scenario === "attachments";
+const ATTACHMENT_RAW = [
+  'Content-Type: multipart/mixed; boundary="gc"', '',
+  ...Array.from({ length: 40 }, () => [
+    '--gc', 'Content-Type: application/pdf',
+    'Content-Disposition: attachment; filename="invoice.pdf"', '', 'A clear attachment.',
+  ]).flat(), '--gc--', '',
+].join('\r\n');
 const tracked = [];
 const state = {
   rows: 0, databases: 0, headers: 0, snapshots: 0, directHits: 0,
@@ -44,7 +53,7 @@ function makeHeader(key, origin) {
     mime2DecodedAuthor: "Alice",
     mime2DecodedRecipients: "Bob",
     ccList: "copy@example.test",
-    flags: 0,
+    flags: attachments ? 0x10000080 : 0,
     isRead: true,
     isFlagged: false,
     messageSize: 321,
@@ -87,6 +96,14 @@ const folder = {
   prettyName: "INBOX",
   server: { type: "imap" },
   updateFolder() {},
+  getMsgInputStream() {
+    let offset = 0;
+    return {
+      available: () => ATTACHMENT_RAW.length - offset,
+      read(count) { const bytes = ATTACHMENT_RAW.slice(offset, offset + count); offset += bytes.length; return bytes; },
+      close() {},
+    };
+  },
   get msgDatabase() { return makeDatabase(); },
 };
 const account = { key: "account1", incomingServer: folder.server };
@@ -133,20 +150,48 @@ function releaseYield() {
 }
 
 async function main() {
-  assert.ok(["forward", "reverse", "lookup", "lookup-without-direct"].includes(scenario));
+  assert.ok(["forward", "reverse", "lookup", "lookup-without-direct", "attachments"].includes(scenario));
   assert.equal(typeof global.gc, "function", "Child requires --expose-gc");
   const runtime = vm.createContext({
     Date: FakeDate,
+    TextDecoder, Uint8Array, atob, btoa,
     Services: { prefs: { getBoolPref: () => false }, tm: { dispatchToMainThread } },
-    Ci: { nsMsgMessageFlags: { Expunged: 0x8 } },
+    Ci: { nsMsgMessageFlags: { Expunged: 0x8, Offline: 0x80, Partial: 0x400, Attachment: 0x10000000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    Cc: new Proxy({}, { get() { assert.fail("Attachment metadata must not open a MIME channel or timer"); } }),
+    Cr: { NS_BASE_STREAM_CLOSED: 1 },
+    NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
+    ChromeUtils: { importESModule() { assert.fail("Attachment metadata must not use Gloda"); } },
     MailServices: {
       mimeConverter: { decodeMimeHeader: value => value },
       folderLookup: { getFolderForURL: uri => uri === folder.URI ? folder : null },
       accounts: { findAccountForServer: server => server === folder.server ? account : null },
     },
     isAccountAllowed: () => true,
+    isToolEnabled: () => true,
   });
   vm.runInContext(fs.readFileSync(0, "utf8"), runtime, { filename: "api-message-header-retention.js" });
+  if (attachments) {
+    state.rows = 1;
+    const pending = runtime.run("invoice", undefined, folder.URI).then(value => {
+      state.settled = true;
+      return value;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof state.resume, "function", "Raw admission must yield");
+    await assertCollected("raw admission", () => assert.equal(state.settled, false));
+    releaseYield();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof state.resume, "function", "Metadata extraction must yield");
+    await assertCollected("metadata extraction", () => assert.equal(state.settled, false));
+    releaseYield();
+    const result = await pending;
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].matchingAttachments.length, 40);
+    assert.equal(result.truncated, false);
+    await assertCollected("settled search with detached result retained");
+    process.stdout.write(JSON.stringify({ scenario, ok: true }) + "\n");
+    return;
+  }
   const chunkSize = vm.runInContext("SEARCH_YIELD_EVERY", runtime);
   assert.ok(Number.isInteger(chunkSize) && chunkSize > 1);
   state.rows = 3 * chunkSize + 1;

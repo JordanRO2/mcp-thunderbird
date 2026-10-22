@@ -56,6 +56,7 @@ function loadProductionAttachmentValidation(overrides = {}, transform = code => 
     getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     messageHeaderLimits,
+    getMarkedApiSnippet('// BEGIN SEARCH RESULT LIMITS', '// END SEARCH RESULT LIMITS'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
     getMarkedApiSnippet('// BEGIN FILTER SEARCH TERM HELPERS', '// END FILTER SEARCH TERM HELPERS'),
     getMarkedApiSnippet('// BEGIN BOUNDED REFRESH HELPERS', '// END BOUNDED REFRESH HELPERS'),
@@ -3166,5 +3167,96 @@ describe('Conservative compose size preflight', () => {
       assert.equal(size.estimatedEncodedBytes, null);
       assert.match(size.warning, /could not be safely bounded/);
     }
+  });
+});
+
+describe('Validation: searchAttachments', () => {
+  for (const [name, maximum] of [['maxResults', 200], ['scanCap', 50000]]) {
+    it(`accepts both bounds for ${name}`, () => {
+      for (const value of [1, maximum]) {
+        assert.deepStrictEqual(validateProductionToolArgs('searchAttachments', { nameContains: 'x', [name]: value }), []);
+      }
+    });
+  }
+
+  for (const name of ['nameContains', 'contentType', 'folderPath']) {
+    it(`rejects an empty ${name}`, () => {
+      const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', [name]: '' });
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], /at least 1/);
+    });
+  }
+
+  it('accepts only nameContains (no required params)', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'invoice' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts only contentType', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: 'application/pdf' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts both filters plus folderPath, maxResults, scanCap', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {
+      nameContains: 'invoice',
+      contentType: 'application/pdf',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 100,
+      scanCap: 10000,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // required: [] -- no params are mandatory at the validation layer. The
+  // "provide at least one filter" rule is enforced by the handler, not the
+  // schema, so an empty args object passes validation.
+  it('accepts an empty args object (the filter rule lives in the handler)', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {});
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects nameContains of the wrong type', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 42 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects contentType of the wrong type', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts integer maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: 50 });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects non-integer (float) maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: 12.5 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: '50' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects non-integer (float) scanCap', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: 'image/', scanCap: 99.9 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {
+      nameContains: 'invoice',
+      regex: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: regex/);
   });
 });
