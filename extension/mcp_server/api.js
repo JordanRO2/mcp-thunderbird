@@ -11798,12 +11798,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function newOneShotTimer(callback, delayMs) {
-              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-              timer.initWithCallback({ notify: callback }, delayMs, Ci.nsITimer.TYPE_ONE_SHOT);
-              return timer;
-            }
-
             function cancelTimer(timer) {
               if (timer) try { timer.cancel(); } catch { /* ignore */ }
             }
@@ -11839,7 +11833,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   resolve(false);
                 };
                 try {
-                  waiter.timer = newOneShotTimer(giveUp, Math.max(1, scan.deadline - Date.now()));
+                  waiter.timer = refreshTimer(Math.max(1, scan.deadline - Date.now()), giveUp);
                 } catch {
                   giveUp();
                 }
@@ -11982,6 +11976,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // must not win simply because its timeout has not run yet.
                   if (searchTimeExpired(scan) || Date.now() >= parseDeadline) { settle({ failed: true }); return; }
                   const outcome = checkAttachmentSearchCandidate(candidate, () => {
+                    if (searchTimeExpired(scan) || Date.now() >= parseDeadline) return { failed: true };
                     if (!mime) return { failed: true };
                     if (classifyMimeMessageEncryption(mime) !== "clear") return { withheld: true };
                     if (!isAttachmentSearchMimeComplete(mime, scan)) return { failed: true };
@@ -12004,14 +11999,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const timeoutMs = Math.max(0, parseDeadline - Date.now());
                   if (timeoutMs === 0) { settleWithoutParse({ failed: true }); return; }
-                  timer = newOneShotTimer(() => {
+                  timer = refreshTimer(timeoutMs, () => {
                     if (!released && !settled) {
                       slot.stalledAt = Date.now();
                       pool.stalledSlots.add(slot);
                       wakeParseWaiters(pool);
                     }
                     settle({ failed: true });
-                  }, timeoutMs);
+                  });
                   if (settled || searchTimeExpired(scan)) { settleWithoutParse({ failed: true }); return; }
                   const refusal = checkAttachmentSearchCandidate(candidate, hdr => {
                     // These flags prevent downloads and extra-part examination;
@@ -12062,7 +12057,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let scanFailures = 0;
                 const failedFolders = new Set();
                 if (folderPath) {
-                  const opened = openFolder(folderPath);
+                  // openFolder also returns a native database, which would
+                  // survive this async frame's yields. The scan owns DB access.
+                  const opened = getAccessibleFolder(folderPath);
                   if (opened.error) return { error: opened.error };
                   folders.push(opened.folder);
                 } else {
@@ -12159,8 +12156,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // separate this check from publishing the result.
                 if (!isToolEnabled("searchAttachments")) return { error: "Tool 'searchAttachments' is disabled in extension options" };
                 const visible = [];
-                for (const { candidate, attachments } of inspected) {
+                for (let index = 0; index < inspected.length; index++) {
+                  if (searchTimeExpired(scan)) {
+                    notParsed += inspected.length - index;
+                    break;
+                  }
+                  const { candidate, attachments } = inspected[index];
                   const outcome = checkAttachmentSearchCandidate(candidate, hdr => {
+                    if (searchTimeExpired(scan)) return { failed: true };
                     if (!attachments) return { none: true };
                     const header = msgHdrToHeaderObject(hdr);
                     header.folderPath = candidate.folderPath;
@@ -12173,6 +12176,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   else if (outcome.header) visible.push(outcome);
                 }
                 for (const folder of folders) {
+                  if (searchTimeExpired(scan)) break;
                   try {
                     if (getAccessibleFolder(folder.URI).error) failedFolders.add(folder.URI);
                   } catch {

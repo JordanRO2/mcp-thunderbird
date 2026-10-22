@@ -1,17 +1,21 @@
 "use strict";
 
-// Only launched by message-headers.test.cjs, with production snippets on stdin.
+// Launched by message-headers/search-attachments tests, with production snippets
+// on stdin. Both consumers must release native handles while awaiting work.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
 const scenario = process.argv[2];
 const lookup = scenario === "lookup" || scenario === "lookup-without-direct";
+const attachments = scenario === "attachments";
+const ATTACHMENT_RAW = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="invoice.pdf"\r\n\r\nA clear attachment.\r\n';
 const tracked = [];
 const state = {
   rows: 0, databases: 0, headers: 0, snapshots: 0, directHits: 0,
   directCalls: [], keyReads: [], visited: [], serialized: [],
   yields: 0, resume: null, settled: false,
+  mimeCallback: null, parseTimer: null,
 };
 
 function messageId(key) { return `m-${key}@example.test`; }
@@ -44,7 +48,7 @@ function makeHeader(key, origin) {
     mime2DecodedAuthor: "Alice",
     mime2DecodedRecipients: "Bob",
     ccList: "copy@example.test",
-    flags: 0,
+    flags: attachments ? 0x10000080 : 0,
     isRead: true,
     isFlagged: false,
     messageSize: 321,
@@ -87,6 +91,14 @@ const folder = {
   prettyName: "INBOX",
   server: { type: "imap" },
   updateFolder() {},
+  getMsgInputStream() {
+    let offset = 0;
+    return {
+      available: () => ATTACHMENT_RAW.length - offset,
+      read(count) { const bytes = ATTACHMENT_RAW.slice(offset, offset + count); offset += bytes.length; return bytes; },
+      close() {},
+    };
+  },
   get msgDatabase() { return makeDatabase(); },
 };
 const account = { key: "account1", incomingServer: folder.server };
@@ -133,20 +145,70 @@ function releaseYield() {
 }
 
 async function main() {
-  assert.ok(["forward", "reverse", "lookup", "lookup-without-direct"].includes(scenario));
+  assert.ok(["forward", "reverse", "lookup", "lookup-without-direct", "attachments"].includes(scenario));
   assert.equal(typeof global.gc, "function", "Child requires --expose-gc");
   const runtime = vm.createContext({
     Date: FakeDate,
+    TextDecoder, Uint8Array, atob, btoa,
     Services: { prefs: { getBoolPref: () => false }, tm: { dispatchToMainThread } },
-    Ci: { nsMsgMessageFlags: { Expunged: 0x8 } },
+    Ci: { nsMsgMessageFlags: { Expunged: 0x8, Offline: 0x80, Partial: 0x400, Attachment: 0x10000000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    Cc: { "@mozilla.org/timer;1": { createInstance() {
+      return { initWithCallback(callback) { state.parseTimer = callback; }, cancel() {} };
+    } } },
+    Cr: { NS_BASE_STREAM_CLOSED: 1 },
+    NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
+    ChromeUtils: { importESModule: () => ({
+      MsgHdrToMimeMessage(_hdr, _parts, callback) { state.mimeCallback = callback; },
+    }) },
     MailServices: {
       mimeConverter: { decodeMimeHeader: value => value },
       folderLookup: { getFolderForURL: uri => uri === folder.URI ? folder : null },
       accounts: { findAccountForServer: server => server === folder.server ? account : null },
     },
     isAccountAllowed: () => true,
+    isToolEnabled: () => true,
   });
   vm.runInContext(fs.readFileSync(0, "utf8"), runtime, { filename: "api-message-header-retention.js" });
+  if (attachments) {
+    state.rows = 1;
+    for (const timeout of [false, true]) {
+      state.settled = false;
+      state.mimeCallback = null;
+      const pending = runtime.run("invoice", undefined, folder.URI).then(value => {
+        state.settled = true;
+        return value;
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(typeof state.resume, "function", "Raw admission must yield");
+      await assertCollected("raw admission", () => assert.equal(state.settled, false));
+      releaseYield();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(typeof state.mimeCallback, "function", "Native parse must be pending");
+      assert.equal(runtime.pool.live, 1);
+      await assertCollected("awaiting MIME", () => assert.equal(state.settled, false));
+      const mime = { contentType: "application/pdf", allUserAttachments: [
+        { name: "invoice.pdf", contentType: "application/pdf", size: 19 },
+      ] };
+      if (timeout) state.parseTimer.notify();
+      else state.mimeCallback(null, mime);
+      const result = await pending;
+      assert.equal(result.messages.length, timeout ? 0 : 1);
+      assert.equal(result.truncated, timeout);
+      assert.equal(runtime.pool.live, timeout ? 1 : 0);
+      // Keep the response and native callback alive even after a timeout.
+      await assertCollected("settled search with callback retained");
+      if (timeout) {
+        assert.equal(result.notParsed, 1);
+        state.mimeCallback(null, mime);
+        state.mimeCallback(null, mime);
+        assert.equal(result.messages.length, 0);
+        assert.equal(runtime.pool.live, 0);
+        await assertCollected("late callback");
+      }
+    }
+    process.stdout.write(JSON.stringify({ scenario, ok: true }) + "\n");
+    return;
+  }
   const chunkSize = vm.runInContext("SEARCH_YIELD_EVERY", runtime);
   assert.ok(Number.isInteger(chunkSize) && chunkSize > 1);
   state.rows = 3 * chunkSize + 1;

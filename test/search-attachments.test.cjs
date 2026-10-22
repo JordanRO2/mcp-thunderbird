@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { spawnSync } = require("node:child_process");
 const { loadToolSchema } = require("./helpers/tool-schema.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
@@ -66,7 +67,7 @@ function makeHarness({
 } = {}) {
   const stats = {
     yields: 0, mimeCalls: 0, inFlight: 0, maxInFlight: 0, timersCreated: 0, timersCancelled: 0,
-    mimeArgs: [], mimeFolders: [], rawOpens: 0, rawCloses: 0, serverFetches: 0,
+    mimeArgs: [], mimeFolders: [], rawOpens: 0, rawCloses: 0, serverFetches: 0, refreshes: 0,
   };
   let generation = 0;
   let now = 0;
@@ -83,7 +84,7 @@ function makeHarness({
       prettyName: "INBOX",
       isServer: false,
       server: null,
-      updateFolder() {},
+      updateFolder() { stats.refreshes++; },
       headers,
       getUriForMsg(header) { return `${this.URI}#${header.messageKey}`; },
       getMsgInputStream(msgHdr) {
@@ -239,10 +240,11 @@ function makeHarness({
   });
   const keywordStart = source.indexOf("const INTERNAL_KEYWORDS = new Set([");
   const keywordEnd = source.indexOf("]);", keywordStart);
-  vm.runInContext([
+  const code = [
     ...["SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES", "DEFAULT_MAX_RESULTS", "MAX_SEARCH_RESULTS_CAP"].map(constant),
     snippet("// BEGIN ATTACHMENT SEARCH LIMITS", "// END ATTACHMENT SEARCH LIMITS"),
     snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
+    snippet("// BEGIN BOUNDED REFRESH HELPERS", "// END BOUNDED REFRESH HELPERS"),
     snippet("// BEGIN INLINE ATTACHMENT BASE64 HELPERS", "// END INLINE ATTACHMENT BASE64 HELPERS"),
     snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
     snippet("// BEGIN MESSAGE TEXT CONVERSION", "// END MESSAGE TEXT CONVERSION"),
@@ -257,10 +259,11 @@ function makeHarness({
     snippet("// BEGIN MESSAGE HEADER READ TOOLS", "// END MESSAGE HEADER READ TOOLS"),
     snippet("// BEGIN ATTACHMENT SEARCH TOOL", "// END ATTACHMENT SEARCH TOOL"),
     "this.run = searchAttachments; this.constants = { MAX_MIME_CONCURRENCY, MIME_PARSE_TIMEOUT_MS }; this.pool = attachmentParsePool;",
-  ].join("\n"), runtime);
+  ].join("\n");
+  vm.runInContext(code, runtime);
 
   return {
-    runtime, folder: folders[0], folders, stats, timers,
+    runtime, folder: folders[0], folders, stats, timers, code,
     get constants() { return runtime.constants; },
     advance(ms) { now += ms; },
     revokeAccess() { accessible = false; },
@@ -310,6 +313,7 @@ describe("searchAttachments results", () => {
     assert.equal("message" in result, false);
     assert.equal("matches" in result, false);
     assert.equal(result.messages.length, 1);
+    assert.equal(h.stats.refreshes, 0, "a local-only search must not start a folder sync");
     const match = result.messages[0];
     assert.equal(match.id, "m-0@example.com");
     assert.equal(match.read, false);
@@ -1030,6 +1034,45 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.truncated, true);
     assert.match(result.message, /20-second/);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.notParsed, 1);
+  });
+
+  it("stops final database lookups when one lookup consumes the remaining budget", async () => {
+    const rows = rowsOf(40);
+    const h = makeHarness({ rows });
+    let publishing = false;
+    let finalOpens = 0;
+    for (const row of rows) row.afterMimeCallback = () => {
+      if (h.stats.mimeCalls === rows.length && h.stats.inFlight === 0) {
+        publishing = true;
+        h.advance(19000);
+      }
+    };
+    const open = Object.getOwnPropertyDescriptor(h.folder, "msgDatabase").get;
+    Object.defineProperty(h.folder, "msgDatabase", { get() {
+      if (publishing) { finalOpens++; h.advance(1000); }
+      return open.call(h.folder);
+    } });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(finalOpens, 1);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.notParsed, 40);
+    assert.equal(result.truncated, true);
+  });
+});
+
+describe("searchAttachments native handle lifetime", () => {
+  it("releases header/database handles across admission, MIME waits and late callbacks", () => {
+    // Reuse S13's WeakRef/GC driver, with the same production code as these
+    // behavior tests. Its fixture never retains native-like handles for us.
+    const { code } = makeHarness({ rows: [] });
+    const child = spawnSync(process.execPath, ["--expose-gc",
+      path.resolve(__dirname, "helpers/message-header-retention.cjs"), "attachments"], {
+      input: code, encoding: "utf8", timeout: 15000,
+    });
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+    assert.equal(JSON.parse(child.stdout).ok, true);
   });
 });
 

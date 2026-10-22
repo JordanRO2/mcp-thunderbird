@@ -482,7 +482,6 @@ const sampleTools = [
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
-
 ];
 
 const validate = createValidator(sampleTools);
