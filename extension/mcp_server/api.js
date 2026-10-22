@@ -11774,6 +11774,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // A timed-out parse is forgotten after this long even if its callback
             // never arrives, so one dead stream cannot disable the tool for good.
+            // Gloda exposes no cancellation handle: reclaim (or a server restart)
+            // cannot stop the old stream, so actual native work can exceed eight
+            // after reclaim. Until then timeouts keep their slots across calls.
             const STALLED_PARSE_TTL_MS = 5 * 60 * 1000;
 
             // One pool for the whole extension: streams left running by a timed-out
@@ -11872,8 +11875,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // STRICT tier only. The read-only recovery tier deliberately accepts
             // some unusual MIME; it must not authorize a bulk native parse.
             function prepareAttachmentSearchCandidate(candidate, scan) {
+              let refusal;
               const checkAccess = () => {
-                if (checkAttachmentSearchCandidate(candidate, () => true) !== true) {
+                const checked = checkAttachmentSearchCandidate(candidate, () => true);
+                if (checked !== true) {
+                  refusal = checked;
                   throw new Error(MESSAGE_READ_STOPPED_ERROR);
                 }
               };
@@ -11896,7 +11902,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const state = classifyRawMessageEncryption(raw, 0, { signedRaw: true });
                 if (searchTimeExpired(scan)) return { failed: true };
                 return state === "clear" ? { signed } : { withheld: true };
-              }).catch(error => error?.isStreamSizeLimit ? { tooLarge: true } : { failed: true });
+              }).catch(error => refusal || (error?.isStreamSizeLimit ? { tooLarge: true } : { failed: true }));
+            }
+
+            // Searched isDirectSendMimeComplete: its body/HTML quoting budgets
+            // belong to sending. Search needs the tree/stream completion checks
+            // plus nonempty containers before trusting allUserAttachments.
+            function isAttachmentSearchMimeComplete(mime, scan) {
+              const pending = [mime];
+              const seen = new Set();
+              while (pending.length) {
+                if (searchTimeExpired(scan)) return false;
+                const part = pending.pop();
+                if (!part || typeof part !== "object" || seen.has(part) ||
+                    part.truncated || part.isTruncated || part.bodyTruncated) return false;
+                seen.add(part);
+                if (part.parts !== undefined && !Array.isArray(part.parts)) return false;
+                const container = getMimePartContentTypes(part).some(value => {
+                  const type = parseRawMimeHeaderValue(value).value;
+                  return type.startsWith("multipart/") || type === "message/rfc822";
+                });
+                if (container && !part.parts?.length) return false;
+                for (const child of part.parts || []) pending.push(child);
+              }
+              return !searchTimeExpired(scan);
             }
 
             /**
@@ -11918,6 +11947,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!slot.reclaimed) pool.live--;
                 wakeParseWaiters(pool);
               };
+              // A slot can arrive through another parse's callback. Dispatch
+              // after admission so each synchronous raw read/classification has
+              // its own turn, including the first eight candidates.
+              await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
               const prepared = await prepareAttachmentSearchCandidate(candidate, scan);
               if (prepared.signed === undefined || searchTimeExpired(scan)) {
                 releaseSlot();
@@ -11928,6 +11961,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let settled = false;
                 let received = false;
                 let timer = null;
+                const parseDeadline = Math.min(scan.deadline, Date.now() + MIME_PARSE_TIMEOUT_MS);
                 const settle = value => {
                   if (settled) return;
                   settled = true;
@@ -11942,10 +11976,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   releaseSlot();
                   if (settled || received) return;
                   received = true;
-                  if (searchTimeExpired(scan)) { settle({ failed: true }); return; }
-                  const outcome = checkAttachmentSearchCandidate(candidate, hdr => {
+                  // Timers can be delayed by main-thread work. A late callback
+                  // must not win simply because its timeout has not run yet.
+                  if (searchTimeExpired(scan) || Date.now() >= parseDeadline) { settle({ failed: true }); return; }
+                  const outcome = checkAttachmentSearchCandidate(candidate, () => {
                     if (!mime) return { failed: true };
                     if (classifyMimeMessageEncryption(mime) !== "clear") return { withheld: true };
+                    if (!isAttachmentSearchMimeComplete(mime, scan)) return { failed: true };
                     const attachments = mime.allUserAttachments;
                     if (!Array.isArray(attachments)) return { failed: true };
                     const matched = [];
@@ -11956,17 +11993,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         matched.push({ name, contentType: type, size: typeof att.size === "number" ? att.size : null });
                       }
                     }
-                    if (searchTimeExpired(scan)) return { failed: true };
+                    if (searchTimeExpired(scan) || Date.now() >= parseDeadline) return { failed: true };
                     if (matched.length === 0) return { none: true };
-                    const header = msgHdrToHeaderObject(hdr);
-                    header.folderPath = candidate.folderPath;
-                    header.matchingAttachments = matched;
-                    return { match: { header, ts: hdr.date || 0, candidate } };
+                    return { match: matched };
                   });
                   settle(outcome);
                 };
                 try {
-                  const timeoutMs = Math.max(0, Math.min(MIME_PARSE_TIMEOUT_MS, scan.deadline - Date.now()));
+                  const timeoutMs = Math.max(0, parseDeadline - Date.now());
                   if (timeoutMs === 0) { settleWithoutParse({ failed: true }); return; }
                   timer = newOneShotTimer(() => {
                     if (!released && !settled) {
@@ -12021,6 +12055,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
 
                 const folders = [];
+                let scanFailures = 0;
+                const failedFolders = new Set();
                 if (folderPath) {
                   const opened = openFolder(folderPath);
                   if (opened.error) return { error: opened.error };
@@ -12034,6 +12070,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (inbox) folders.push(inbox);
                     } catch {
                       scan.truncated = true;
+                      scanFailures++;
                     }
                   }
                 }
@@ -12067,7 +12104,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return false;
                   }, { newestFirst: true });
                   totalScanned += scannedHere;
-                  if (!outcome.complete) scan.truncated = true;
+                  if (!outcome.complete) {
+                    scan.truncated = true;
+                    failedFolders.add(folder.URI);
+                  }
                 }
                 // Array.prototype.sort is stable, so equal dates keep scan order.
                 collected.sort((a, b) => b.date - a.date);
@@ -12075,7 +12115,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const candidates = collected.slice(0, candidateLimit);
 
                 // Phase 2: bounded-in-flight MIME parse.
-                const found = [];
+                // Retain successful no-match candidates too: a final policy or
+                // identity change makes that inspection an omission, not proof
+                // that the candidate has no matching attachment.
+                const inspected = [];
                 let withheld = 0;
                 let notParsed = 0;
                 let tooLarge = 0;
@@ -12090,13 +12133,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     for (;;) {
                       if (nextIndex >= candidates.length) return;
                       if (searchTimeExpired(scan)) return;
-                      const outcome = await parseAttachmentCandidate(candidates[nextIndex++], ctx);
-                      if (outcome.match) found.push(outcome.match);
+                      const candidate = candidates[nextIndex++];
+                      const outcome = await parseAttachmentCandidate(candidate, ctx);
+                      if (outcome.match || outcome.none) inspected.push({ candidate, attachments: outcome.match });
                       else if (outcome.withheld) withheld++;
                       else if (outcome.tooLarge) tooLarge++;
                       else if (outcome.notOffline) notOffline++;
                       else if (outcome.failed) notParsed++;
-                      await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
                     }
                   };
                   const workers = [];
@@ -12106,21 +12149,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   notParsed += candidates.length - nextIndex;
                 }
 
-                // Access can be revoked while the scan yields.
-                const visible = found.filter(entry => {
+                // All worker/native frames have finished or detached. Recheck
+                // current access, key/ID and privacy using primitive locators,
+                // and only now build the shared public headers. No await may
+                // separate this check from publishing the result.
+                if (!isToolEnabled("searchAttachments")) return { error: "Tool 'searchAttachments' is disabled in extension options" };
+                const visible = [];
+                for (const { candidate, attachments } of inspected) {
+                  const outcome = checkAttachmentSearchCandidate(candidate, hdr => {
+                    if (!attachments) return { none: true };
+                    const header = msgHdrToHeaderObject(hdr);
+                    header.folderPath = candidate.folderPath;
+                    header.matchingAttachments = attachments;
+                    return { header, ts: hdr.date || 0 };
+                  });
+                  if (outcome.withheld) withheld++;
+                  else if (outcome.notOffline) notOffline++;
+                  else if (outcome.failed) notParsed++;
+                  else if (outcome.header) visible.push(outcome);
+                }
+                for (const folder of folders) {
                   try {
-                    return !getAccessibleFolder(entry.header.folderPath).error;
+                    if (getAccessibleFolder(folder.URI).error) failedFolders.add(folder.URI);
                   } catch {
-                    return false;
+                    failedFolders.add(folder.URI);
                   }
-                });
-                if (visible.length < found.length) scan.truncated = true;
+                }
+                scanFailures += failedFolders.size;
 
                 visible.sort((a, b) => b.ts - a.ts);
-                const overflow = visible.length > cap;
-                const truncated = scan.truncated || scanCapHit || candidateLimitHit || overflow || withheld > 0 || tooLarge > 0 || notParsed > 0 || notOffline > 0;
+                const overflow = Math.max(0, visible.length - cap);
+                searchTimeExpired(scan);
+                const truncated = scan.truncated || scanFailures > 0 || scanCapHit || candidateLimitHit || overflow > 0 || withheld > 0 || tooLarge > 0 || notParsed > 0 || notOffline > 0;
                 const response = {
-                  matches: visible.slice(0, cap).map(entry => entry.header),
+                  messages: visible.slice(0, cap).map(entry => entry.header),
                   totalScanned,
                   candidates: candidates.length,
                   truncated,
@@ -12129,6 +12191,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (tooLarge > 0) response.tooLarge = tooLarge;
                 if (notParsed > 0) response.notParsed = notParsed;
                 if (notOffline > 0) response.notOffline = notOffline;
+                if (scanFailures > 0) response.scanFailures = scanFailures;
+                if (scanCapHit) response.scanCapHit = true;
+                if (candidateLimitHit) response.candidateLimitHit = true;
+                if (overflow > 0) response.overflow = overflow;
                 if (truncated) {
                   const reasons = [];
                   if (withheld > 0) reasons.push(`${withheld} candidate(s) were withheld because they are protected, signed with access off, or could not be verified as clear`);
@@ -12136,8 +12202,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (scan.timedOut) reasons.push(`the search reached its ${SEARCH_TIME_BUDGET_MS / 1000}-second time budget`);
                   if (candidateLimitHit) reasons.push("the candidate limit (maxResults x 4, newest across folders) was reached before every message was examined");
                   if (scanCapHit) reasons.push("scanCap was reached before every message was examined");
+                  if (scanFailures > 0) reasons.push(`${scanFailures} folder scan(s) failed or became unavailable`);
                   if (overflow) reasons.push("more messages matched than maxResults, only the newest are returned");
-                  if (notOffline > 0) reasons.push(`${notOffline} message(s) with attachments have no offline copy on their remote server and were not downloaded (enable offline use for the folder, or read them with getMessage)`);
+                  if (notOffline > 0) reasons.push(`${notOffline} message(s) with attachments have no complete local copy and were not downloaded (enable offline use and sync the folder, then retry; getMessage can separately fetch an individual message, but does not make this local-only search complete)`);
                   if (notParsed > 0) {
                     reasons.push(pool.stalledSlots.size > 0
                       ? `${notParsed} candidate(s) were not parsed because MIME parses stalled or the budget ran out`
