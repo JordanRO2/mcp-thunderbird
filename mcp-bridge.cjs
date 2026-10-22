@@ -1299,12 +1299,18 @@ async function handleMessage(line) {
 // BEGIN BRIDGE HTTP REQUEST HELPERS
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
+// Whole message reads (including batches) have a 120 s extension deadline.
+const MESSAGE_READ_TIMEOUT = MAIL_OPERATION_TIMEOUT;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;
+  let timeoutMs = REQUEST_TIMEOUT;
   if (message?.method === 'tools/call') {
     const name = message.params?.name;
     const args = message.params?.arguments;
+    if (name === 'getMessage' || name === 'getMessages' || name === 'displayMessage') {
+      timeoutMs = MESSAGE_READ_TIMEOUT;
+    }
     // Match coerceToolArgs in the extension: only the exact string "true"
     // becomes true before validation and dispatch.
     const saveAsDraft = args?.saveAsDraft === true || args?.saveAsDraft === 'true';
@@ -1315,10 +1321,8 @@ function getThunderbirdRequestPolicy(message) {
       checkFolders = 'the Sent folder and the Outbox';
     }
   }
-  return {
-    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
-    checkFolders,
-  };
+  if (checkFolders) timeoutMs = MAIL_OPERATION_TIMEOUT;
+  return { timeoutMs, checkFolders };
 }
 
 function tryRequest(hostname, postData, port, token, policy) {

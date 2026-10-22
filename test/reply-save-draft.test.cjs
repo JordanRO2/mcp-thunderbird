@@ -21,6 +21,7 @@ const RESTRICTED_URI = "imap://restricted@example.test/Drafts";
 
 function loadReply(options = {}) {
   const { enabled = true, blocked = true, attachmentError, mode = "success" } = options;
+  const access = { original: true, destination: true, reply: true, saveDraft: enabled };
   const calls = { finds: 0, sends: 0, opens: [], saves: 0, timers: [], windows: [], mime: [], lookups: [], flags: [], dialogs: 0 };
   const identity = {
     key: "sender",
@@ -60,7 +61,7 @@ function loadReply(options = {}) {
       } },
       accounts: { accounts: [{ key: "allowed", identities: [identity] }], findAccountForServer: server => ({ key: server.accountKey }) },
     },
-    isAccountAllowed: key => key === "allowed",
+    isAccountAllowed: key => key === "allowed" && access.destination,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {} }) },
@@ -74,9 +75,9 @@ function loadReply(options = {}) {
         return timer;
       } },
     },
-    isToolEnabled(name) { assert.equal(name, "saveDraft"); return enabled; },
+    isToolEnabled(name) { return name === "saveDraft" ? access.saveDraft : access.reply; },
     isSkipReviewBlocked: () => blocked,
-    findMessage() { calls.finds++; return { msgHdr: { folder }, folder }; },
+    findMessage() { calls.finds++; return access.original ? { msgHdr: { folder }, folder } : { error: "Original account access denied" }; },
     materializeAttachmentDescs: descs => descs,
     buildBodyWithSignature: body => body || "",
     filePathsToAttachDescs(attachments) {
@@ -156,7 +157,7 @@ function loadReply(options = {}) {
   const reply = args => sandbox.dispatchTool("replyToMessage", {
     messageId: "original@example.com", folderPath: "imap://example/INBOX", body: "reply text", saveAsDraft: true, ...args,
   });
-  return { reply, calls, identity };
+  return { reply, calls, identity, access };
 }
 
 describe("replyToMessage saveAsDraft", () => {
@@ -186,8 +187,8 @@ describe("replyToMessage saveAsDraft", () => {
     assert.equal(args[7], "cc@example.com");
     assert.deepEqual(args[9], [attachment]);
     assert.equal(calls.mime[0].examineEncryptedParts, false);
-    assert.deepEqual(calls.lookups, [DRAFTS_URI]);
-    assert.deepEqual(calls.flags, [0x400]);
+    assert.deepEqual(calls.lookups, [DRAFTS_URI, DRAFTS_URI]);
+    assert.deepEqual(calls.flags, [0x400, 0x400]);
     assert.equal(calls.timers[0].cancelled, true);
     assert.equal(calls.windows[0].unregistered, true);
   });
@@ -218,7 +219,7 @@ describe("replyToMessage saveAsDraft", () => {
   for (const [label, options] of [
     ["restricted current window identity", { windowIdentity: { draftsFolderURI: RESTRICTED_URI } }],
     ["restricted compose identity", { windowIdentity: null, composeIdentity: { draftsFolderURI: RESTRICTED_URI } }],
-    ["restricted destination despite encrypted opt-in", { allowEncrypted: true, mime: { contentType: "multipart/encrypted" }, windowIdentity: { draftFolder: RESTRICTED_URI } }],
+    ["restricted destination despite encrypted opt-in", { allowEncrypted: true, windowIdentity: { draftFolder: RESTRICTED_URI } }],
     ["missing current identity", { windowIdentity: null, composeIdentity: null }],
     ["missing configured destination", { windowIdentity: {} }],
     ["unreadable destination", { windowIdentity: { get draftsFolderURI() { throw new Error(RESTRICTED_URI); } } }],
@@ -252,7 +253,7 @@ describe("replyToMessage saveAsDraft", () => {
     });
     assert.equal((await reply()).success, true);
     assert.equal(calls.saves, 1);
-    assert.deepEqual(calls.lookups, [legacyURI]);
+    assert.deepEqual(calls.lookups, [legacyURI, legacyURI]);
   });
 
   it("retains the ordinary review path when saveAsDraft is omitted", async () => {
@@ -304,11 +305,12 @@ describe("replyToMessage saveAsDraft", () => {
     it(`restores window state before returning ${completion} and ignores late successful completion`, async () => {
       const { reply, calls } = loadReply({ mode: "pending" });
       const pending = reply();
+      for (let i = 0; i < 4; i++) await Promise.resolve();
       const win = calls.windows[0];
       assert.equal(win.gCloseWindowAfterSave, true);
       assert.notEqual(win.DisplaySaveFolderDlg, win.originalDialog);
 
-      if (completion === "timeout") calls.timers[0].callback.notify();
+      if (completion === "timeout") calls.timers.at(-1).callback.notify();
       else win.completeSave(0x80004005);
       assert.equal(win.gCloseWindowAfterSave, false);
       assert.equal(win.DisplaySaveFolderDlg, win.originalDialog);
@@ -316,7 +318,7 @@ describe("replyToMessage saveAsDraft", () => {
       assert.equal(typeof result.error, "string");
 
       win.completeSave(0);
-      calls.timers[0].callback.notify();
+      calls.timers.at(-1).callback.notify();
       assert.notEqual(win.closed, true, "late success must not close the window using our override");
       assert.equal(win.gCloseWindowAfterSave, false);
       assert.equal(win.DisplaySaveFolderDlg, win.originalDialog);
@@ -324,6 +326,36 @@ describe("replyToMessage saveAsDraft", () => {
       assert.equal(calls.saves, 1);
     });
   }
+
+  for (const permission of ["original", "destination", "reply", "saveDraft"]) {
+    it(`rechecks ${permission} access at native draft completion and restores overrides`, async () => {
+      const { reply, calls, access } = loadReply({ mode: "pending" });
+      const pending = reply();
+      for (let i = 0; i < 4; i++) await Promise.resolve();
+      const win = calls.windows[0];
+      access[permission] = false;
+      win.completeSave();
+      const result = await pending;
+      assert.match(result.error, /access denied|disabled|requires the saveDraft|accessible Drafts/);
+      assert.equal(result.success, undefined);
+      assert.equal(result.saveOutcome, "uncertain");
+      assert.equal(win.gCloseWindowAfterSave, false);
+      assert.equal(win.DisplaySaveFolderDlg, win.originalDialog);
+      assert.notEqual(win.closed, true);
+    });
+  }
+
+  it("rechecks access after a completed draft before reporting success", async () => {
+    const { reply, calls, access } = loadReply({ mode: "pending" });
+    const pending = reply();
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    calls.windows[0].completeSave();
+    access.original = false;
+    const result = await pending;
+    assert.match(result.error, /Original account access denied/);
+    assert.equal(result.success, undefined);
+    assert.equal(result.saveOutcome, "uncertain");
+  });
 
   it("restores an originally true close flag after failure", async () => {
     const { reply, calls } = loadReply({ mode: "failure", originalCloseFlag: true });

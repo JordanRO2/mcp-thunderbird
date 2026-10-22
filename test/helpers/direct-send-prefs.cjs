@@ -47,9 +47,9 @@ function makeDirectSendPrefs(overrides = {}) {
 // classifiers. Other direct-send harnesses stub MIME quoting, so reuse one
 // explicit clear-raw control while privacy-messages runs the real classifiers.
 const clearOriginalRawFixture = {
-  readBoundedRawMessage: () => "Content-Type: text/plain\r\n\r\nOriginal text",
+  readCompleteRawMessage: async () => "Content-Type: text/plain\r\n\r\nOriginal text",
+  getMessageReadAccessError: () => null,
   classifyRawMessageEncryption: () => "clear",
-  isRawTopLevelMultipartSigned: () => false,
 };
 
 // Searched for reusable UTF-8/MIME completeness dependencies -> found production

@@ -177,6 +177,25 @@ describe('bridge request outcomes', () => {
     });
   }
 
+  for (const [name, args] of [
+    ['getMessage', { rawSource: true }],
+    ['getMessage', { rawSource: 'true' }],
+    ['getMessages', { rawSource: true }],
+    ['getMessage', { rawSource: false }],
+    ['getMessage', {}],
+    ['getMessages', {}],
+    ['displayMessage', {}],
+  ]) {
+    it(`${name} ${JSON.stringify(args)} outlasts the extension's 120 s server fetch`, async () => {
+      const { runtime, requests } = loadRequests();
+      const pending = runtime.forwardToThunderbird(toolCall(name, args));
+      connect(requests[0]);
+      assert.equal(requests[0].timeoutMs, 150000);
+      requests[0].onTimeout();
+      await assert.rejects(pending, /timed out after 150 seconds/);
+    });
+  }
+
   for (const message of [
     toolCall('listFolders'),
     toolCall('sendMail'),

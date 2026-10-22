@@ -79,6 +79,9 @@ function loadInlineImageFetcher({
   ].join("\n");
   const sandbox = {
     btoa: globalThis.btoa,
+    canContinue: () => true,
+    pending: new Set(),
+    deadline: Infinity,
     Cr: { NS_BASE_STREAM_CLOSED },
     console: { error: (...args) => log.push(args) },
     NetUtil: {
@@ -110,7 +113,7 @@ function loadGetMessage({ stream, log, findMessageError }) {
   const source = fs.readFileSync(apiPath, "utf8");
   const helperStart = source.indexOf("// BEGIN RAW MIME ATTACHMENT HELPERS");
   const helperEnd = source.indexOf("// END RAW MIME ATTACHMENT HELPERS");
-  const getMessageStart = source.indexOf("function getMessage(messageId,");
+  const getMessageStart = source.indexOf("// BEGIN MESSAGE READ TOOLS");
   const getMessageEnd = source.indexOf(
     "async function getMessages(",
     getMessageStart
@@ -122,6 +125,9 @@ function loadGetMessage({ stream, log, findMessageError }) {
 
   const sandbox = {
     Cr: { NS_BASE_STREAM_CLOSED },
+    Cc: { "@mozilla.org/timer;1": { createInstance: () => ({ initWithCallback() {}, cancel() {} }) } },
+    Ci: { nsITimer: { TYPE_ONE_SHOT: 0 } },
+    isToolEnabled: () => true,
     console: { error: (...args) => log.push(args) },
     PREF_ALLOW_ENCRYPTED_MESSAGES: "allowEncryptedMessages",
     isPrivacyOptInEnabled: () => false,
