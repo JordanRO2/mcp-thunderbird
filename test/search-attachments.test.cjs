@@ -291,6 +291,14 @@ describe("searchAttachments schema", () => {
     assert.match(tool.description, /untrusted external data/);
     assert.match(tool.description, /heuristic/);
     assert.match(tool.description, /notOffline/);
+    assert.equal(tool.inputSchema.properties.maxResults.minimum, 1);
+    assert.equal(tool.inputSchema.properties.maxResults.maximum, 200);
+    assert.equal(tool.inputSchema.properties.maxResults.default, 50);
+    assert.equal(tool.inputSchema.properties.scanCap.minimum, 1);
+    assert.equal(tool.inputSchema.properties.scanCap.maximum, 50000);
+    assert.equal(tool.inputSchema.properties.scanCap.default, 5000);
+    assert.match(tool.description, /never decrypt/i);
+    assert.match(tool.description, /2 MiB/);
   });
 });
 
@@ -300,6 +308,7 @@ describe("searchAttachments results", () => {
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.truncated, false);
     assert.equal("message" in result, false);
+    assert.equal("matches" in result, false);
     assert.equal(result.messages.length, 1);
     const match = result.messages[0];
     assert.equal(match.id, "m-0@example.com");
@@ -335,6 +344,16 @@ describe("searchAttachments results", () => {
     assert.equal(result.overflow, 7);
     assert.equal(result.truncated, true);
     assert.match(result.message, /maxResults/);
+  });
+
+  it("uses the shared default and maximum result limits at runtime", async () => {
+    const h = makeHarness({ rows: rowsOf(201) });
+    const defaulted = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(defaulted.messages.length, 50);
+    const capped = await h.call("invoice", undefined, h.folder.URI, 1000);
+    assert.equal(capped.messages.length, 200);
+    assert.equal(capped.overflow, 1);
+    assert.equal(capped.truncated, true);
   });
 
   it("returns an error for an unknown folder, and { error } on unexpected exceptions", async () => {
@@ -379,6 +398,18 @@ describe("searchAttachments cooperative scan", () => {
     assert.equal(result.messages[0].id, "m-49@example.com");
     assert.equal(result.truncated, true);
     assert.match(result.message, /scanCap/);
+  });
+
+  it("applies the named default and maximum scan caps", async () => {
+    const raw = "Content-Type: text/plain\r\n\r\nClear.\r\n";
+    const h = makeHarness({ rows: rowsOf(50001, { attach: false, raw }) });
+    const defaulted = await h.call("x", undefined, h.folder.URI);
+    assert.equal(defaulted.totalScanned, 5000);
+    assert.equal(defaulted.scanCapHit, true);
+    const capped = await h.call("x", undefined, h.folder.URI, 200, 100000);
+    assert.equal(capped.totalScanned, 50000);
+    assert.equal(capped.scanCapHit, true);
+    assert.equal(h.stats.mimeCalls, 0);
   });
 
   it("limits the candidate buffer to maxResults*4 and reports it", async () => {
