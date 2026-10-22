@@ -9,13 +9,18 @@ const vm = require("node:vm");
 const scenario = process.argv[2];
 const lookup = scenario === "lookup" || scenario === "lookup-without-direct";
 const attachments = scenario === "attachments";
-const ATTACHMENT_RAW = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="invoice.pdf"\r\n\r\nA clear attachment.\r\n';
+const ATTACHMENT_RAW = [
+  'Content-Type: multipart/mixed; boundary="gc"', '',
+  ...Array.from({ length: 40 }, () => [
+    '--gc', 'Content-Type: application/pdf',
+    'Content-Disposition: attachment; filename="invoice.pdf"', '', 'A clear attachment.',
+  ]).flat(), '--gc--', '',
+].join('\r\n');
 const tracked = [];
 const state = {
   rows: 0, databases: 0, headers: 0, snapshots: 0, directHits: 0,
   directCalls: [], keyReads: [], visited: [], serialized: [],
   yields: 0, resume: null, settled: false,
-  mimeCallback: null, parseTimer: null,
 };
 
 function messageId(key) { return `m-${key}@example.test`; }
@@ -152,14 +157,10 @@ async function main() {
     TextDecoder, Uint8Array, atob, btoa,
     Services: { prefs: { getBoolPref: () => false }, tm: { dispatchToMainThread } },
     Ci: { nsMsgMessageFlags: { Expunged: 0x8, Offline: 0x80, Partial: 0x400, Attachment: 0x10000000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
-    Cc: { "@mozilla.org/timer;1": { createInstance() {
-      return { initWithCallback(callback) { state.parseTimer = callback; }, cancel() {} };
-    } } },
+    Cc: new Proxy({}, { get() { assert.fail("Attachment metadata must not open a MIME channel or timer"); } }),
     Cr: { NS_BASE_STREAM_CLOSED: 1 },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
-    ChromeUtils: { importESModule: () => ({
-      MsgHdrToMimeMessage(_hdr, _parts, callback) { state.mimeCallback = callback; },
-    }) },
+    ChromeUtils: { importESModule() { assert.fail("Attachment metadata must not use Gloda"); } },
     MailServices: {
       mimeConverter: { decodeMimeHeader: value => value },
       folderLookup: { getFolderForURL: uri => uri === folder.URI ? folder : null },
@@ -171,41 +172,23 @@ async function main() {
   vm.runInContext(fs.readFileSync(0, "utf8"), runtime, { filename: "api-message-header-retention.js" });
   if (attachments) {
     state.rows = 1;
-    for (const timeout of [false, true]) {
-      state.settled = false;
-      state.mimeCallback = null;
-      const pending = runtime.run("invoice", undefined, folder.URI).then(value => {
-        state.settled = true;
-        return value;
-      });
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(typeof state.resume, "function", "Raw admission must yield");
-      await assertCollected("raw admission", () => assert.equal(state.settled, false));
-      releaseYield();
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(typeof state.mimeCallback, "function", "Native parse must be pending");
-      assert.equal(runtime.pool.live, 1);
-      await assertCollected("awaiting MIME", () => assert.equal(state.settled, false));
-      const mime = { contentType: "application/pdf", allUserAttachments: [
-        { name: "invoice.pdf", contentType: "application/pdf", size: 19 },
-      ] };
-      if (timeout) state.parseTimer.notify();
-      else state.mimeCallback(null, mime);
-      const result = await pending;
-      assert.equal(result.messages.length, timeout ? 0 : 1);
-      assert.equal(result.truncated, timeout);
-      assert.equal(runtime.pool.live, timeout ? 1 : 0);
-      // Keep the response and native callback alive even after a timeout.
-      await assertCollected("settled search with callback retained");
-      if (timeout) {
-        assert.equal(result.notParsed, 1);
-        state.mimeCallback(null, mime);
-        state.mimeCallback(null, mime);
-        assert.equal(result.messages.length, 0);
-        assert.equal(runtime.pool.live, 0);
-        await assertCollected("late callback");
-      }
-    }
+    const pending = runtime.run("invoice", undefined, folder.URI).then(value => {
+      state.settled = true;
+      return value;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof state.resume, "function", "Raw admission must yield");
+    await assertCollected("raw admission", () => assert.equal(state.settled, false));
+    releaseYield();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof state.resume, "function", "Metadata extraction must yield");
+    await assertCollected("metadata extraction", () => assert.equal(state.settled, false));
+    releaseYield();
+    const result = await pending;
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].matchingAttachments.length, 40);
+    assert.equal(result.truncated, false);
+    await assertCollected("settled search with detached result retained");
     process.stdout.write(JSON.stringify({ scenario, ok: true }) + "\n");
     return;
   }

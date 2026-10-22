@@ -29,10 +29,10 @@ function productionSchema() {
 
 const FLAGS = { Expunged: 0x8, Offline: 0x80, Partial: 0x400, Attachment: 0x10000000 };
 const DECRYPTION_OKAY = 0x00020000;
-const PDF = { name: "Invoice.PDF", contentType: "application/pdf", size: 10 };
-const PNG = { name: "photo.png", contentType: "image/png", size: 20 };
+const PDF = { name: "Invoice.PDF", contentType: "application/pdf", size: 10, disposition: "attachment" };
+const PNG = { name: "photo.png", contentType: "image/png", size: 20, disposition: "attachment" };
 // Searched the raw-MIME and message-read fixtures: their builders are local.
-// Keep valid MIME here, including the attachment represented by each mock tree.
+// Keep valid MIME here; search metadata is derived from these exact bytes.
 function attachmentRaw(attachments = [PDF]) {
   return [
     'From: a@example.test', 'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="b"', '',
@@ -53,28 +53,24 @@ const SIGNED_RAW = [
 ].join('\r\n');
 const SMIME_RAW = "From: a@example.test\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nAAAA\r\n";
 
-/**
- * rows: { attach?: bool, offline?: bool, atts?, enigmail?, raw?, mime?: "hang"|"null"|"throw"|"cbthrow", mimeMessage? }
- * Parsing is driven by the harness: each MsgHdrToMimeMessage call is recorded and
- * completed on a later macrotask, so the in-flight count is real. A "hang" row's
- * parse completes only when the test calls row.release(), like a stuck stream
- * whose callback arrives late. row.timer is the timer armed for that parse.
- * extraFolders: more Inbox row lists, one extra account each.
- */
+/** Native MIME APIs are forbidden: the one local raw read is the only transport. */
 function makeHarness({
-  rows, extraFolders = [], allowEncrypted = false, parseDelayMs = 0, msPerYield = 0,
-  timerThrows = false, serverType = "imap",
+  rows, extraFolders = [], allowEncrypted = false, msPerYield = 0,
+  serverType = "imap",
 } = {}) {
   const stats = {
-    yields: 0, mimeCalls: 0, inFlight: 0, maxInFlight: 0, timersCreated: 0, timersCancelled: 0,
-    mimeArgs: [], mimeFolders: [], rawOpens: 0, rawCloses: 0, serverFetches: 0, refreshes: 0,
+    yields: 0, mimeCalls: 0, uriCalls: 0, channelCalls: 0, imports: 0,
+    rawOpens: 0, rawCloses: 0, rawFolders: [], serverFetches: 0, refreshes: 0,
   };
+  function forbidden(name) {
+    stats[name]++;
+    assert.fail(`Attachment search must not call native MIME transport (${name})`);
+  }
   let generation = 0;
   let now = 0;
   let accessible = true;
   let toolEnabled = true;
   let onYield = null;
-  const timers = [];
   const folders = [];
 
   [rows, ...extraFolders].forEach((folderRows, folderIndex) => {
@@ -86,9 +82,11 @@ function makeHarness({
       server: null,
       updateFolder() { stats.refreshes++; },
       headers,
-      getUriForMsg(header) { return `${this.URI}#${header.messageKey}`; },
+      getUriForMsg() { forbidden("uriCalls"); },
+      generateMessageURI() { forbidden("uriCalls"); },
       getMsgInputStream(msgHdr) {
         stats.rawOpens++;
+        stats.rawFolders.push(this.URI);
         const row = msgHdr.row;
         row.onRawOpen?.();
         if (row.rawThrows) throw new Error("local store unavailable");
@@ -152,37 +150,6 @@ function makeHarness({
     static now() { return now; }
   }
 
-  function MsgHdrToMimeMessage(hdr, partsOfInterest, callback, ...rest) {
-    stats.mimeCalls++;
-    stats.mimeArgs.push(JSON.parse(JSON.stringify(rest)));
-    stats.mimeFolders.push(hdr.folder.URI);
-    stats.inFlight++;
-    stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
-    const row = hdr.row;
-    row.timer = timers[timers.length - 1];
-    if (row.mime === "throw") { stats.inFlight--; throw new Error("sync failure"); }
-    let ended = false;
-    const finish = () => {
-      if (!ended) { stats.inFlight--; ended = true; }
-      row.beforeMimeCallback?.();
-      if (row.mime === "null") callback(hdr, null);
-      else if (row.mime === "cbthrow") callback(hdr, { get allUserAttachments() { throw new Error("boom"); } });
-      else callback(hdr, row.mimeMessage || {
-        contentType: "multipart/mixed",
-        parts: [{ contentType: "text/plain", body: "A clear message." },
-          ...(row.atts || [PDF]).map(att => ({ contentType: att.contentType }))],
-        allUserAttachments: row.atts || [PDF],
-      });
-      row.afterMimeCallback?.();
-    };
-    row.onMimeStart?.();
-    if (row.mime === "hang") {
-      row.release = () => { finish(); };
-      return;
-    }
-    setTimeout(finish, parseDelayMs);
-  }
-
   const runtime = vm.createContext({
     Date: FakeDate,
     TextDecoder, Uint8Array, atob, btoa,
@@ -204,27 +171,16 @@ function makeHarness({
       },
     },
     Ci: { nsMsgMessageFlags: FLAGS, nsMsgFolderFlags: { Inbox: 0x1000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
-    Cc: {
-      "@mozilla.org/timer;1": {
-        createInstance() {
-          if (timerThrows) throw new Error("no timer");
-          stats.timersCreated++;
-          const timer = {
-            cancelled: false,
-            initWithCallback(callback, ms) { timer.callback = callback; timer.ms = ms; },
-            cancel() { timer.cancelled = true; stats.timersCancelled++; },
-          };
-          timers.push(timer);
-          return timer;
-        },
-      },
+    Cc: new Proxy({}, { get: () => ({ createInstance: () => forbidden("channelCalls") }) }),
+    ChromeUtils: { importESModule: () => forbidden("imports") },
+    MsgHdrToMimeMessage: () => forbidden("mimeCalls"),
+    NetUtil: {
+      readInputStreamToString: (stream, count) => stream.read(count),
+      newChannel: () => forbidden("channelCalls"),
     },
-    ChromeUtils: { importESModule: () => ({ MsgHdrToMimeMessage }) },
-    NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       messageServiceFromURI() {
-        stats.serverFetches++;
-        throw new Error("Attachment searches must never request a server stream");
+        forbidden("serverFetches");
       },
       mimeConverter: { decodeMimeHeader: value => value },
       folderLookup: { getFolderForURL: uri => folders.find(candidate => candidate.URI === uri) || null },
@@ -258,28 +214,36 @@ function makeHarness({
     snippet("function openFolder(", "function findTrashFolder("),
     snippet("// BEGIN MESSAGE HEADER READ TOOLS", "// END MESSAGE HEADER READ TOOLS"),
     snippet("// BEGIN ATTACHMENT SEARCH TOOL", "// END ATTACHMENT SEARCH TOOL"),
-    "this.run = searchAttachments; this.constants = { MAX_MIME_CONCURRENCY, MIME_PARSE_TIMEOUT_MS }; this.pool = attachmentParsePool;",
+    "this.run = searchAttachments;",
   ].join("\n");
   vm.runInContext(code, runtime);
 
   return {
-    runtime, folder: folders[0], folders, stats, timers, code,
-    get constants() { return runtime.constants; },
+    runtime, folder: folders[0], folders, stats, code,
     advance(ms) { now += ms; },
     revokeAccess() { accessible = false; },
     disableTool() { toolEnabled = false; },
     setEncrypted(value) { allowEncrypted = value; },
     setOnYield(callback) { onYield = callback; },
+    afterExtraction(callback) {
+      const extract = runtime.extractAttachmentSearchMetadata;
+      runtime.extractAttachmentSearchMetadata = async (...args) => {
+        const result = await extract(...args);
+        callback();
+        return result;
+      };
+    },
     async call(...args) {
-      return JSON.parse(JSON.stringify(await runtime.run(...args)));
+      const result = JSON.parse(JSON.stringify(await runtime.run(...args)));
+      for (const name of ["mimeCalls", "uriCalls", "channelCalls", "imports", "serverFetches"]) {
+        assert.equal(stats[name], 0, `Forbidden native transport on ${name}`);
+      }
+      return result;
     },
   };
 }
 
 const rowsOf = (count, extra = {}) => Array.from({ length: count }, () => ({ ...extra }));
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-// Newest messages are scanned and parsed first, so hung rows go LAST in the list.
-const hungRows = count => Array.from({ length: count }, () => ({ mime: "hang" }));
 
 describe("searchAttachments schema", () => {
   it("bounds its inputs and declares no required parameters", () => {
@@ -374,12 +338,12 @@ describe("searchAttachments results", () => {
   });
 
   it("combines every applicable reason in one message", async () => {
-    const h = makeHarness({ rows: [{ offline: false }, ...rowsOf(6), { mime: "null" }] });
+    const h = makeHarness({ rows: [{ offline: false }, ...rowsOf(6), { rawThrows: true }] });
     const result = await h.call("invoice", undefined, h.folder.URI, 2);
     assert.equal(result.truncated, true);
     assert.match(result.message, /more messages matched than maxResults/);
     assert.match(result.message, /no complete local copy/);
-    assert.match(result.message, /could not be parsed/);
+    assert.match(result.message, /could not be inspected/);
   });
 });
 
@@ -421,7 +385,7 @@ describe("searchAttachments cooperative scan", () => {
     const result = await h.call("invoice", undefined, h.folder.URI, 2);
     assert.equal(result.candidates, 8);
     assert.equal(result.candidateLimitHit, true);
-    assert.equal(h.stats.mimeCalls, 8);
+    assert.equal(h.stats.rawOpens, 8);
     assert.equal(result.truncated, true);
     assert.match(result.message, /candidate limit/);
   });
@@ -438,7 +402,7 @@ describe("searchAttachments cooperative scan", () => {
     const h = makeHarness({ rows: rowsOf(300), extraFolders: [[], []] });
     const result = await h.call("invoice", undefined, undefined, 50);
     assert.equal(result.candidates, 200);
-    assert.equal(h.stats.mimeCalls, 200);
+    assert.equal(h.stats.rawOpens, 200);
     assert.equal(result.truncated, true);
   });
 
@@ -448,7 +412,7 @@ describe("searchAttachments cooperative scan", () => {
     const h = makeHarness({ rows: older, extraFolders: [newer] });
     const result = await h.call("invoice", undefined, undefined, 5);
     assert.equal(result.candidates, 20);
-    assert.ok(h.stats.mimeFolders.every(uri => uri === h.folders[1].URI));
+    assert.ok(h.stats.rawFolders.every(uri => uri === h.folders[1].URI));
     assert.ok(result.messages.every(match => match.folderPath === h.folders[1].URI));
     assert.equal(result.truncated, true);
   });
@@ -503,13 +467,12 @@ describe("searchAttachments cooperative scan", () => {
 });
 
 describe("searchAttachments remote messages without an offline copy", () => {
-  it("counts them separately, spends no timer and no parse, and explains why", async () => {
+  it("counts them separately without opening local raw input, and explains why", async () => {
     const h = makeHarness({ rows: [{ offline: false }, { offline: false }, {}] });
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.notOffline, 2);
     assert.equal(result.candidates, 1);
-    assert.equal(h.stats.mimeCalls, 1);
-    assert.equal(h.stats.timersCreated, 1);
+    assert.equal(h.stats.rawOpens, 1);
     assert.equal(result.truncated, true);
     assert.match(result.message, /no complete local copy/);
     assert.match(result.message, /enable offline use and sync/);
@@ -532,122 +495,6 @@ describe("searchAttachments remote messages without an offline copy", () => {
       const result = await h.call("invoice", undefined, h.folder.URI);
       assert.equal(result.messages.length, 1, serverType);
     }
-  });
-});
-
-describe("searchAttachments bounded MIME pool", () => {
-  it("never has more than MAX_MIME_CONCURRENCY parses in flight, and does use the pool", async () => {
-    const h = makeHarness({ rows: rowsOf(60), parseDelayMs: 2 });
-    const result = await h.call("invoice", undefined, h.folder.URI, 200);
-    assert.equal(h.constants.MAX_MIME_CONCURRENCY, 8);
-    assert.equal(result.messages.length, 60);
-    assert.equal(h.stats.maxInFlight, 8);
-  });
-
-  it("disables download and encrypted-part examination after the raw gate", async () => {
-    const h = makeHarness({ rows: rowsOf(3) });
-    await h.call("invoice", undefined, h.folder.URI);
-    assert.deepEqual(h.stats.mimeArgs, Array.from({ length: 3 }, () => [false, { examineEncryptedParts: false }]));
-  });
-
-  it("creates one timer per parse and cancels every one on the success path", async () => {
-    const h = makeHarness({ rows: rowsOf(12) });
-    await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.timersCreated, 12);
-    assert.equal(h.stats.timersCancelled, 12);
-    assert.ok(h.timers.every(timer => timer.ms === h.constants.MIME_PARSE_TIMEOUT_MS));
-  });
-
-  it("reports a timed-out parse as not parsed and ignores its late callback", async () => {
-    const rows = [...rowsOf(3), ...hungRows(1)];
-    const h = makeHarness({ rows });
-    const pending = h.call("invoice", undefined, h.folder.URI);
-    await sleep(20);
-    rows[3].timer.callback.notify();
-    const result = await pending;
-    assert.equal(result.messages.length, 3);
-    assert.equal(result.notParsed, 1);
-    assert.equal(result.truncated, true);
-    assert.match(result.message, /not parsed because MIME parses stalled/);
-    rows[3].release();
-    assert.equal(h.stats.inFlight, 0);
-    assert.ok(h.timers.every(timer => timer.cancelled));
-  });
-
-  it("keeps a timed-out parse counted as in flight until its callback arrives", async () => {
-    const rows = [...rowsOf(40), ...hungRows(4)];
-    const h = makeHarness({ rows, parseDelayMs: 3 });
-    const pending = h.call("invoice", undefined, h.folder.URI, 50);
-    await sleep(15);
-    for (const row of rows.slice(40)) row.timer.callback.notify();
-    const result = await pending;
-    // 4 stalled parses plus at most 4 live ones: never more than 8 in flight.
-    assert.equal(h.stats.maxInFlight, 8);
-    assert.equal(result.messages.length, 40);
-    assert.equal(result.notParsed, 4);
-    for (const row of rows.slice(40)) row.release();
-    assert.equal(h.stats.inFlight, 0);
-  });
-
-  it("stops launching once every slot is held by a stalled parse and says so", async () => {
-    const rows = [...rowsOf(20), ...hungRows(8)];
-    const h = makeHarness({ rows, parseDelayMs: 1 });
-    const pending = h.call("invoice", undefined, h.folder.URI, 50);
-    await sleep(15);
-    for (const row of rows.slice(20)) row.timer.callback.notify();
-    const result = await pending;
-    assert.equal(h.stats.maxInFlight, 8);
-    assert.equal(h.stats.mimeCalls, 8 + result.messages.length);
-    assert.equal(result.messages.length + result.notParsed, 28);
-    assert.match(result.message, /stalled/);
-    for (const row of rows.slice(20)) row.release();
-    assert.equal(h.stats.inFlight, 0);
-  });
-
-  it("treats null MIME, throwing callbacks and synchronous MIME throws as unparsed without hanging", async () => {
-    const h = makeHarness({ rows: [{ mime: "null" }, { mime: "cbthrow" }, { mime: "throw" }, {}] });
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(result.messages.length, 1);
-    assert.equal(result.notParsed, 3);
-    assert.equal(result.truncated, true);
-    assert.equal(h.stats.timersCancelled, h.stats.timersCreated);
-  });
-
-  it("survives timer allocation failure without rejecting", async () => {
-    const h = makeHarness({ rows: rowsOf(3), timerThrows: true });
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(result.messages.length, 0);
-    assert.equal(result.notParsed, 3);
-  });
-
-  it("clamps each parse timeout to what is left of the shared budget", async () => {
-    const row = {};
-    const h = makeHarness({ rows: [row] });
-    row.onRawRead = () => h.advance(13500);
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.timersCreated, 1);
-    assert.equal(h.timers[0].ms, 6500);
-    assert.equal(result.messages.length, 1);
-  });
-
-  it("does not start parsing once the budget is spent and counts the candidates as not parsed", async () => {
-    const rows = [...rowsOf(997, { attach: false }), ...rowsOf(3)];
-    const h = makeHarness({ rows, msPerYield: 7000 });
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.timersCreated, 0);
-    assert.equal(h.stats.mimeCalls, 0);
-    assert.equal(result.truncated, true);
-    assert.match(result.message, /20-second/);
-    assert.equal(result.notParsed, result.candidates);
-  });
-
-  it("stops pulling candidates at the shared deadline and counts the rest as not parsed", async () => {
-    const h = makeHarness({ rows: rowsOf(40), parseDelayMs: 0, msPerYield: 2500 });
-    const result = await h.call("invoice", undefined, h.folder.URI, 200);
-    assert.equal(result.truncated, true);
-    assert.match(result.message, /20-second/);
-    assert.ok(result.notParsed > 0);
-    assert.equal(result.messages.length + result.notParsed, result.candidates);
   });
 });
 
@@ -676,11 +523,11 @@ describe("searchAttachments complete raw privacy gate", () => {
 
   for (const allowEncrypted of [false, true]) {
     for (const [name, raw] of protectedRaw) {
-      it(`withholds ${name} before Gloda with opt-in ${allowEncrypted}`, async () => {
+      it(`withholds ${name} without native MIME parsing with opt-in ${allowEncrypted}`, async () => {
         const h = makeHarness({ rows: [{ raw }], allowEncrypted });
         assert.notEqual(h.runtime.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "clear");
         const result = await h.call("invoice", undefined, h.folder.URI);
-        assert.equal(h.stats.mimeCalls, 0, "the raw gate must run before Gloda can decrypt");
+        assert.equal(h.stats.mimeCalls, 0, "native parsers must never be consulted");
         assert.equal(h.stats.rawOpens, 1, "use one complete local snapshot");
         assert.equal(h.stats.rawCloses, 1);
         assert.equal(h.stats.serverFetches, 0);
@@ -701,19 +548,7 @@ describe("searchAttachments complete raw privacy gate", () => {
       assert.equal(result.truncated, true);
     });
 
-    it(`withholds an encrypted returned tree with opt-in ${allowEncrypted}`, async () => {
-      const mimeMessage = {
-        contentType: 'multipart/encrypted; protocol="application/pgp-encrypted"',
-        isEncrypted: true, parts: [],
-        get allUserAttachments() { return assert.fail("Do not inspect protected attachment metadata"); },
-      };
-      const h = makeHarness({ rows: [{ mimeMessage }], allowEncrypted });
-      const result = await h.call("invoice", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 1, "the contradictory mocked tree is rejected after the clear raw gate");
-      assert.equal(result.messages.length, 0);
-      assert.equal(result.protectedWithheld, 1);
-      assert.equal(result.truncated, true);
-    });
+
   }
 
   it("rejects search input that only the permissive getMessage tier accepts", async () => {
@@ -767,31 +602,6 @@ describe("searchAttachments complete raw privacy gate", () => {
   });
 });
 
-describe("searchAttachments incomplete MIME accounting", () => {
-  for (const [name, makeTree] of [
-    ["empty multipart", () => ({ contentType: "multipart/mixed", parts: [], allUserAttachments: [] })],
-    ["missing attachment list", () => ({ contentType: "text/plain", body: "A clear message." })],
-    ["truncated nested part", () => ({ contentType: "multipart/mixed", parts: [
-      { contentType: "text/plain", body: "A clear message.", isTruncated: true },
-    ], allUserAttachments: [PDF] })],
-    ["cyclic part tree", () => {
-      const mime = { contentType: "multipart/mixed", parts: [], allUserAttachments: [] };
-      mime.parts.push(mime);
-      return mime;
-    }],
-  ]) {
-    it(`counts a ${name} result as an omission, never no match`, async () => {
-      const h = makeHarness({ rows: [{ mimeMessage: makeTree() }] });
-      const result = await h.call("invoice", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 1);
-      assert.equal(result.messages.length, 0);
-      assert.equal(result.notParsed, 1);
-      assert.equal(result.truncated, true);
-      assert.equal(h.runtime.pool.live, 0);
-    });
-  }
-});
-
 describe("searchAttachments synchronous raw-size budget", () => {
   it("counts an oversized local snapshot without parsing or downloading it", async () => {
     const prefix = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="Invoice.PDF"\r\n\r\n';
@@ -812,77 +622,226 @@ describe("searchAttachments synchronous raw-size budget", () => {
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.messages.length, 1);
     assert.equal(result.truncated, false);
-    assert.equal(h.stats.mimeCalls, 1);
     assert.equal(h.stats.rawOpens, 1);
   });
 });
 
-describe("searchAttachments signed messages", () => {
-  const populated = () => ({
-    contentType: 'multipart/signed; protocol="application/pgp-signature"',
-    parts: [{ contentType: "multipart/mixed", parts: [
-      { contentType: "text/plain", body: "A clear message." },
-      { contentType: "application/pdf" },
-    ] }, { contentType: "application/pgp-signature" }],
-    allUserAttachments: [PDF],
-  });
-  const stripped = () => ({
-    contentType: 'multipart/signed; protocol="application/pgp-signature"',
-    isEncrypted: true, parts: [], allUserAttachments: [],
+
+function rawPart(headers, body = "body") {
+  return [...headers, "", body].join("\r\n");
+}
+
+function mixedRaw(parts, subtype = "mixed") {
+  return [`Content-Type: multipart/${subtype}; boundary="semantics"`, "",
+    ...parts.flatMap(part => ["--semantics", part]), "--semantics--", ""].join("\r\n");
+}
+
+describe("searchAttachments snapshot metadata", () => {
+  it("returns only accepted snapshot metadata when the URI's later contents differ", async () => {
+    const row = { raw: PLAIN_RAW };
+    const h = makeHarness({ rows: [row] });
+    row.onRawRead = () => { row.raw = attachmentRaw([{ ...PNG, name: "later.png" }]); };
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [PDF]);
+    assert.equal(result.truncated, false);
+    assert.equal(h.stats.rawOpens, 1);
+    assert.equal(h.stats.rawCloses, 1);
+    assert.doesNotMatch(JSON.stringify(result), /later\.png/);
   });
 
-  for (const [shape, tree] of [["populated", populated], ["stripped", stripped]]) {
-    for (const allowEncrypted of [false, true]) {
-      it(`accounts for ${shape} signed mail with opt-in ${allowEncrypted}`, async () => {
-        const h = makeHarness({ rows: [{ raw: SIGNED_RAW, mimeMessage: tree() }], allowEncrypted });
-        assert.equal(h.runtime.classifyRawMessageEncryption(SIGNED_RAW, 0, { signedRaw: true }), "clear");
-        const result = await h.call("invoice", undefined, h.folder.URI);
-        const searchable = allowEncrypted && shape === "populated";
-        assert.equal(h.stats.mimeCalls, allowEncrypted ? 1 : 0);
-        assert.equal(result.messages.length, searchable ? 1 : 0);
-        assert.equal(result.protectedWithheld || 0, searchable ? 0 : 1);
-        assert.equal(result.truncated, !searchable);
-        assert.equal(h.stats.rawOpens, 1);
-      });
-    }
+  it("never sees a future encrypted URI body after accepting clear snapshot bytes", async () => {
+    const row = { raw: PLAIN_RAW };
+    const h = makeHarness({ rows: [row], allowEncrypted: true });
+    row.onRawRead = () => { row.raw = SMIME_RAW; };
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [PDF]);
+    assert.equal(result.truncated, false);
+    assert.equal(h.stats.rawOpens, 1);
+  });
+
+  it("includes named leaves and attachment dispositions, including named text and inline images", async () => {
+    const raw = mixedRaw([
+      rawPart(['Content-Type: text/plain; name="notes.txt"'], "notes"),
+      rawPart(['Content-Type: image/png; name="inline.png"', 'Content-Disposition: inline; filename="inline.png"'], "image"),
+      rawPart(['Content-Type: application/pdf', 'Content-Disposition: attachment'], "pdf"),
+      rawPart(['Content-Type: image/png', 'Content-ID: <unnamed>'], "unnamed inline image"),
+      rawPart(['Content-Type: text/plain'], "ordinary body"),
+    ]);
+    const h = makeHarness({ rows: [{ raw }] });
+    const result = await h.call(undefined, "", h.folder.URI);
+    assert.match(result.error, /at least one/);
+    const found = await h.call(undefined, "t", h.folder.URI);
+    assert.deepEqual(found.messages[0].matchingAttachments, [
+      { name: "notes.txt", contentType: "text/plain", size: 5, disposition: "" },
+    ]);
+    const all = await h.call(undefined, "image", h.folder.URI);
+    assert.deepEqual(all.messages[0].matchingAttachments, [
+      { name: "inline.png", contentType: "image/png", size: 5, disposition: "inline" },
+    ]);
+    const unnamed = await h.call(undefined, "application/pdf", h.folder.URI);
+    assert.deepEqual(unnamed.messages[0].matchingAttachments, [
+      { name: "", contentType: "application/pdf", size: 3, disposition: "attachment" },
+    ]);
+    assert.equal(unnamed.truncated, false);
+  });
+
+  it("includes a single-part root attachment and decodes filename parameters", async () => {
+    const raw = rawPart([
+      'Content-Type: text/plain; charset=utf-8',
+      "Content-Disposition: attachment; filename*=utf-8''caf%C3%A9.txt",
+    ], "hello");
+    const h = makeHarness({ rows: [{ raw }] });
+    const result = await h.call("CAFÉ", undefined, h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [
+      { name: "café.txt", contentType: "text/plain", size: 5, disposition: "attachment" },
+    ]);
+  });
+
+  for (const type of ["message/rfc822", "message/news", "message/global"]) {
+    it(`represents ${type} as one attachment without flattening its contained attachments`, async () => {
+      const raw = mixedRaw([rawPart([`Content-Type: ${type}`], PLAIN_RAW)]);
+      const h = makeHarness({ rows: [{ raw }] });
+      const embedded = await h.call(undefined, "message/", h.folder.URI);
+      assert.deepEqual(embedded.messages[0].matchingAttachments, [
+        { name: "", contentType: type, size: PLAIN_RAW.length, disposition: "" },
+      ]);
+      assert.equal(embedded.truncated, false);
+      const inner = await h.call("invoice", undefined, h.folder.URI);
+      assert.equal(inner.messages.length, 0);
+      assert.equal(inner.truncated, false);
+    });
   }
 
-  it("withholds a flagged signed tree with children, even with opt-in", async () => {
-    const h = makeHarness({ rows: [{ raw: SIGNED_RAW, mimeMessage: { ...populated(), isEncrypted: true } }], allowEncrypted: true });
+  it("applies multipart/digest's embedded-message default to untyped children", async () => {
+    const raw = mixedRaw([`\r\n${PLAIN_RAW}`], "digest");
+    const h = makeHarness({ rows: [{ raw }] });
+    const result = await h.call(undefined, "message/", h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [
+      { name: "", contentType: "message/rfc822", size: PLAIN_RAW.length, disposition: "" },
+    ]);
+  });
+
+  it("reports decoded byte sizes for base64 and quoted-printable without fetching attachment content", async () => {
+    const raw = mixedRaw([
+      rawPart(['Content-Type: application/pdf', 'Content-Disposition: attachment; filename="base64.pdf"',
+        'Content-Transfer-Encoding: base64'], "QUJD\r\nREU="),
+      rawPart(['Content-Type: text/plain; charset=utf-8', 'Content-Disposition: attachment; filename="quoted.txt"',
+        'Content-Transfer-Encoding: quoted-printable'], "caf=C3=A9=\r\n!"),
+    ]);
+    const h = makeHarness({ rows: [{ raw }] });
+    const result = await h.call(".", undefined, h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [
+      { name: "base64.pdf", contentType: "application/pdf", size: 5, disposition: "attachment" },
+      { name: "quoted.txt", contentType: "text/plain", size: 6, disposition: "attachment" },
+    ]);
+    assert.equal(result.truncated, false);
+  });
+
+  it("reports external attachment metadata with an unknown size and never opens its location", async () => {
+    const raw = rawPart([
+      'Content-Type: application/pdf', 'Content-Disposition: attachment; filename="external.pdf"',
+      'X-Mozilla-External-Attachment-URL: file:///unread/external.pdf',
+    ], "A stored detached-attachment stub.");
+    const h = makeHarness({ rows: [{ raw }] });
+    const result = await h.call("external", undefined, h.folder.URI);
+    assert.deepEqual(result.messages[0].matchingAttachments, [
+      { name: "external.pdf", contentType: "application/pdf", size: null, disposition: "attachment" },
+    ]);
+    assert.equal(result.truncated, false);
+  });
+
+  it("counts undecodable filename metadata instead of silently omitting a possible match", async () => {
+    const raw = rawPart(['Content-Type: application/pdf', "Content-Disposition: attachment; filename*=unknown''bad"], "PDF");
+    const h = makeHarness({ rows: [{ raw }] });
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.messages.length, 0);
     assert.equal(result.protectedWithheld, 1);
     assert.equal(result.truncated, true);
   });
+});
 
+describe("searchAttachments signed snapshots", () => {
   for (const allowEncrypted of [false, true]) {
-    it(`rejects name-typed protection inside signed mail before Gloda with opt-in ${allowEncrypted}`, async () => {
+    it(`applies signed policy to the snapshot with opt-in ${allowEncrypted}`, async () => {
+      const h = makeHarness({ rows: [{ raw: SIGNED_RAW }], allowEncrypted });
+      assert.equal(h.runtime.classifyRawMessageEncryption(SIGNED_RAW, 0, { signedRaw: true }), "clear");
+      const result = await h.call("invoice", undefined, h.folder.URI);
+      assert.equal(result.messages.length, allowEncrypted ? 1 : 0);
+      assert.equal(result.protectedWithheld || 0, allowEncrypted ? 0 : 1);
+      assert.equal(result.truncated, !allowEncrypted);
+      assert.equal(h.stats.rawOpens, 1);
+    });
+
+    it(`withholds name-typed protection inside signed mail with opt-in ${allowEncrypted}`, async () => {
       const raw = SIGNED_RAW.replace('Content-Type: application/pdf', 'Content-Type: application/octet-stream')
         .replace('filename="Invoice.PDF"', 'filename="archive.pgp"');
-      const h = makeHarness({ rows: [{ raw, mimeMessage: populated() }], allowEncrypted });
+      const h = makeHarness({ rows: [{ raw }], allowEncrypted });
       const result = await h.call("invoice", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 0);
+      assert.equal(result.protectedWithheld, 1);
+      assert.equal(result.truncated, true);
+    });
+
+    it(`withholds a stripped/incomplete signed snapshot with opt-in ${allowEncrypted}`, async () => {
+      const raw = SIGNED_RAW.replace(PLAIN_RAW, "");
+      const h = makeHarness({ rows: [{ raw }], allowEncrypted });
+      const result = await h.call("invoice", undefined, h.folder.URI);
       assert.equal(result.protectedWithheld, 1);
       assert.equal(result.truncated, true);
     });
   }
+
+  const malformedSigned = [
+    ["wrong signature type", SIGNED_RAW.replace(
+      'Content-Type: application/pgp-signature',
+      'Content-Type: application/pdf; name="hidden.pdf"',
+    )],
+    ["third ordinary attachment", SIGNED_RAW.replace('--signed--', [
+      '--signed', 'Content-Type: application/pdf',
+      'Content-Disposition: attachment; filename="hidden.pdf"', '', 'hidden', '--signed--',
+    ].join('\r\n'))],
+    ["missing protocol", SIGNED_RAW.replace('; protocol="application/pgp-signature"', '')],
+    ["unknown protocol", SIGNED_RAW.replace('protocol="application/pgp-signature"', 'protocol="application/unknown-signature"')],
+  ];
+  for (const [label, signed] of malformedSigned) {
+    for (const nested of [false, true]) {
+      for (const allowEncrypted of [false, true]) {
+        it(`counts ${nested ? "nested" : "top-level"} signed ${label} with opt-in ${allowEncrypted}`, async () => {
+          const raw = nested ? mixedRaw([signed]) : signed;
+          const h = makeHarness({ rows: [{ raw }], allowEncrypted });
+          // These trees illustrate the attachment extractor's extra obligation:
+          // the shared privacy gate establishes clear bytes, not valid signing.
+          assert.equal(h.runtime.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "clear");
+          const result = await h.call("invoice", undefined, h.folder.URI);
+          assert.equal(result.messages.length, 0);
+          assert.equal(result.protectedWithheld, 1);
+          assert.equal(result.truncated, true);
+          assert.equal(h.stats.rawOpens, 1);
+          assert.doesNotMatch(JSON.stringify(result), /Invoice|hidden\.pdf/);
+        });
+      }
+    }
+  }
+
+  it("does not return a detached signature as an attachment", async () => {
+    const raw = SIGNED_RAW.replace('Content-Type: application/pgp-signature',
+      'Content-Type: application/pgp-signature\r\nContent-Disposition: attachment; filename="signature.asc"');
+    const h = makeHarness({ rows: [{ raw }], allowEncrypted: true });
+    const result = await h.call("signature", undefined, h.folder.URI);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.truncated, false);
+    assert.equal((await h.call("invoice", undefined, h.folder.URI)).messages.length, 1);
+  });
 });
 
 describe("searchAttachments access, identity and deadlines across awaits", () => {
   it("rechecks local availability after collecting the primitive locator", async () => {
     const row = {};
     const h = makeHarness({ rows: [row] });
-    const original = h.runtime.acquireParseSlot;
-    h.runtime.acquireParseSlot = async (...args) => {
-      const acquired = await original(...args);
-      row.header.flags &= ~FLAGS.Offline;
-      return acquired;
-    };
+    h.setOnYield(() => { row.header.flags &= ~FLAGS.Offline; });
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.messages.length, 0);
     assert.equal(result.notOffline, 1);
-    assert.equal(h.stats.mimeCalls, 0);
-    assert.equal(h.stats.serverFetches, 0);
+    assert.equal(h.stats.rawOpens, 0);
   });
 
   for (const reason of ["access", "tool", "key reuse"]) {
@@ -895,7 +854,6 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
         if (reason === "key reuse") row.header.messageId = "replacement@example.test";
       };
       const result = await h.call("invoice", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 0);
       if (reason === "tool") {
         assert.match(result.error, /disabled/);
         assert.equal(result.messages, undefined);
@@ -907,33 +865,28 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
     });
   }
 
-  it("rechecks signed-mail policy after raw acquisition before starting Gloda", async () => {
+  it("rechecks signed-mail policy after raw acquisition before extraction", async () => {
     const row = { raw: SIGNED_RAW };
     const h = makeHarness({ rows: [row], allowEncrypted: true });
     row.onRawRead = () => h.setEncrypted(false);
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.mimeCalls, 0);
     assert.equal(result.messages.length, 0);
     assert.equal(result.protectedWithheld, 1);
     assert.equal(result.truncated, true);
   });
 
   for (const reason of ["access", "tool", "key reuse", "recorded encryption", "signed opt-out"]) {
-    it(`rechecks ${reason} before publishing a parsed result`, async () => {
-      const row = reason === "signed opt-out" ? {
-        raw: SIGNED_RAW,
-        mimeMessage: { contentType: 'multipart/signed; protocol="application/pgp-signature"', parts: [{ contentType: "application/pdf" }], allUserAttachments: [PDF] },
-      } : {};
+    it(`rechecks ${reason} before publishing an extracted result`, async () => {
+      const row = reason === "signed opt-out" ? { raw: SIGNED_RAW } : {};
       const h = makeHarness({ rows: [row], allowEncrypted: true });
-      row.afterMimeCallback = () => {
+      h.afterExtraction(() => {
         if (reason === "access") h.revokeAccess();
         if (reason === "tool") h.disableTool();
         if (reason === "key reuse") row.header.messageId = "replacement@example.test";
         if (reason === "recorded encryption") row.enigmail = DECRYPTION_OKAY;
         if (reason === "signed opt-out") h.setEncrypted(false);
-      };
+      });
       const result = await h.call("invoice", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 1);
       if (reason === "tool") {
         assert.match(result.error, /disabled/);
         assert.equal(result.messages, undefined);
@@ -947,18 +900,14 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
   }
 
   for (const reason of ["signed opt-out", "key reuse"]) {
-    it(`rechecks ${reason} for a parsed nonmatching candidate before reporting completeness`, async () => {
-      const row = reason === "signed opt-out" ? {
-        raw: SIGNED_RAW,
-        mimeMessage: { contentType: 'multipart/signed; protocol="application/pgp-signature"', parts: [{ contentType: "application/pdf" }], allUserAttachments: [PDF] },
-      } : {};
+    it(`rechecks ${reason} for a nonmatching snapshot before reporting completeness`, async () => {
+      const row = reason === "signed opt-out" ? { raw: SIGNED_RAW } : {};
       const h = makeHarness({ rows: [row], allowEncrypted: true });
-      row.afterMimeCallback = () => {
+      h.afterExtraction(() => {
         if (reason === "signed opt-out") h.setEncrypted(false);
         else row.header.messageId = "replacement@example.test";
-      };
+      });
       const result = await h.call("does-not-match", undefined, h.folder.URI);
-      assert.equal(h.stats.mimeCalls, 1);
       assert.equal(result.messages.length, 0);
       assert.equal(result.truncated, true);
       if (reason === "signed opt-out") assert.equal(result.protectedWithheld, 1);
@@ -975,38 +924,52 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
       return state;
     };
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.mimeCalls, 0);
     assert.equal(result.notParsed, 1);
     assert.equal(result.truncated, true);
     assert.match(result.message, /20-second/);
   });
 
-  it("rejects a callback after the deadline even when its timer has not fired", async () => {
-    const row = {};
-    const h = makeHarness({ rows: [row] });
-    row.beforeMimeCallback = () => h.advance(20000);
+  it("checks the deadline across cooperative extraction yields", async () => {
+    const h = makeHarness({ rows: [{ raw: attachmentRaw(rowsOf(64, PDF)) }] });
+    h.setOnYield(count => { if (count > 1) h.advance(20000); });
     const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(h.stats.mimeCalls, 1);
+    assert.ok(h.stats.yields > 1, "a large metadata walk must cooperate with the main thread");
     assert.equal(result.messages.length, 0);
     assert.equal(result.notParsed, 1);
     assert.equal(result.truncated, true);
     assert.match(result.message, /20-second/);
-    assert.equal(h.runtime.pool.live, 0);
   });
 
-  it("rejects a callback past its own 8-second limit when its timer is delayed", async () => {
-    const row = {};
-    const h = makeHarness({ rows: [row] });
-    row.beforeMimeCallback = () => h.advance(8001);
-    const result = await h.call("invoice", undefined, h.folder.URI);
-    assert.equal(result.messages.length, 0);
-    assert.equal(result.notParsed, 1);
-    assert.equal(result.truncated, true);
-    assert.equal(h.runtime.pool.live, 0);
-    assert.ok(h.timers.every(timer => timer.cancelled));
-  });
+  for (const reason of ["access", "tool", "key reuse", "recorded encryption", "signed opt-out", "offline copy"]) {
+    it(`rechecks ${reason} changed during a metadata extraction yield`, async () => {
+      const many = attachmentRaw(rowsOf(64, PDF));
+      const row = { raw: reason === "signed opt-out" ? SIGNED_RAW.replace(PLAIN_RAW, many) : many };
+      const h = makeHarness({ rows: [row], allowEncrypted: true });
+      h.setOnYield(count => {
+        if (count !== 2) return;
+        if (reason === "access") h.revokeAccess();
+        if (reason === "tool") h.disableTool();
+        if (reason === "key reuse") row.header.messageId = "replacement@example.test";
+        if (reason === "recorded encryption") row.enigmail = DECRYPTION_OKAY;
+        if (reason === "signed opt-out") h.setEncrypted(false);
+        if (reason === "offline copy") row.header.flags &= ~FLAGS.Offline;
+      });
+      const result = await h.call("invoice", undefined, h.folder.URI);
+      assert.ok(h.stats.yields >= 2);
+      if (reason === "tool") {
+        assert.match(result.error, /disabled/);
+        assert.equal(result.messages, undefined);
+      } else {
+        assert.equal(result.messages.length, 0);
+        assert.equal(result.truncated, true);
+        if (reason === "recorded encryption" || reason === "signed opt-out") assert.equal(result.protectedWithheld, 1);
+        else if (reason === "offline copy") assert.equal(result.notOffline, 1);
+        else assert.equal(result.notParsed, 1);
+      }
+    });
+  }
 
-  it("gives each initial candidate a separate turn for raw classification", async () => {
+  it("gives every candidate a separate turn for raw classification", async () => {
     const rows = rowsOf(8);
     const h = makeHarness({ rows });
     const turns = [];
@@ -1024,13 +987,11 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
     assert.equal(result.messages.length, 0);
     assert.equal(result.protectedWithheld, 1);
     assert.equal(result.truncated, true);
-    assert.equal(h.stats.mimeCalls, 0);
   });
 
   it("checks the deadline again before building the response", async () => {
-    const row = {};
-    const h = makeHarness({ rows: [row] });
-    row.afterMimeCallback = () => h.advance(20000);
+    const h = makeHarness({ rows: [{}] });
+    h.afterExtraction(() => h.advance(20000));
     const result = await h.call("invoice", undefined, h.folder.URI);
     assert.equal(result.truncated, true);
     assert.match(result.message, /20-second/);
@@ -1043,12 +1004,10 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
     const h = makeHarness({ rows });
     let publishing = false;
     let finalOpens = 0;
-    for (const row of rows) row.afterMimeCallback = () => {
-      if (h.stats.mimeCalls === rows.length && h.stats.inFlight === 0) {
-        publishing = true;
-        h.advance(19000);
-      }
-    };
+    let extracted = 0;
+    h.afterExtraction(() => {
+      if (++extracted === rows.length) { publishing = true; h.advance(19000); }
+    });
     const open = Object.getOwnPropertyDescriptor(h.folder, "msgDatabase").get;
     Object.defineProperty(h.folder, "msgDatabase", { get() {
       if (publishing) { finalOpens++; h.advance(1000); }
@@ -1060,10 +1019,59 @@ describe("searchAttachments access, identity and deadlines across awaits", () =>
     assert.equal(result.notParsed, 40);
     assert.equal(result.truncated, true);
   });
+
+  it("does not open candidates once the budget is spent during the scan", async () => {
+    const rows = [...rowsOf(997, { attach: false }), ...rowsOf(3)];
+    const h = makeHarness({ rows, msPerYield: 7000 });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(h.stats.rawOpens, 0);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /20-second/);
+    assert.equal(result.notParsed, result.candidates);
+  });
+
+  it("counts candidates left at the shared deadline as unavailable", async () => {
+    const h = makeHarness({ rows: rowsOf(40), msPerYield: 2500 });
+    const result = await h.call("invoice", undefined, h.folder.URI, 200);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /20-second/);
+    assert.ok(result.notParsed > 0);
+    assert.equal(result.messages.length + result.notParsed, result.candidates);
+  });
+});
+
+describe("searchAttachments search-local accounting", () => {
+  it("keeps concurrent searches' failures and explanations independent", async () => {
+    const h = makeHarness({ rows: [{ rawThrows: true }], extraFolders: [[{}]] });
+    const [failed, complete] = await Promise.all([
+      h.call("invoice", undefined, h.folders[0].URI),
+      h.call("invoice", undefined, h.folders[1].URI),
+    ]);
+    assert.equal(failed.notParsed, 1);
+    assert.equal(failed.truncated, true);
+    assert.equal(complete.messages.length, 1);
+    assert.equal(complete.truncated, false);
+    assert.equal(complete.message, undefined);
+    assert.equal(complete.notParsed, undefined);
+  });
+
+  it("does not carry another search's failure explanations into a complete search", async () => {
+    const row = { rawThrows: true };
+    const h = makeHarness({ rows: [row] });
+    const failed = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(failed.notParsed, 1);
+    assert.equal(failed.truncated, true);
+    row.rawThrows = false;
+    const complete = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(complete.messages.length, 1);
+    assert.equal(complete.truncated, false);
+    assert.equal(complete.message, undefined);
+    assert.equal(complete.notParsed, undefined);
+  });
 });
 
 describe("searchAttachments native handle lifetime", () => {
-  it("releases header/database handles across admission, MIME waits and late callbacks", () => {
+  it("releases header/database handles across admission and metadata extraction awaits", () => {
     // Reuse S13's WeakRef/GC driver, with the same production code as these
     // behavior tests. Its fixture never retains native-like handles for us.
     const { code } = makeHarness({ rows: [] });
@@ -1073,98 +1081,5 @@ describe("searchAttachments native handle lifetime", () => {
     });
     assert.equal(child.status, 0, child.stderr || child.stdout);
     assert.equal(JSON.parse(child.stdout).ok, true);
-  });
-});
-
-describe("searchAttachments in-flight limit across calls", () => {
-  it("counts streams left by a timed-out parse of an earlier call against later calls", async () => {
-    const hung = hungRows(3);
-    const rows = [...rowsOf(40), ...hung];
-    const h = makeHarness({ rows, parseDelayMs: 2 });
-    const first = h.call("invoice", undefined, h.folder.URI, 50);
-    await sleep(15);
-    for (const row of hung) row.timer.callback.notify();
-    await first;
-    for (const row of hung) row.mime = undefined; // later calls parse them normally
-    assert.equal(h.stats.inFlight, 3, "three streams are still running");
-    h.stats.maxInFlight = 0;
-    const second = await h.call("invoice", undefined, h.folder.URI, 50);
-    assert.equal(second.messages.length, 43, "normal messages still parse");
-    assert.ok(h.stats.maxInFlight <= 8, `max in flight ${h.stats.maxInFlight}`);
-    assert.equal(h.stats.maxInFlight, 8);
-    for (const row of hung) row.release();
-    assert.equal(h.stats.inFlight, 0);
-  });
-
-  it("refuses new parses while every slot is held by an earlier call's stalled streams, then recovers", async () => {
-    const hung = hungRows(8);
-    const h = makeHarness({ rows: [{}, {}, ...hung] });
-    const first = h.call("invoice", undefined, h.folder.URI, 50);
-    await sleep(15);
-    for (const row of hung) row.timer.callback.notify();
-    await first;
-    for (const row of hung) row.mime = undefined;
-    const calls = h.stats.mimeCalls;
-    const blocked = await h.call("invoice", undefined, h.folder.URI, 50);
-    assert.equal(h.stats.mimeCalls, calls, "nothing new may start while all slots are stalled");
-    assert.equal(blocked.messages.length, 0);
-    assert.match(blocked.message, /stalled/);
-    for (const row of hung) row.release();
-    const recovered = await h.call("invoice", undefined, h.folder.URI, 50);
-    assert.equal(recovered.messages.length, 10);
-  });
-
-  it("rechecks access when another call releases a waited-for parse slot", async () => {
-    const rows = hungRows(8);
-    const h = makeHarness({ rows });
-    const first = h.call("invoice", undefined, h.folder.URI);
-    await sleep(20);
-    assert.equal(h.stats.mimeCalls, 8);
-    const second = h.call("invoice", undefined, h.folder.URI);
-    await sleep(10);
-    assert.ok(h.runtime.pool.waiters.length > 0, "the second search must wait for the shared pool");
-    h.revokeAccess();
-    for (const row of rows) row.release();
-    const [, result] = await Promise.all([first, second]);
-    assert.equal(h.stats.mimeCalls, 8, "no parse starts using access checked before the wait");
-    assert.equal(result.messages.length, 0);
-    assert.equal(result.notParsed, 8);
-    assert.equal(result.truncated, true);
-    assert.equal(h.runtime.pool.live, 0);
-    assert.equal(h.runtime.pool.waiters.length, 0);
-  });
-
-  it("releases a timed-out stream only once even if its callback repeats", async () => {
-    const row = { mime: "hang" };
-    const h = makeHarness({ rows: [row] });
-    const pending = h.call("invoice", undefined, h.folder.URI);
-    await sleep(20);
-    row.timer.callback.notify();
-    const result = await pending;
-    assert.equal(result.notParsed, 1);
-    assert.equal(result.messages.length, 0);
-    assert.equal(h.runtime.pool.live, 1);
-    row.release();
-    row.release();
-    assert.equal(h.runtime.pool.live, 0);
-    assert.equal(h.runtime.pool.stalledSlots.size, 0);
-    assert.equal(result.messages.length, 0, "late callbacks cannot append to the settled response");
-  });
-
-  it("reclaims slots of streams that never call back after the stall TTL", async () => {
-    const hung = hungRows(8);
-    const h = makeHarness({ rows: [{}, {}, ...hung] });
-    const first = h.call("invoice", undefined, h.folder.URI, 50);
-    await sleep(15);
-    for (const row of hung) row.timer.callback.notify();
-    await first;
-    for (const row of hung) row.mime = undefined;
-    h.advance(6 * 60 * 1000);
-    const later = await h.call("invoice", undefined, h.folder.URI, 50);
-    assert.equal(later.messages.length, 10);
-    // A callback arriving after reclamation must not free a slot twice.
-    for (const row of hung) row.release();
-    assert.equal(h.runtime.pool.live, 0);
-    assert.equal(h.runtime.pool.stalledSlots.size, 0);
   });
 });
