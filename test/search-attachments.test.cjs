@@ -265,7 +265,9 @@ describe("searchAttachments schema", () => {
     assert.equal(tool.inputSchema.properties.scanCap.maximum, 50000);
     assert.equal(tool.inputSchema.properties.scanCap.default, 5000);
     assert.match(tool.description, /never decrypt/i);
-    assert.match(tool.description, /2 MiB/);
+    assert.match(tool.description, /16 MiB/);
+    assert.match(tool.description, /tooLarge/);
+    assert.match(tool.description, /tooComplex/);
   });
 });
 
@@ -605,21 +607,44 @@ describe("searchAttachments complete raw privacy gate", () => {
 describe("searchAttachments synchronous raw-size budget", () => {
   it("counts an oversized local snapshot without parsing or downloading it", async () => {
     const prefix = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="Invoice.PDF"\r\n\r\n';
-    const h = makeHarness({ rows: [{ raw: prefix + "a".repeat(2 * 1024 * 1024), messageSize: 1 }] });
+    const h = makeHarness({ rows: [{ raw: prefix + "a".repeat(16 * 1024 * 1024), messageSize: 1 }] });
+    const calls = countClassificationCalls(h);
     const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(calls(), 0);
     assert.equal(result.messages.length, 0);
     assert.equal(result.tooLarge, 1);
     assert.equal(result.truncated, true);
-    assert.match(result.message, /2 MiB|2097152|size/i);
+    assert.match(result.message, /16 MiB|16777216|size/i);
     assert.equal(h.stats.mimeCalls, 0);
     assert.equal(h.stats.serverFetches, 0);
     assert.equal(h.stats.rawCloses, 1);
   });
 
+  it("accepts an ordinary 2 MiB decoded base64 attachment and reports its byte size", async () => {
+    const size = 2 * 1024 * 1024;
+    const base64 = Buffer.alloc(size, 65).toString('base64').match(/.{1,76}/g).join('\r\n');
+    const raw = rawPart([
+      'Content-Type: application/pdf', 'Content-Disposition: attachment; filename="Invoice.PDF"',
+      'Content-Transfer-Encoding: base64',
+    ], base64);
+    assert.ok(raw.length > 2 * 1024 * 1024);
+    assert.ok(raw.length < 16 * 1024 * 1024);
+    const h = makeHarness({ rows: [{ raw }] });
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.ok(calls() > 0);
+    assert.deepEqual(result.messages[0].matchingAttachments, [{ ...PDF, size }]);
+    assert.equal(result.truncated, false);
+    assert.equal(h.stats.rawOpens, 1);
+    assert.ok(h.stats.yields >= 3, "Large decoded-size accounting yields between bounded chunks");
+  });
+
   it("accepts a complete strictly clear snapshot exactly at the search cap", async () => {
     const prefix = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="Invoice.PDF"\r\n\r\n';
-    const h = makeHarness({ rows: [{ raw: prefix + "a".repeat(2 * 1024 * 1024 - prefix.length) }] });
+    const h = makeHarness({ rows: [{ raw: prefix + "a".repeat(16 * 1024 * 1024 - prefix.length) }] });
+    const calls = countClassificationCalls(h);
     const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.ok(calls() > 0);
     assert.equal(result.messages.length, 1);
     assert.equal(result.truncated, false);
     assert.equal(h.stats.rawOpens, 1);
@@ -635,6 +660,230 @@ function mixedRaw(parts, subtype = "mixed") {
   return [`Content-Type: multipart/${subtype}; boundary="semantics"`, "",
     ...parts.flatMap(part => ["--semantics", part]), "--semantics--", ""].join("\r\n");
 }
+
+function countClassificationCalls(harness) {
+  let calls = 0;
+  const classify = harness.runtime.classifyRawMessageEncryption;
+  harness.runtime.classifyRawMessageEncryption = (...args) => {
+    calls++;
+    return classify(...args);
+  };
+  return () => calls;
+}
+
+function nestedRaw(raw, depth, embedded = true) {
+  for (let index = 0; index < depth; index++) {
+    raw = embedded ? rawPart(['Content-Type: message/rfc822'], raw)
+      : [`Content-Type: multipart/mixed; boundary="depth${index}"`, '', `--depth${index}`,
+        raw, `--depth${index}--`, ''].join('\r\n');
+  }
+  return raw;
+}
+
+describe("searchAttachments structural work budget", () => {
+  it("accepts exactly 256 entities, including the multipart root and text part", async () => {
+    const h = makeHarness({ rows: [{ raw: attachmentRaw(rowsOf(254, PDF)) }] });
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(result.messages[0].matchingAttachments.length, 254);
+    assert.equal(result.truncated, false);
+    assert.ok(calls() > 0, "a budget pass must still run the shared strict classifier");
+  });
+
+  it("rejects a 257th entity before the classifier runs", async () => {
+    const h = makeHarness({ rows: [{ raw: attachmentRaw(rowsOf(255, PDF)) }] });
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(calls(), 0);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.tooComplex, 1);
+    assert.equal(result.protectedWithheld, undefined);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /tooComplex|complex|structur|work/i);
+  });
+
+  it("counts embedded-message roots against the same entity budget", async () => {
+    const inner = rawPart(['Content-Type: text/plain'], "clear");
+    const embedded = rawPart(['Content-Type: message/rfc822'], inner);
+    const named = rawPart(['Content-Type: application/pdf; name="invoice.pdf"'], "pdf");
+    const accepted = makeHarness({ rows: [{ raw: mixedRaw([...Array(127).fill(embedded), named]) }] });
+    const acceptedCalls = countClassificationCalls(accepted);
+    const result = await accepted.call(undefined, "message/", accepted.folder.URI);
+    assert.equal(result.messages[0].matchingAttachments.length, 127);
+    assert.equal(result.truncated, false);
+    assert.ok(acceptedCalls() > 0);
+    const rejected = makeHarness({ rows: [{ raw: mixedRaw([...Array(128).fill(embedded), named]) }] });
+    const rejectedCalls = countClassificationCalls(rejected);
+    const omitted = await rejected.call(undefined, "message/", rejected.folder.URI);
+    assert.equal(rejectedCalls(), 0);
+    assert.equal(omitted.tooComplex, 1);
+    assert.equal(omitted.truncated, true);
+  });
+
+  for (const embedded of [false, true]) {
+    it(`accepts nesting depth 10 and rejects depth 11 for ${embedded ? "attached messages" : "multipart bodies"}`, async () => {
+      const leaf = rawPart(['Content-Type: application/pdf; name="invoice.pdf"'], "pdf");
+      const accepted = makeHarness({ rows: [{ raw: nestedRaw(leaf, 10, embedded) }] });
+      const acceptedCalls = countClassificationCalls(accepted);
+      const result = await accepted.call(undefined, embedded ? "message/" : "application/pdf", accepted.folder.URI);
+      assert.equal(result.messages.length, 1);
+      assert.equal(result.truncated, false);
+      assert.ok(acceptedCalls() > 0);
+      const rejected = makeHarness({ rows: [{ raw: nestedRaw(leaf, 11, embedded) }] });
+      const rejectedCalls = countClassificationCalls(rejected);
+      const omitted = await rejected.call("invoice", undefined, rejected.folder.URI);
+      assert.equal(rejectedCalls(), 0);
+      assert.equal(omitted.messages.length, 0);
+      assert.equal(omitted.tooComplex, 1);
+      assert.equal(omitted.truncated, true);
+    });
+  }
+
+  it("accepts 64 KiB of entity headers and rejects one more byte before classification", async () => {
+    const prefix = 'Content-Type: application/pdf; name="invoice.pdf"\r\nX-Padding: ';
+    const header = prefix + "x".repeat(64 * 1024 - prefix.length);
+    const accepted = makeHarness({ rows: [{ raw: `${header}\r\n\r\nPDF` }] });
+    const acceptedCalls = countClassificationCalls(accepted);
+    const result = await accepted.call("invoice", undefined, accepted.folder.URI);
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.truncated, false);
+    assert.ok(acceptedCalls() > 0);
+    const rejected = makeHarness({ rows: [{ raw: `${header}x\r\n\r\nPDF` }] });
+    const rejectedCalls = countClassificationCalls(rejected);
+    const omitted = await rejected.call("invoice", undefined, rejected.folder.URI);
+    assert.equal(rejectedCalls(), 0);
+    assert.equal(omitted.tooComplex, 1);
+    assert.equal(omitted.truncated, true);
+  });
+
+  it("accepts 256 KiB of aggregate headers and rejects one more byte", async () => {
+    const rootHeader = 'Content-Type: multipart/mixed; boundary="aggregate"';
+    const leafPrefix = 'Content-Type: application/pdf; name="invoice.pdf"\r\nX-Padding: ';
+    const headerLengths = [65536, 65536, 65536, 65536 - rootHeader.length];
+    const leafHeaders = headerLengths.map(length => leafPrefix + "x".repeat(length - leafPrefix.length));
+    assert.equal(rootHeader.length + leafHeaders.reduce((total, header) => total + header.length, 0), 256 * 1024);
+    const combine = headers => [rootHeader, '', ...headers.flatMap(header => [
+      '--aggregate', header, '', 'PDF',
+    ]), '--aggregate--', ''].join('\r\n');
+    const accepted = makeHarness({ rows: [{ raw: combine(leafHeaders) }] });
+    const acceptedCalls = countClassificationCalls(accepted);
+    const result = await accepted.call("invoice", undefined, accepted.folder.URI);
+    assert.equal(result.messages[0].matchingAttachments.length, 4);
+    assert.equal(result.truncated, false);
+    assert.ok(acceptedCalls() > 0);
+    leafHeaders[3] += "x";
+    assert.ok(leafHeaders.every(header => header.length <= 64 * 1024));
+    const rejected = makeHarness({ rows: [{ raw: combine(leafHeaders) }] });
+    const rejectedCalls = countClassificationCalls(rejected);
+    const omitted = await rejected.call("invoice", undefined, rejected.folder.URI);
+    assert.equal(rejectedCalls(), 0);
+    assert.equal(omitted.messages.length, 0);
+    assert.equal(omitted.tooComplex, 1);
+    assert.equal(omitted.truncated, true);
+    assert.match(omitted.message, /256 KiB total/);
+  });
+
+  it("rejects many large RFC 2047 filename headers before the classifier decodes them", async () => {
+    const prefix = 'Content-Type: application/pdf\r\nContent-Disposition: attachment; filename="';
+    const word = '=?UTF-8?B?QQ==?= ';
+    const words = word.repeat(Math.floor((64 * 1024 - prefix.length - 1) / word.length));
+    const header = prefix + words + "x".repeat(64 * 1024 - prefix.length - words.length - 1) + '"';
+    assert.equal(header.length, 64 * 1024);
+    const leaf = `${header}\r\n\r\nPDF`;
+    const raw = mixedRaw(Array(255).fill(leaf));
+    assert.ok(raw.length < 16 * 1024 * 1024, "The raw-size cap alone must not stop this regression fixture");
+    const h = makeHarness({ rows: [{ raw }] });
+    assert.equal(h.runtime.isStrictlyWellFormedRawMime(leaf), true);
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(calls(), 0);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.tooComplex, 1);
+    assert.equal(result.tooLarge, undefined);
+    assert.equal(result.truncated, true);
+  });
+
+  for (const [label, newline] of [["CRLF", "\r\n"], ["LF", "\n"], ["CR", "\r"]]) {
+    it(`bounds ${label} logical line breaks without counting CRLF twice`, async () => {
+      const prefix = 'Content-Type: application/pdf; name="invoice.pdf"\r\n\r\n';
+      const raw = prefix + newline.repeat(300000 - 2);
+      const accepted = makeHarness({ rows: [{ raw }] });
+      const acceptedCalls = countClassificationCalls(accepted);
+      const result = await accepted.call("invoice", undefined, accepted.folder.URI);
+      assert.equal(result.messages.length, 1);
+      assert.equal(result.truncated, false);
+      assert.ok(acceptedCalls() > 0);
+      const rejected = makeHarness({ rows: [{ raw: raw + newline }] });
+      const rejectedCalls = countClassificationCalls(rejected);
+      const omitted = await rejected.call("invoice", undefined, rejected.folder.URI);
+      assert.equal(rejectedCalls(), 0);
+      assert.equal(omitted.tooComplex, 1);
+      assert.equal(omitted.truncated, true);
+    });
+  }
+
+  it("bounds repeated work over large attached messages independently of depth", async () => {
+    const leaf = rawPart(['Content-Type: application/pdf; name="invoice.pdf"'], "A".repeat(12 * 1024 * 1024));
+    const raw = nestedRaw(leaf, 2);
+    assert.ok(raw.length < 16 * 1024 * 1024);
+    const h = makeHarness({ rows: [{ raw }] });
+    const calls = countClassificationCalls(h);
+    const result = await h.call(undefined, "message/", h.folder.URI);
+    assert.equal(calls(), 0);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.tooComplex, 1);
+    assert.equal(result.truncated, true);
+  });
+
+  it("charges quoted-printable decoding work before running the classifier", async () => {
+    const prefix = 'Content-Type: application/pdf; name="invoice.pdf"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n';
+    const bodyLength = Math.floor((32 * 1024 * 1024 - prefix.length) / 4);
+    const raw = prefix + "A".repeat(bodyLength);
+    const h = makeHarness({ rows: [{ raw: raw + "A" }] });
+    // The utility's exact edge is cheap to test directly; the over-budget path
+    // must stop the actual search before allocating the shared QP decoder array.
+    assert.equal(h.runtime.preflightAttachmentSearchSnapshot(raw, { deadline: 20000 }).signed, false);
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(calls(), 0);
+    assert.equal(result.tooComplex, 1);
+    assert.equal(result.truncated, true);
+  });
+
+  it("checks the deadline between work preflight and the strict classifier", async () => {
+    const h = makeHarness({ rows: [{}] });
+    const preflight = h.runtime.preflightAttachmentSearchSnapshot;
+    h.runtime.preflightAttachmentSearchSnapshot = (...args) => {
+      const result = preflight(...args);
+      h.advance(20000);
+      return result;
+    };
+    const calls = countClassificationCalls(h);
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(calls(), 0);
+    assert.equal(result.notParsed, 1);
+    assert.equal(result.tooComplex, undefined);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /20-second/);
+  });
+
+  it("reports size and structural omissions separately in the same response", async () => {
+    const h = makeHarness({ rows: [
+      { raw: attachmentRaw(rowsOf(255, PDF)) },
+      { raw: rawPart(['Content-Type: application/pdf'], "A".repeat(16 * 1024 * 1024)) },
+      {},
+    ] });
+    const result = await h.call("invoice", undefined, h.folder.URI);
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.tooLarge, 1);
+    assert.equal(result.tooComplex, 1);
+    assert.equal(result.notParsed, undefined);
+    assert.equal(result.protectedWithheld, undefined);
+    assert.equal(result.truncated, true);
+    assert.match(result.message, /16 MiB|size/);
+    assert.match(result.message, /tooComplex|complex|structur|work/i);
+  });
+});
 
 describe("searchAttachments snapshot metadata", () => {
   it("returns only accepted snapshot metadata when the URI's later contents differ", async () => {
