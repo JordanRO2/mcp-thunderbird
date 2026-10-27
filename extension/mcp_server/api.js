@@ -12999,7 +12999,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (anchor.threadId === null || anchor.threadId === undefined || anchor.threadId === NSMSGKEY_NONE) {
                   const alone = hydrateQueryRows([{ folder, key: anchor.key, id: anchor.id }]).headers;
                   if (alone.length === 0) return { error: `Message not found: ${messageId}` };
-                  return { thread: alone, threadId: null, anchorId: anchor.id, anchored: true, total: 1, truncated: false };
+                  return { thread: alone, threadId: null, anchorId: anchor.id, anchored: true, total: 1, scanned: 1, truncated: false };
                 }
 
                 // Member keys: from the thread object, else a folder scan on threadId.
@@ -13028,6 +13028,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const msgHdr = getSearchHeader(chunkDb, childKeys[index]);
                         if (!msgHdr) { complete = false; continue; }
                         if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
+                        // The key may have been reused or moved to another thread across a yield.
+                        if (msgHdr.threadId !== anchor.threadId) { complete = false; continue; }
                         scanned++;
                         members.set(childKeys[index], { id: msgHdr.messageId, date: msgHdr.date || 0 });
                       } catch {
@@ -13132,11 +13134,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   : null;
 
                 const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
-                // Per Inbox: { folder, scanned, matched, incomplete }. Rows are
-                // { folder, key, id, date, folderPath } only.
-                const inboxes = new Map();
-                let rows = [];
-                const causes = { newestFirst: true, scanLimit };
+                const canRead = folder => {
+                  try {
+                    return isFolderAccessible(folder);
+                  } catch {
+                    return false;
+                  }
+                };
+                // Per Inbox: { folder, scanned, matched, incomplete, capped,
+                // timedOut, unavailable, rows }. Rows (newest `cap` of that Inbox)
+                // are { folder, key, id, date, folderPath } only.
+                const inboxes = [];
 
                 for (const account of getAccessibleAccounts()) {
                   let inbox = null;
@@ -13150,67 +13158,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   // No Inbox (or only a server root, which has no database): nothing to read.
                   if (!inbox || inbox.isServer) continue;
-                  const state = { folder: inbox, scanned: 0, matched: 0, incomplete: false };
-                  inboxes.set(inbox.URI, state);
+                  // Access can be revoked while an earlier Inbox yielded.
+                  if (!canRead(inbox)) continue;
+                  const state = { folder: inbox, scanned: 0, matched: 0, incomplete: false, rows: [] };
+                  inboxes.push(state);
                   // Once the budget is gone the remaining Inboxes are unknown, not empty.
-                  if (searchTimeExpired(scan)) { state.incomplete = true; causes.timedOut = true; continue; }
+                  if (searchTimeExpired(scan)) { state.incomplete = true; state.timedOut = true; continue; }
                   refreshImapFolderSync(inbox);
 
                   let examined = 0;
-                  let capped = false;
                   const outcome = await scanFolderCooperatively(inbox, scan, msgHdr => {
                     if (sinceMicros !== null && msgHdr.date && msgHdr.date < sinceMicros) return false;
-                    if (examined >= scanLimit) { capped = true; return true; }
+                    if (examined >= scanLimit) { state.capped = true; return true; }
                     examined++;
-                    // Cheap prefilter before the XPCOM parse: an address cannot be
-                    // hidden in an encoded-word, so a raw miss is a real miss.
-                    const rawAuthor = msgHdr.author || "";
-                    if (!rawAuthor.toLowerCase().includes(wanted)) return false;
-                    if (!parseAuthorEmails(rawAuthor).includes(wanted)) return false;
+                    // Thunderbird's parser decodes encoded-words, quoted local parts and
+                    // comments inside the addr-spec, so the raw text cannot be prefiltered.
+                    if (!parseAuthorEmails(msgHdr.author || "").includes(wanted)) return false;
                     state.matched++;
-                    rows.push({ folder: inbox, key: msgHdr.messageKey, id: msgHdr.messageId, date: msgHdr.date || 0, folderPath: inbox.URI });
-                    // Bound memory: keep only the newest rows.
-                    if (rows.length > cap * 2) {
-                      rows.sort((a, b) => b.date - a.date);
-                      rows = rows.slice(0, cap);
+                    state.rows.push({ folder: inbox, key: msgHdr.messageKey, id: msgHdr.messageId, date: msgHdr.date || 0, folderPath: inbox.URI });
+                    // Bound memory: keep only this Inbox's newest rows.
+                    if (state.rows.length > cap * 2) {
+                      state.rows.sort((a, b) => b.date - a.date);
+                      state.rows = state.rows.slice(0, cap);
                     }
                     return false;
                   }, { newestFirst: true });
-                  state.scanned = outcome.scanned;
-                  if (capped) { state.incomplete = true; causes.capped = true; }
+                  state.scanned = examined;
+                  if (state.capped) state.incomplete = true;
                   if (!outcome.complete) {
                     state.incomplete = true;
-                    if (scan.timedOut) causes.timedOut = true;
-                    else causes.unavailable = true;
+                    if (scan.timedOut) state.timedOut = true;
+                    else state.unavailable = true;
                   }
+                  state.rows.sort((a, b) => b.date - a.date);
+                  state.rows = state.rows.slice(0, cap);
                 }
 
                 // No await from here on. Drop everything from accounts whose
-                // access was revoked during the scan.
-                const accessible = new Map();
-                for (const [uri, state] of inboxes) {
-                  let ok = false;
-                  try {
-                    ok = isFolderAccessible(state.folder);
-                  } catch {
-                    ok = false;
-                  }
-                  accessible.set(uri, ok);
-                }
-                rows = rows.filter(row => accessible.get(row.folderPath));
-                rows.sort((a, b) => b.date - a.date);
+                // access was revoked during the scan, causes included.
+                const readable = inboxes.filter(state => canRead(state.folder));
+                const rows = readable.flatMap(state => state.rows).sort((a, b) => b.date - a.date);
 
                 const { headers: messages, vanished } = hydrateQueryRows(rows.slice(0, cap));
-                if (vanished) causes.vanished = true;
+                const causes = {
+                  newestFirst: true,
+                  scanLimit,
+                  capped: readable.some(state => state.capped),
+                  timedOut: readable.some(state => state.timedOut),
+                  unavailable: readable.some(state => state.unavailable),
+                  vanished,
+                };
 
                 let totalScanned = 0;
                 let matched = 0;
                 const notScannedFolders = [];
-                for (const [uri, state] of inboxes) {
-                  if (!accessible.get(uri)) continue;
+                for (const state of readable) {
                   totalScanned += state.scanned;
                   matched += state.matched;
-                  if (state.incomplete) notScannedFolders.push(uri);
+                  if (state.incomplete) notScannedFolders.push(state.folder.URI);
                 }
 
                 const incomplete = notScannedFolders.length > 0 || !!causes.vanished;
